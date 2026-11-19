@@ -1,0 +1,36 @@
+{
+  "provenance": "Hand-authored synthetic source-derived contracts, not live captures. See docs/codex-openai-parity.md for Go symbols and limitations.",
+  "codex_selection": {
+    "model": "gpt-5.4", "provider": "codex", "auth_index": "fixture-codex",
+    "auth": {"provider": "codex", "metadata": {"access_token": "synthetic-oauth-token", "account_id": "synthetic-account"}}
+  },
+  "compat_selection": {
+    "model": "upstream", "provider": "openai-compatibility", "auth_index": "fixture-compat",
+    "auth": {
+      "provider": "home-compat",
+      "attributes": {"api_key": "synthetic-api-key", "base_url": "https://compat.example.test/v1", "compat_name": "home-compat", "provider_key": "home-compat", "auth_kind": "apikey"},
+      "metadata": {"credential_options": {"support-prompt-cache-key": true, "models": [{"name": "upstream", "alias": "chosen", "use-max-completion-tokens": true, "input-modalities": ["text"]}]}}
+    }
+  },
+  "codex_cases": [
+    {
+      "name": "text-budget-tier-and-unsupported-fields",
+      "input": {"model": "alias", "input": "hello", "stream": false, "store": true, "max_tokens": 2, "service_tier": " FAST ", "temperature": 0.2, "top_p": 0.8, "user": "caller", "stream_options": {"include_usage": true}, "prompt_cache_retention": "24h", "safety_identifier": "caller"},
+      "expected": {"model": "gpt-5.4", "input": [{"type": "message", "role": "user", "content": [{"type": "input_text", "text": "hello"}]}], "stream": true, "store": false, "max_output_tokens": 16, "service_tier": "priority", "include": ["reasoning.encrypted_content"], "instructions": ""}
+    },
+    {
+      "name": "developer-role-tool-arguments-explicit-parallel-false",
+      "input": {"input": [{"type": "message", "role": "system", "content": "Be brief"}, {"type": "function_call", "call_id": "call_1", "name": "lookup", "arguments": "  "}, {"type": "function_call_output", "call_id": "call_1", "output": "ok"}], "tools": [{"type": "function", "name": "lookup", "parameters": {"type": "object", "properties": {}}}], "parallel_tool_calls": false, "instructions": "explicit", "max_output_tokens": 64, "max_completion_tokens": 512, "service_tier": "default"},
+      "expected": {"model": "gpt-5.4", "input": [{"type": "message", "role": "developer", "content": "Be brief"}, {"type": "function_call", "call_id": "call_1", "name": "lookup", "arguments": "{}"}, {"type": "function_call_output", "call_id": "call_1", "output": "ok"}], "tools": [{"type": "function", "name": "lookup", "parameters": {"type": "object", "properties": {}}}], "parallel_tool_calls": false, "instructions": "explicit", "max_output_tokens": 64, "stream": true, "store": false, "include": ["reasoning.encrypted_content"]}
+    }
+  ],
+  "nested_cache_hints": {"input": [{"type": "message", "role": "user", "prompt_cache_breakpoint": true, "content": [{"type": "input_text", "text": "hello", "prompt_cache_breakpoint": true}]}]},
+  "blocked_codex_inputs": [
+    {"messages": [{"role": "user", "content": "hello"}]},
+    {"input": [], "previous_response_id": "resp_previous"},
+    {"input": [], "context_management": [{"type": "compaction", "compact_threshold": 1000}]},
+    {"input": [], "tools": [{"type": "image_generation"}]},
+    {"input": [], "tools": [{"type": "web_search"}]},
+    {"input": [], "generate": true}
+  ]
+}

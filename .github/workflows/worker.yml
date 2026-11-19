@@ -1,0 +1,28 @@
+name: Worker checks
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  rust:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install current stable Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+      - name: Format, lint, test and locked release build
+        run: sh scripts/verify-worker.sh
+      - name: Build non-root runtime image
+        run: docker build --tag ai48proxy:ci .
+      - name: Inspect image and verify executable
+        run: |
+          test "$(docker image inspect --format '{{.Config.User}}' ai48proxy:ci)" = '10001:10001'
+          docker run --rm --network none --read-only ai48proxy:ci --version

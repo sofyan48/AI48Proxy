@@ -1,0 +1,131 @@
+# Full installer topology. install.sh generates .env and deploy/*.yaml first.
+x-worker: &worker
+  image: ${AI48PROXY_IMAGE:-ai48proxy:local}
+  build:
+    context: .
+    args:
+      RUST_IMAGE: ${RUST_IMAGE:-rust:bookworm}
+  init: true
+  user: "10001:10001"
+  command: ["--identity-dir", "/var/lib/ai48proxy/identity"]
+  depends_on:
+    - home
+  networks:
+    - cliproxy
+  stop_grace_period: 120s
+  restart: unless-stopped
+  healthcheck:
+    test: ["CMD", "/usr/local/bin/ai48proxy", "--healthcheck", "http://127.0.0.1:8317/healthz"]
+    interval: 10s
+    timeout: 5s
+    start_period: 60s
+    retries: 3
+
+services:
+  postgres:
+    image: postgres:17-alpine
+    container_name: cliproxy-postgres
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER:?Run ./install.sh deploy to generate POSTGRES_USER}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?Run ./install.sh deploy to generate POSTGRES_PASSWORD}
+      POSTGRES_DB: ${POSTGRES_DB:?Run ./install.sh deploy to generate POSTGRES_DB}
+    volumes:
+      - ./postgres-data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U \"$$POSTGRES_USER\" -d \"$$POSTGRES_DB\""]
+      interval: 5s
+      timeout: 5s
+      retries: 20
+    networks:
+      - cliproxy
+    restart: unless-stopped
+
+  home:
+    image: ${HOME_IMAGE:-ghcr.io/sofyan48/ai48home:latest}
+    pull_policy: always
+    container_name: ai48home
+    environment:
+      HOME_USER_EMAIL_SMTP_PASSWORD: ""
+    depends_on:
+      postgres:
+        condition: service_healthy
+    ports:
+      - "8327:8327"
+    volumes:
+      - type: bind
+        source: ./deploy/cluster.yaml
+        target: /AI48Home/cluster.yaml
+        read_only: true
+        bind:
+          create_host_path: false
+      - ./home-data:/AI48Home/data
+      - ./home-logs:/AI48Home/logs
+      - ./home-plugins:/AI48Home/plugins
+    networks:
+      cliproxy:
+        aliases:
+          - home
+    stop_grace_period: 30s
+    restart: unless-stopped
+
+  # Empty JWTs are permitted only while the installer initializes Home and issues
+  # tokens. The installer must fill all three before starting these services.
+  cliproxy-1:
+    <<: *worker
+    container_name: cliproxy-worker-1
+    environment:
+      HOME_JWT: ${HOME_JWT_1:-}
+      WORKER_START_DELAY: ${WORKER_START_DELAY:-25}
+      RUST_LOG: ${RUST_LOG:-ai48proxy=info}
+    volumes:
+      - worker-1-state:/var/lib/ai48proxy
+
+  cliproxy-2:
+    <<: *worker
+    container_name: cliproxy-worker-2
+    environment:
+      HOME_JWT: ${HOME_JWT_2:-}
+      WORKER_START_DELAY: ${WORKER_START_DELAY:-25}
+      RUST_LOG: ${RUST_LOG:-ai48proxy=info}
+    volumes:
+      - worker-2-state:/var/lib/ai48proxy
+
+  cliproxy-3:
+    <<: *worker
+    container_name: cliproxy-worker-3
+    environment:
+      HOME_JWT: ${HOME_JWT_3:-}
+      WORKER_START_DELAY: ${WORKER_START_DELAY:-25}
+      RUST_LOG: ${RUST_LOG:-ai48proxy=info}
+    volumes:
+      - worker-3-state:/var/lib/ai48proxy
+
+  nginx:
+    image: nginx:alpine
+    container_name: cliproxy-lb
+    depends_on:
+      - cliproxy-1
+      - cliproxy-2
+      - cliproxy-3
+    ports:
+      - "8317:8317"
+    volumes:
+      - type: bind
+        source: ./deploy/nginx.conf
+        target: /etc/nginx/nginx.conf
+        read_only: true
+        bind:
+          create_host_path: false
+    networks:
+      - cliproxy
+    stop_grace_period: 15s
+    restart: unless-stopped
+
+volumes:
+  worker-1-state:
+  worker-2-state:
+  worker-3-state:
+
+networks:
+  cliproxy:
+    name: cliproxy-network

@@ -1,0 +1,12 @@
+/target/
+/.ai48proxy/
+.env
+*.pem
+/deploy/config.yaml
+/deploy/cluster.yaml
+/deploy/.home-imported
+/postgres-data/
+/home-data/
+/home-logs/
+/home-plugins/
+/.env.tmp.*

@@ -1,0 +1,9 @@
+# Allowlist prevents identity material, configuration, tokens and build outputs
+# from being sent to the builder, including files outside standard secret paths.
+**
+!Cargo.toml
+!Cargo.lock
+!src/
+!src/**
+!Dockerfile
+!.dockerignore

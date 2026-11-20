@@ -154,6 +154,42 @@ pub(super) fn control(frame: &Value, active_id: Option<&str>) -> bool {
         .is_some_and(|id| !id.is_empty() && Some(id) == active_id)
 }
 
+/// Classify an upstream terminal event without letting an overlapping response
+/// close the currently streamed turn. Failures may omit an id, in which case
+/// the only safe attribution is the active response.
+pub(super) fn terminal_response_id<'a>(
+    event: &'a Value,
+    active_id: Option<&'a str>,
+) -> Option<&'a str> {
+    let kind = event.get("type").and_then(Value::as_str).unwrap_or("");
+    let failure = matches!(kind, "error" | "response.failed");
+    if !failure
+        && !matches!(
+            kind,
+            "response.completed" | "response.done" | "response.incomplete" | "response.cancelled"
+        )
+    {
+        return None;
+    }
+    let nested = event
+        .pointer("/response/id")
+        .and_then(Value::as_str)
+        .filter(|id| !id.is_empty());
+    let explicit = event
+        .get("response_id")
+        .and_then(Value::as_str)
+        .filter(|id| !id.is_empty());
+    if failure {
+        explicit.or(nested).or(active_id)
+    } else {
+        nested
+    }
+}
+
+pub(super) fn terminal_owns_active(event: &Value, active_id: Option<&str>) -> bool {
+    terminal_response_id(event, active_id).is_some_and(|id| Some(id) == active_id)
+}
+
 #[cfg(test)]
 mod native_tests {
     use super::*;

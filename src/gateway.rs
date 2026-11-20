@@ -97,7 +97,13 @@ pub fn router(home: Arc<HomeClient>) -> Router {
 
 async fn health(State(home): State<Arc<HomeClient>>) -> Response {
     if home.ready() && !home.cancellation().is_cancelled() {
-        Json(json!({"status":"ready"})).into_response()
+        Json(json!({
+                    "status": "ready",
+                    "worker": "ai48proxy",
+                    "home_managed": true,
+                    "providers": ["openai-compatible", "codex", "claude", "gemini", "vertex", "antigravity", "xai", "kimi", "meta"],
+                    "deferred_capabilities": ["native-plugin", "gemini-cli", "aistudio-ws-relay", "xai-websocket", "advanced-codex-ws", "advanced-replay"]
+                })).into_response()
     } else {
         error(
             StatusCode::SERVICE_UNAVAILABLE,

@@ -188,6 +188,24 @@ fn chat_tools_go_schema_cleanup_and_synthetic_replay() {
 const BYPASS_FIXTURE: &str = "skip_thought_signature_validator";
 
 #[test]
+fn replay_restores_native_function_response_id_from_stable_provenance() {
+    let selection = selected(json!({"metadata":{"project_id":"p"}}));
+    let args = json!({"path":"/tmp/file"});
+    let stable_id = super::tools::stable_replay_id("native-call", "Read", &args);
+    let mut body = json!({
+        "contents":[
+            {"role":"model","parts":[{"functionCall":{"id":"native-call","name":"Read","args":args}}]},
+            {"role":"user","parts":[{"functionResponse":{"id":stable_id,"name":"Read","response":{"result":"ok"}}}]}
+        ]
+    });
+
+    normalize(&mut body, &selection).unwrap();
+    let response = &body["request"]["contents"][1]["parts"][0]["functionResponse"];
+    assert_eq!(response["id"], "native-call");
+    assert_eq!(response["name"], "Read");
+}
+
+#[test]
 fn native_tool_schema_preserves_types_and_claude_placeholders() {
     for model in ["gemini-3-flash", "claude-sonnet-4-5"] {
         let mut selection = selected(json!({"metadata":{"project_id":"p"}}));

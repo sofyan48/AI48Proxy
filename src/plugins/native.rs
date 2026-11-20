@@ -1,4 +1,6 @@
 use anyhow::{Context, Result, bail, ensure};
+#[cfg(windows)]
+use std::ffi::CStr;
 use std::{
     ffi::{CString, c_char, c_int, c_void},
     path::{Path, PathBuf},
@@ -46,14 +48,6 @@ struct PluginApi {
 }
 
 type Init = unsafe extern "C" fn(*const HostApi, *mut PluginApi) -> c_int;
-
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-pub struct PluginCapabilities {
-    pub executor: bool,
-    pub scheduler: bool,
-    pub auth_provider: bool,
-    pub model_provider: bool,
-}
 
 pub struct NativePlugin {
     path: PathBuf,

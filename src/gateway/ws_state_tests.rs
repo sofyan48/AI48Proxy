@@ -92,3 +92,30 @@ fn controls_require_exact_current_response_ownership() {
     assert!(!control(&frame, None));
     assert!(!control(&json!({"type":"response.cancel"}), Some("r1")));
 }
+
+#[test]
+fn overlapping_terminals_only_close_their_own_response() {
+    assert_eq!(
+        terminal_response_id(
+            &json!({"type":"response.completed","response":{"id":"r2"}}),
+            Some("r1")
+        ),
+        Some("r2")
+    );
+    assert!(!terminal_owns_active(
+        &json!({"type":"response.completed","response":{"id":"r2"}}),
+        Some("r1")
+    ));
+    assert!(terminal_owns_active(
+        &json!({"type":"response.failed","response":{"id":"r1"}}),
+        Some("r1")
+    ));
+}
+
+#[test]
+fn idless_failures_are_attributed_to_the_active_response() {
+    let event = json!({"type":"error","error":{"message":"upstream"}});
+    assert_eq!(terminal_response_id(&event, Some("r1")), Some("r1"));
+    assert!(terminal_owns_active(&event, Some("r1")));
+    assert_eq!(terminal_response_id(&event, None), None);
+}

@@ -225,10 +225,13 @@ async fn session(
                     active_id = event.pointer("/response/id").and_then(Value::as_str).map(str::to_owned);
                     ensure!(active_id.is_some(), "response id missing");
                 }
-                let terminal = matches!(kind, "response.completed" | "response.done" | "response.failed" | "response.incomplete" | "response.cancelled");
-                if terminal {
-                    let id = event.pointer("/response/id").and_then(Value::as_str);
-                    ensure!(turn.is_some() && id.is_some() && id == active_id.as_deref(), "terminal response mismatch");
+                let terminal = matches!(kind, "error" | "response.completed" | "response.done" | "response.failed" | "response.incomplete" | "response.cancelled");
+                let owns_active = ws_state::terminal_owns_active(&event, active_id.as_deref());
+                if terminal && kind != "error" {
+                    ensure!(ws_state::terminal_response_id(&event, active_id.as_deref()).is_some(), "terminal response id missing");
+                }
+                if owns_active {
+                    ensure!(turn.is_some(), "terminal response without active turn");
                     let successful = matches!(kind, "response.completed" | "response.done")
                         && event.pointer("/response/status").and_then(Value::as_str).is_none_or(|s| s == "completed");
                     let current = turn.as_mut().expect("checked turn");
@@ -242,7 +245,7 @@ async fn session(
                     active_id = None;
                 }
                 writer.send(Message::Text(text.into())).await?;
-                if kind == "error" { anyhow::bail!("upstream rejected request"); }
+                if kind == "error" && owns_active { anyhow::bail!("upstream rejected request"); }
             },
             message = input.recv() => {
                 let Some(message) = message else { break; };

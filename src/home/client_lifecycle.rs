@@ -72,7 +72,8 @@ impl HomeClient {
                     Ok(next) => next,
                     Err(_) => break "config_parse",
                 };
-                if validate_support(&next).is_err() {
+                if validate_support(&next).is_err() || validate_worker_capabilities(&next).is_err()
+                {
                     break "config_unsupported";
                 }
                 let old = self.config();

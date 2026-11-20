@@ -2,8 +2,16 @@
 //! This module owns loading and lifetime only; higher-level Home callbacks are
 //! deliberately explicit and fail closed until their contract is implemented.
 
+mod home_contract;
+mod manager;
 mod native;
-pub use native::{AbiVersion, NativePlugin, PluginBuffer, PluginCapabilities};
+pub use home_contract::{
+    InstallPlan, PluginArtifact, PluginManifest, PluginPlatform, PluginStatus, PluginStatusEntry,
+    PluginSyncItem, PluginSyncRequest, PluginSyncResponse, PluginTask, ResolvedAuthConfig,
+    parse_sync_plan, validate_plugin_path,
+};
+pub use manager::{PluginCapabilities, PluginInfo, PluginManager};
+pub use native::{AbiVersion, NativePlugin, PluginBuffer};
 
 #[cfg(test)]
 mod tests {

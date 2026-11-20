@@ -1,5 +1,7 @@
 # AI48Proxy
 
+Licensed under the [MIT License](LICENSE).
+
 An asynchronous AI gateway written in Rust and Tokio, designed to run as an
 **AI48Home-managed worker**. AI48Home controls credentials, model access, routing
 and cluster policy; AI48Proxy executes selected upstream requests and reports
@@ -60,12 +62,29 @@ nginx. Worker containers use the published multi-architecture image
 configuration, initializes a fresh database once, provisions distinct worker
 tokens and starts services in readiness order.
 
+Download or run the installer from the AI48Proxy repository root:
+
 ```sh
-./install.sh init
-./install.sh deploy
+curl -fsSLO https://raw.githubusercontent.com/sofyan48/AI48Proxy/main/install.sh
+chmod +x install.sh
+./install.sh init       # create the local .env and deployment files
+./install.sh deploy    # pull GHCR worker images and start the production stack
 ./install.sh status
 ./install.sh logs ai48proxy-1
 ```
+
+Useful lifecycle commands:
+
+```sh
+./install.sh start
+./install.sh stop
+```
+
+`deploy` is the production-style three-worker stack with AI48Home, PostgreSQL,
+and Nginx. It pulls images; it does not build the worker locally. For source
+reload during development, use [Development Docker Compose](#development-docker-compose)
+instead. Run it from the repository root so the generated `deploy/` files and
+Compose configuration remain together.
 
 The installer does not build the worker image locally. Set `AI48PROXY_IMAGE` in
 `.env` to pin a release, for example `ghcr.io/sofyan48/ai48proxy:v0.1.0`.

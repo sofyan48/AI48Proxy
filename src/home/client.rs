@@ -6,6 +6,7 @@ use super::{
 use crate::{
     config::Config,
     execution::{Registry, ReleaseFrame},
+    plugins::{PluginStatus, PluginSyncRequest, PluginSyncResponse, PluginTask},
     reporting::ReportingQueue,
 };
 use anyhow::{Context, Result, bail, ensure};
@@ -339,6 +340,16 @@ impl HomeClient {
     /// Request the Home-owned plugin synchronization plan for this mTLS worker.
     /// The request and response are sensitive because manifests may contain URLs
     /// and verification material; callers must not log either body.
+    pub async fn plugin_sync_typed(
+        &self,
+        request: PluginSyncRequest,
+    ) -> Result<PluginSyncResponse> {
+        request.validate()?;
+        let value = self.plugin_sync(serde_json::to_value(request)?).await?;
+        let bytes = serde_json::to_vec(&value)?;
+        PluginSyncResponse::parse(&bytes, chrono::Utc::now())
+    }
+
     pub async fn plugin_sync(&self, request: Value) -> Result<Value> {
         let command = self.command(vec![
             b"GET".to_vec(),
@@ -362,6 +373,11 @@ impl HomeClient {
     }
 
     /// Fetch pending Home plugin tasks for this worker node.
+    pub async fn plugin_tasks_typed(&self) -> Result<Vec<PluginTask>> {
+        let value = self.plugin_tasks().await?;
+        serde_json::from_value(value).context("invalid Home plugin task response")
+    }
+
     pub async fn plugin_tasks(&self) -> Result<Value> {
         let bytes = self
             .command(vec![b"GET".to_vec(), b"plugin-tasks".to_vec()])
@@ -372,6 +388,11 @@ impl HomeClient {
     }
 
     /// Acknowledge a plugin status report after local processing has completed.
+    pub async fn push_plugin_status_typed(&self, status: &PluginStatus) -> Result<()> {
+        status.validate()?;
+        self.push_plugin_status(serde_json::to_vec(status)?).await
+    }
+
     pub async fn push_plugin_status(&self, payload: Vec<u8>) -> Result<()> {
         let command = self.command(vec![b"RPUSH".to_vec(), b"plugin-status".to_vec(), payload]);
         let reply = tokio::time::timeout(PLUGIN_STATUS_TIMEOUT, command)

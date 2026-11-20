@@ -1,5 +1,6 @@
 //! Declaration-only schema conversion and conservative synthetic tool replay.
 use super::*;
+use sha2::{Digest, Sha256};
 use std::collections::HashMap;
 
 const BYPASS: &str = "skip_thought_signature_validator";
@@ -8,6 +9,22 @@ fn signature(value: &str) -> bool {
         value,
         "skip_thought_signature_validator" | "context_engineering_is_the_way_to_go"
     )
+}
+
+struct PendingCall {
+    name: String,
+    args: Value,
+}
+
+pub(super) fn stable_replay_id(call_id: &str, name: &str, args: &Value) -> String {
+    let args = serde_json::to_string(args).expect("validated JSON arguments");
+    let mut hash = Sha256::new();
+    hash.update(call_id.trim());
+    hash.update([0]);
+    hash.update(name.trim());
+    hash.update([0]);
+    hash.update(args);
+    format!("cpa_gemini_{}", hex::encode(&hash.finalize()[..16]))
 }
 
 pub(super) fn normalize(body: &mut Value, model: &str) -> Result<()> {
@@ -130,7 +147,7 @@ pub(super) fn normalize(body: &mut Value, model: &str) -> Result<()> {
             );
         }
     }
-    let mut pending = HashMap::<String, String>::new();
+    let mut pending = HashMap::<String, PendingCall>::new();
     for content in body["contents"].as_array_mut().unwrap() {
         let role = content
             .get("role")
@@ -219,7 +236,13 @@ pub(super) fn normalize(body: &mut Value, model: &str) -> Result<()> {
                         "Antigravity provider-issued signature replay unsupported"
                     );
                 }
-                pending.insert(id.to_owned(), name.to_owned());
+                pending.insert(
+                    id.to_owned(),
+                    PendingCall {
+                        name: name.to_owned(),
+                        args: call["args"].clone(),
+                    },
+                );
                 if let Some(sig) = sig
                     .as_ref()
                     .and_then(Value::as_str)
@@ -247,18 +270,35 @@ pub(super) fn normalize(body: &mut Value, model: &str) -> Result<()> {
                         .all(|k| ["id", "name", "response"].contains(&k.as_str())),
                     "unsupported functionResponse field"
                 );
-                let id = response
+                let response_id = response
                     .get("id")
                     .and_then(Value::as_str)
                     .ok_or_else(|| anyhow::anyhow!("missing response id"))?;
-                let name = pending
-                    .remove(id)
-                    .ok_or_else(|| anyhow::anyhow!("unknown functionResponse id"))?;
+                let (native_id, call) = if let Some(call) = pending.remove(response_id) {
+                    (response_id.to_owned(), call)
+                } else {
+                    let match_id = pending.iter().find_map(|(native_id, call)| {
+                        (stable_replay_id(native_id, &call.name, &call.args) == response_id)
+                            .then_some(native_id.clone())
+                    });
+                    let native_id =
+                        match_id.ok_or_else(|| anyhow::anyhow!("unknown functionResponse id"))?;
+                    let call = pending
+                        .remove(&native_id)
+                        .expect("matched pending replay call");
+                    (native_id, call)
+                };
                 ensure!(
-                    response.get("name").and_then(Value::as_str) == Some(name.as_str())
+                    response.get("name").and_then(Value::as_str) == Some(call.name.as_str())
                         && response.get("response").is_some_and(Value::is_object),
                     "invalid functionResponse pairing"
                 );
+                if response_id != native_id {
+                    part.get_mut("functionResponse")
+                        .and_then(Value::as_object_mut)
+                        .expect("validated functionResponse")
+                        .insert("id".into(), native_id.into());
+                }
             } else {
                 ensure!(sig.is_none(), "Antigravity signed text replay unsupported");
                 ensure!(pending.is_empty(), "tool results must follow tool calls");

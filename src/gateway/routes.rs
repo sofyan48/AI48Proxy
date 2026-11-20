@@ -203,8 +203,11 @@ pub(super) async fn generate(
             },
             response = prepared.request.send() => response,
         };
-        observe_result(&mut result, &mut attempt).await;
-        if !refreshed_once
+        let rules =
+            crate::config::execution::resolve_rules(&config, &selection.provider, &selection.auth);
+        let mut scoped = observe_result_with_rules(&mut result, &mut attempt, &rules).await;
+        if !scoped.is_some_and(|action| action.stops())
+            && !refreshed_once
             && result
                 .as_ref()
                 .is_ok_and(|r| r.status() == StatusCode::UNAUTHORIZED)
@@ -273,7 +276,12 @@ pub(super) async fn generate(
                     },
                     response = prepared.request.send() => response,
                 };
-                observe_result(&mut result, &mut attempt).await;
+                let rules = crate::config::execution::resolve_rules(
+                    &config,
+                    &selection.provider,
+                    &selection.auth,
+                );
+                scoped = observe_result_with_rules(&mut result, &mut attempt, &rules).await;
             }
         }
         let translation = prepared.translation;
@@ -291,7 +299,10 @@ pub(super) async fn generate(
         // This decision is strictly before any body read/output. Body failures below
         // never return to dispatch, including SSE failures after response headers.
         let will_retry = retryable
-            && !(result.is_ok() && attempt.record.fail_code == "request_scoped")
+            && !scoped.is_some_and(|action| action.stops())
+            && !(result.is_ok()
+                && attempt.record.fail_code == "request_scoped"
+                && scoped.is_none())
             && can_retry(
                 round,
                 selection.request_retry,
@@ -421,16 +432,26 @@ pub(super) async fn generate(
     }
 }
 
-/// Preserve HTTP attribution before refresh/retry can discard the response.
+#[cfg(test)]
 async fn observe_result(
     result: &mut Result<reqwest::Response, reqwest::Error>,
     attempt: &mut lifecycle::Attempt,
 ) {
+    observe_result_with_rules(result, attempt, &[]).await;
+}
+
+/// Preserve HTTP attribution before refresh/retry can discard the response.
+/// Configured request-scoped rules match the bounded body locally, as CPA does.
+async fn observe_result_with_rules(
+    result: &mut Result<reqwest::Response, reqwest::Error>,
+    attempt: &mut lifecycle::Attempt,
+    rules: &[crate::config::execution::RequestScopedRule],
+) -> Option<crate::config::execution::ErrorAction> {
     let response = match result {
         Ok(response) => response,
         Err(_) => {
             attempt.record.local_failure(502);
-            return;
+            return None;
         }
     };
     let status = response.status().as_u16();
@@ -439,7 +460,7 @@ async fn observe_result(
         // Headers do not complete an execution. A dropped/incomplete body remains a
         // request-scoped failure until the response consumer proves completion.
         attempt.record.local_failure(status);
-        return;
+        return None;
     }
     let retry_after_seconds = response
         .headers()
@@ -493,10 +514,19 @@ async fn observe_result(
         );
     }
     // An unreadable error body does not erase the genuine HTTP failure.
-    attempt.record.upstream_failure(status, &body);
-    if request_scoped {
+    // Rules see the bounded body text only; it is never returned or logged.
+    let raw = match &body {
+        Value::String(text) => text.clone(),
+        Value::Null => String::new(),
+        other => other.to_string(),
+    };
+    let action = attempt
+        .record
+        .upstream_failure_with_rules(status, &raw, rules);
+    if request_scoped && action.is_none() {
         attempt.record.fail_code = "request_scoped".into();
     }
+    action
 }
 
 fn accepts_sse(mode: crate::providers::ResponseMode, content_type: &str) -> bool {

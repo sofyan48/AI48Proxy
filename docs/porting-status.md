@@ -10,16 +10,19 @@ configuration is production-ready.
 | --- | --- |
 | Home transport | RESP2 command connections, certificate enrollment and verified mTLS |
 | Configuration | Subscription updates, typed normalization, immutable snapshots and explicit unsupported-setting validation |
-| Membership | Heartbeat fencing, reconnect recovery, discovery, conditional takeover and drained-worker rebalance |
+| Membership | Heartbeat fencing, reconnect recovery, discovery, conditional takeover and planned replacement-connection rebalance; active work remains origin-owned |
+| Balance telemetry | Negotiated `cpa_latency_swap_v1` subscription RTT sampling, `CLUSTER BALANCE LATENCY` reports/probes and randomized equal-load node choice |
 | Execution ownership | Home admission, cumulative releases, in-flight snapshots, cancellation and ambiguous-dispatch fencing |
-| Usage | Durable accepted-event outbox, replay, bounded admission and supported token/image accounting fields |
-| Logs | Bounded application-log forwarding and opt-in sanitized request metadata forwarding |
+| Usage | Durable accepted-event outbox, current-Home restart replay, process-local origin routing during handoff, supported token/image fields and optional `media_counts` |
+| Logs | Bounded application logs; opt-in generation request logs submitted once at body completion/error/disconnect (499), with provider attribution |
 | OpenAI-compatible upstreams | Home-selected custom bases and credentials, Chat execution and Responses bridges |
-| Codex | HTTP Responses, constrained WebSocket sessions, cache identity helpers and supported image execution |
+| Codex | HTTP Responses, constrained WebSocket sessions, HTTP scoped cache identity before payload rules and supported image execution |
 | Claude | Messages, Chat translation, focused OAuth wire preparation, final-body attribution signing and HTTP failure classification |
 | Google-format upstreams | Gemini, Vertex native/OpenAPI routing, Antigravity envelopes and supported function-tool translation |
-| Media | Supported image generation/editing and xAI speech; unsupported combinations fail explicitly |
-| Runtime controls | Payload rules, supported reasoning settings, response filtering, keepalives, shutdown bounds and image-generation modes |
+| New text providers | xAI and Meta native Responses/Chat bridges; Kimi and `kimi-ai` native Chat/Responses; unsupported sources/tools/replay fail closed |
+| Media | Supported images, xAI image completion SSE, xAI speech and JSON-only xAI video generation/edit/extension/retrieval with OpenAI-style facade and Home-KV credential binding |
+| Media lifecycle | Shared Home-owned refresh, eligible retry, request-scoped actions, cancellation and release-before-redispatch; video retrieval stays credential-pinned |
+| Runtime controls | Payload rules, bounded original-byte request-scoped error matching, reasoning controls, response filtering, pre-header SSE keepalives, shutdown bounds and image-generation modes |
 
 See the [provider guide](provider.md) for request-level restrictions and the
 [Home integration guide](home-compatibility.md) for lifecycle ownership.
@@ -31,31 +34,33 @@ local upstream HTTP/WebSocket fixtures, payload ordering and lifecycle ownership
 These checks do not demonstrate that a live provider accepts a particular account,
 model, tool schema or billing configuration.
 
-Previous development sessions exercised live Codex SSE successfully. That is a
-point-in-time observation, not an availability guarantee. Claude testing was
-blocked by Home credential availability at the last recorded live check. Provider
-account state, balances and credentials must be verified in the deployment itself;
-private account details do not belong in public documentation.
-
-The latest attempted Docker rebuild/start was interrupted by the operator. Do not
-assume that the newest source has been deployed. Check the running image and worker
-health before testing changes.
+This status describes source wiring, not live acceptance or a record that the
+newest source is deployed. Verify running revisions, provider account state,
+balances, credentials and Home accounting in the intended deployment. Private
+account details do not belong in public documentation.
 
 ## Remaining work
 
 - Native plugin execution and Gemini CLI execution.
-- Full realtime/video workflows and credential-bound video retrieval.
+- General realtime workflows, xAI WebSockets, video forms/streaming and non-xAI
+  video execution; compatible/Codex image SSE.
 - WebSocket proxy transport, overlapping turns, advanced steering and recovery.
-- Advanced Claude helper/subagent profiles, tool alias reversal, continuity/date
+- Advanced Claude helper/workload profiles, tool alias reversal, continuity/date
   pinning and signed reasoning replay.
 - Advanced Antigravity signed replay, complex schemas, incremental tool arguments
   and multimedia behavior.
 - Remaining provider-specific controls, specialized Vertex operations and
   cross-format conversions.
-- Active-execution migration during rebalance and latency-based Home selection
-  optimizations.
-- Complete configured end-to-end validation for new runtime controls, request-log
-  completion/cancellation semantics and all media billing dimensions.
+- Broader xAI/Kimi/Meta source bridges, advanced tools/reasoning replay and stateful
+  continuation/compaction; Meta DCA-only key pre-minting and subscription attestation.
+- Deployment qualification of live handoff/rollback, negotiated latency telemetry,
+  keepalive/error/disconnect behavior, media binding expiry and billing dimensions.
+  These are validation tasks, not claims that the source wiring is absent.
+
+Devin is intentionally out of scope, not a pending supported executor. Planned
+rebalance does not transfer active execution ownership: releases/usage stay bound
+to the origin during the process lifetime. Origin routing is not persisted, so
+restart usage replay uses the current Home, as in the reference worker.
 
 Only remove a capability restriction when request preparation, response handling,
 configuration, execution lifecycle and accounting are implemented and tested.

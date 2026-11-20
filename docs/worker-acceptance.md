@@ -10,8 +10,8 @@ the applicable gates pass for the intended workload.
 
 Run commands from the AI48Proxy root. See [integration architecture](home-compatibility.md)
 for membership, configuration and accounting contracts, and
-[implementation status](porting-status.md) for a dated checkpoint. Historical live
-results in that checkpoint do not satisfy these gates for another deployment.
+[implementation status](porting-status.md) for source-backed capabilities. Neither
+document satisfies these gates for a deployment.
 Record AI48Proxy and AI48Home revisions, `rustc --version`, `cargo --version`,
 OS/architecture, image digest, configuration revision, enabled providers and UTC
 test window privately. If an external compatibility comparison is needed, record
@@ -197,11 +197,12 @@ alone is not support for every format/credential combination.
 | `POST /v1beta/models/{model}:streamGenerateContent` | Native Gemini API-key SSE |
 | `POST /v1/messages/count_tokens` | Native Claude API-key estimate; no fabricated inference usage |
 | Image/audio routes | Test only the selected provider's implemented path and configuration gates; verify usage and cancellation separately |
-| Video routes | Explicit unsupported response; registration is not execution support |
+| Video routes | xAI JSON generation/edit/extension, bound retrieval and OpenAI-style facade/content; reject forms, expired/missing bindings and wrong credentials |
+| xAI/Kimi/Meta text | Test each implemented Chat/Responses path; unsupported Claude/Gemini sources, advanced tools/replay and continuation fail closed |
 
 For Vertex/Antigravity, also verify Home-prepared credentials, required project/
 location metadata, envelope handling and the exact supported tool/schema subset.
-For image/audio, inspect `src/gateway/media.rs` before selecting the test matrix;
+For media, inspect `src/gateway/media.rs` and `media_video.rs` before selecting the test matrix;
 route presence does not establish general multimedia or realtime support.
 
 Also test unauthorized access, disallowed alias, exhausted concurrency (429),
@@ -210,6 +211,19 @@ Reject silent executor fallback, leaked credential/error bodies, or a 200 stream
 that terminates without its expected terminal event. Cancel a long stream by
 closing the test client and confirm cancellation/release below. Do not require
 request-log records as proof of usage: those are separate Home contracts.
+
+With request logs enabled, verify exactly one generation log submission after
+body completion, error or disconnect (499), with a provider label after selection
+and no secrets. For `send-keepalive-before-ft`, delay upstream headers: verify SSE
+comments, HTTP errors before commitment, SSE error envelopes after commitment and
+upstream cancellation on disconnect. Test request-scoped rules against original
+error bytes (including whitespace/invalid UTF-8), the 64 KiB complete-body bound,
+and stop/continue/cooldown behavior in both text and media retry paths.
+
+For video, verify `video-result-auth-cache-ttl` (default `3h`), expiry/renewal,
+credential-pinned retrieval, unavailable Home KV and downloads that forward no
+authorization. Confirm completed video duration produces supported `media_counts`;
+a queued job ID and raw speech bytes must not fabricate duration/counts.
 
 ## 5. Usage, cumulative release and observation gate
 
@@ -246,7 +260,9 @@ For each successful, failed, translated and cancelled request:
 - Interrupt Home after usage is durably accepted into the outbox; terminate and
   restart the worker on the same persistent storage. Verify replay, Home dedupe
   and persistent local ACK deletion. No accepted record may silently disappear.
-  Snapshot/release state is not a durable outbox and must not be assumed to survive
+  Origin usage routing is process-local: after restart, replay uses the current
+  Home, matching the reference worker, not a persisted origin. Snapshot/release
+  state is not a durable outbox and must not be assumed to survive
   process restart. Reconcile the old membership at Home before normal admission.
 - Separately test capacity/storage failure on disposable storage: admission must
   fence rather than evict queued usage. Preserve corrupt records for diagnosis;
@@ -277,13 +293,16 @@ bounded operator deadlines derived from Home's heartbeat/cancel/snapshot setting
 3. With a multi-Home test cluster, lose the active target and verify discovered
    alternate-target admission. Test full process restart separately: discovered
    targets are not persisted, so explicit startup targets must still be reachable.
-   Exercise a planned rebalance separately: busy/pending/release-unacknowledged
-   workers must not migrate live counters. A drained worker must claim the exact
-   plan/term/target, preflight it, register with a fresh registry and acknowledge
-   the result before restoring readiness. Inject stale/rejected claims, failed
-   target preflight, destination registration failure and lost result ACKs. Verify
-   failure reporting/fallback or fencing, not silent success. Do not count typed
-   latency helper coverage as proof of latency-driven balancing.
+   Exercise planned rebalance while executions, pending admissions and releases
+   are outstanding. Verify the exact plan/term/target claim and preflight, fresh
+   destination registration and acknowledged result before replacement readiness.
+   Active streams must continue on the origin, with releases and usage delivered
+   there rather than transferred into the destination registry. Inject stale/rejected
+   claims, failed preflight, destination registration failure and lost result ACKs;
+   verify rollback to origin or safety fencing, not silent success. With negotiated
+   `cpa_latency_swap_v1`, verify subscription RTT sampling, `CLUSTER BALANCE LATENCY`
+   reports and discovered-target probes; telemetry must not renew heartbeat health.
+   Verify randomized selection across equal-load discovery candidates separately.
 4. Apply a supported Home update and verify new-request behavior and immutable
    in-flight configuration. Save a private downstream snapshot and validate with
    `./target/release/ai48proxy --check-config /PRIVATE/home-snapshot.yaml`.
@@ -302,7 +321,7 @@ bounded operator deadlines derived from Home's heartbeat/cancel/snapshot setting
    encrypted private storage. Restore only with the original owner stopped and
    after Home reconciliation. A stale backup can replay ACKed events and cannot
    restore missing post-backup usage; test Home dedupe. Do not rotate only key
-   files or clone one identity across replicas. Roll back to the previously
+   files or share one identity across replicas. Roll back to the previously
    accepted deployment using a separate identity after draining/reconciling the
    worker. Another implementation cannot be assumed to consume this worker's
    private usage outbox. Retain the worker volume until reconciliation.
@@ -317,17 +336,17 @@ bounded operator deadlines derived from Home's heartbeat/cancel/snapshot setting
 | Codex OAuth | HTTP Responses and constrained WebSocket sessions with per-turn accounting; full SIWC, continuation, overlap and steering semantics remain incomplete |
 | Vertex | Native Gemini/OpenAPI Chat with Home-prepared token/API-key credentials as appropriate; no local service-account exchange or complete specialized API coverage |
 | Antigravity | Native envelope execution and focused Chat/tool bridge; signed reasoning replay/cache fidelity, complex schemas and advanced tools remain limited |
-| Image/audio | Selected source paths and configuration gates only; not general multimedia/realtime support; video routes remain unsupported |
+| Image/audio/video | Supported source/configuration subsets; xAI image completion SSE and credential-bound JSON video, not general realtime support; compatible/Codex image SSE and video forms reject |
 | Other execution/auth | Gemini CLI and plugin execution unavailable; no general local login/refresh fallback |
-| Membership | Conditional drained takeover and drain-only planned rebalance; no live registry/counter transfer or persisted discovery targets |
+| Membership | Conditional drained takeover; planned connection handoff preserves origin-owned active work and rolls back on failure; no live counter transfer or persisted discovery/origin routing |
 | Configuration/operations | Supported keepalive/retry/body/drain controls; known unsupported active settings reject; fresh mTLS command connections prioritize ownership isolation over throughput |
 | Accounting | Durable accepted usage and supported v2 fields; crash gaps and complete provider billing equivalence remain unproven |
 
 Do not promote a worker for a workload requiring an unsupported capability or an
 unpassed gate. Test the exact credential/provider/format/tool/session combination;
 a successful basic request does not qualify advanced OAuth, caching, billing,
-retry or media behavior. Consult current route/provider source and the dated
-[implementation checkpoint](porting-status.md), rather than treating historical
+retry or media behavior. Consult current route/provider source and the
+[implementation status](porting-status.md), rather than treating historical
 feature inventories as complete.
 
 When needed, CLIProxyAPI can serve as an external compatibility reference using a

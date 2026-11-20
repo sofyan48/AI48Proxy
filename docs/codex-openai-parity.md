@@ -55,11 +55,21 @@ Payload rules run once after built-ins and can override or filter normalized bus
 
 ## Cache keys and headers
 
-An explicit Responses `prompt_cache_key` seeds the HTTP `session-id` header before final payload rules. Nonblank incoming session headers can override it; trusted credential headers are applied after provider forwarding. The gateway additionally appends its shared incoming session headers, so request-builder precedence alone must not be treated as a guarantee that the final wire contains only one session-header value.
+Codex HTTP cache identity is actively wired for regular and compact preparation
+before final payload rules. It uses original caller context rather than translated
+fields or credential metadata: explicit source keys take precedence, then trusted
+execution/derived session scope, with the supported caller-scoped Chat fallback.
+Responses explicit keys remain verbatim; Chat keys are trimmed. The derived
+conversation root is caller-isolated and suppressed by explicit session identity.
+The resulting key seeds both `prompt_cache_key` and the HTTP `session-id` header.
+Payload rules may then override or remove the body key without restoring it. Nonblank incoming session headers can override it; trusted credential headers are applied after provider forwarding. The gateway additionally appends its shared incoming session headers, so request-builder precedence alone must not be treated as a guarantee that the final wire contains only one session-header value.
 
-Codex forwards an allowlist of turn/version/request headers, never downstream authorization. OAuth user-agent defaults follow configured, caller, then built-in fallback precedence; trusted credential headers are applied last within provider preparation. Caller `originator` can be forwarded. API-key mode does not acquire OAuth account identity merely because metadata contains an account ID.
+Codex forwards an allowlist of turn/version/request headers, never downstream authorization. OAuth client identification defaults follow configured, caller, then built-in fallback precedence; trusted credential headers are applied last within provider preparation. Caller `originator` can be forwarded. API-key mode does not acquire OAuth account identity merely because metadata contains an account ID.
 
-The repository also contains source-specific cache-key derivation helpers. Their existence does not imply every HTTP gateway path injects a derived key. Downstream WebSocket sessions do actively derive a provider-scoped execution key when an explicit key is absent.
+The gateway supplies cache identity through request-scoped preparation context,
+including refresh/rebuild; it does not obtain execution identity from provider
+credential metadata. Downstream WebSocket sessions also derive a provider-scoped
+execution key when an explicit key is absent.
 
 For compatible Chat, Home's selected model options control `use-max-completion-tokens`: false/default keeps `max_tokens`, true keeps `max_completion_tokens`, and an existing preferred value wins when both are present. Streaming requests ask for usage. Text-only input-modality options normalize tool-result images into omission text rather than sending unsupported image content.
 
@@ -84,13 +94,24 @@ WS continuation state is restored before its final payload rules; only event fra
 
 The dedicated `/v1/images/generations` and `/v1/images/edits` handlers support Codex direct Images requests for recognized image models and a Responses image-generation-tool bridge for other selections. The bridge uses configured `gpt-image-2-base-model`, extracts image results only after completion, and can use indexed `output_item.done` output when the completion output is empty.
 
-These are buffered image endpoints, not image SSE or general Responses output retrieval. Compatible image providers use the separate media compatibility checks and trusted base; support for text Chat does not automatically establish every media capability. See [Provider support](provider.md) for xAI speech, image policy, and unsupported video routes.
+These are buffered image endpoints, not image SSE or general Responses output retrieval. Compatible image providers use the separate media compatibility checks and trusted base; support for text Chat does not automatically establish every media capability. See [Provider support](provider.md) for xAI image completion SSE, speech, image
+policy and credential-bound xAI video routes.
 
 ## Response integrity and lifecycle
 
 Codex HTTP uses a bounded incremental event decoder and terminal validation rather than trusting only `Content-Type`. It handles `response.completed` and the supported `response.done` alias, collects the completed response for buffered callers, and translates events for Chat callers. Missing completion, malformed events, provider failure, or truncation must not be reported as a successful execution.
 
-The generation gateway owns cancellation, accounting, execution release, eligible precommit retries, and Home-owned OAuth refresh. A built request does not prove any of those transport behaviors. WebSocket and media paths have their own lifecycle boundaries and do not inherit every HTTP retry feature.
+The generation gateway owns cancellation, accounting, execution release, eligible
+precommit retries, and Home-owned OAuth refresh. Media uses a shared refresh/retry
+conductor with release-before-redispatch, request-scoped actions and cancellation;
+pinned video retrieval does not rotate credentials. WebSockets retain separate
+lifecycle/retry boundaries. A built request alone does not prove these behaviors.
+
+Request-scoped error rules operate on complete original error bodies bounded to
+64 KiB, before sanitization, rather than normalized JSON. Stop actions suppress
+refresh/rotation; continue actions permit otherwise eligible retry. Cooldown
+variants report `force_cooldown` to Home, which owns scheduling. Incomplete or
+oversized bodies cannot match a partial prefix.
 
 ## Automated coverage and live-validation boundary
 

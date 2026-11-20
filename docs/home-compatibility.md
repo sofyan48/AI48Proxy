@@ -62,7 +62,7 @@ was sent. A lost reply can mean the capability was consumed: preserve the identi
 and `enrollment-sent` marker, reconcile/revoke through Home, and obtain operator
 approval before reprovisioning. Deleting the marker and blindly retrying is unsafe.
 On Unix, identity directories/files use 0700/0600. One identity and reporting
-volume must have exactly one process owner; never clone it across replicas.
+volume must have exactly one process owner; never share it across replicas.
 
 Normal Home commands use bounded RESP2 over verified mTLS with the pinned CA and
 client certificate. Home checks both the certificate chain and its database record.
@@ -119,18 +119,28 @@ rejection selects the legacy form without UUID/takeover. Legacy negotiation does
 not waive the requirement for valid lifecycle configuration. Process restart
 creates a new instance identity, not automatic safe takeover of its predecessor.
 
-The subscription control path can enable rebalance and process a Home plan.
-Migration is **drain-only**: it stops admission and declines to claim while active
-executions, pending admissions or unacknowledged releases remain. Once drained,
-it claims the plan/term/target, preflights the target, retires the old lifetime and
-registers at the destination. The supervisor requires acknowledged rebalance result
-reporting before publishing the replacement. Failure paths may report failure,
-return to the origin or fence; they do not transfer a live registry. Typed latency
-helpers alone do not establish a complete latency-driven migration implementation.
+The subscription control path enables rebalance and processes Home plans without
+requiring active executions, pending admissions or outstanding releases to drain.
+It claims the plan/term/target and preflights the destination before stopping new
+admission. Only the replacement connection/membership moves: active executions
+continue with their origin Home and registry. Origin maintenance retains cumulative
+release ownership and usage routing until settlement; no live counters are moved
+into the destination registry. The supervisor requires an acknowledged result
+before publishing replacement readiness. Target registration/result failure rolls
+back to the origin; failed preflight leaves the origin serving after failure
+reporting. Unsafe control acknowledgement failures can still fence admission.
+
+Latency sampling and reporting are active when Home negotiates
+`cpa_latency_swap_v1`. Subscription RTT tokens do not renew heartbeat health.
+Bounded process-local history is reported through `CLUSTER BALANCE LATENCY`;
+Home-requested probes are limited to discovered alternate targets. Discovery
+orders nodes by client count and randomizes equal-load choices. These mechanisms
+are implemented, but do not establish a production balancing or failover result.
 
 Implementation: `src/home/client.rs`, `src/home/client_lifecycle.rs`,
 `src/home/membership.rs`, `src/home/supervisor.rs`, `src/home/rebalance.rs` and
-`src/home/cluster.rs`. Exercise takeover, rejection, stale plans and destination
+`src/home/cluster.rs`, `src/home/latency.rs` and `src/home/reporting.rs`.
+Exercise takeover, rejection, stale plans and destination
 failure against the deployed Home before relying on them operationally.
 
 ## Configuration contract
@@ -153,7 +163,7 @@ In-flight work retains its captured configuration.
 | --- | --- |
 | Retry and credential limits | Home-coordinated retry, exclusion and release-before-redispatch |
 | `proxy-url` and selected credential overrides | HTTP(S) proxy/direct upstream transport; SOCKS is rejected |
-| `streaming` and nonstream keepalive | Configured response keepalive and pre-output bootstrap handling |
+| `streaming` and nonstream keepalive | Response keepalives, including SSE while awaiting upstream headers with `send-keepalive-before-ft` |
 | `payload` | Context-aware rules after built-in business mutations, before transport/signing |
 | `credential-concurrency` | Registration revision, heartbeat/cancel bounds and release timing |
 | `credential-in-flight` | Snapshot interval, observation barrier, multipart and cardinality limits |
@@ -174,6 +184,30 @@ or override configured values. Connection acquisition and lifecycle cancellation
 are distinct from broad request/read deadlines; long upstream streams must not
 acquire an undocumented whole-request timeout.
 
+### Keepalives, request errors and logs
+
+With `send-keepalive-before-ft` and a positive SSE keepalive interval, comments can
+be emitted while execution awaits upstream headers. Errors before commitment keep
+their HTTP status; after commitment, sanitized route-specific SSE error envelopes
+are used. Dropping the downstream body cancels the pending upstream execution.
+
+Request-scoped rules match the original upstream error bytes, not reserialized
+JSON, only after a complete body of at most 64 KiB is read. Oversized/incomplete
+bodies do not match partial prefixes. Matching is ordered and case-sensitive;
+substrings use original bytes and regexes use text with replacement characters
+for invalid UTF-8. Credential metadata rules take precedence; global provider
+rules apply to OAuth credentials. `stop` prevents refresh/rotation and reports
+`request_scoped`; `continue` permits otherwise eligible retries with that code.
+The `-and-cooldown` variants report `force_cooldown` while retaining their respective
+stop/continue behavior. Home owns cooldown enforcement. Media retry uses the same
+bounded matching and action semantics. Raw bodies are not logged or persisted.
+
+Opt-in generation request logs are submitted once per client request at downstream
+body completion, error or disconnect, not once per retry or at upstream headers.
+They include a sanitized provider label when selection occurred; disconnect is
+recorded as 499. Bodies, credential headers and URL queries are omitted. Submission
+is bounded forwarding, not durable exactly-once Home delivery or billing evidence.
+
 ## RESP operations and execution accounting
 
 These are custom RESP arguments, not generic Redis queue semantics.
@@ -191,11 +225,12 @@ These are custom RESP arguments, not generic Redis queue semantics.
 | Usage | `LPUSH usage <JSON>` | Persistence/feedback acknowledgement |
 | Request log | `RPUSH request-log <JSON>` | Separate optional contract, not billing evidence |
 | Discovery | `CLUSTER NODES` | Available Home targets |
-| Rebalance | `CLUSTER BALANCE ENABLE/CLAIM/RESULT ...` | Plan/term/ownership checks; latency helpers also exist |
+| Rebalance | `CLUSTER BALANCE ENABLE/CLAIM/RESULT ...` | Planned connection handoff with origin-owned active executions |
+| Latency | `CLUSTER BALANCE LATENCY <JSON>` | Negotiated `cpa_latency_swap_v1` RTT samples and alternate probes |
 | Shared KV | Typed operations in `src/home/kv.rs` | Home-backed state for supported consumers, no local fallback |
 
-Optional app-log/plugin synchronization contracts in Home do not imply that this
-worker implements their forwarders or plugin execution. Workers do not perform
+Application logs have bounded forwarding. Home plugin synchronization contracts
+do not imply native plugin execution in this worker. Workers do not perform
 Home-to-Home control operations or request Home node secrets.
 
 Dispatch includes requested model, downstream authorization, concurrency protocol,
@@ -225,7 +260,9 @@ Usage reports retain a stable `execution_id` across redelivery, request/session
 lineage, alias/execution model, credential/principal attribution, status,
 latency/TTFT and supported schema-v2 token buckets. Missing/partial observations
 remain explicit; overlapping input/reasoning buckets must not be double counted.
-Usage also feeds Home scheduling decisions.
+Usage also feeds Home scheduling decisions. Optional `media_counts` carries
+`prompt_media`, `completion_media`, `prompt_audio` and `audio_seconds`; completed
+video duration is supported, but raw speech does not yield inferred duration.
 
 The usage outbox lives under the private identity directory. It uses bounded,
 checksummed records, atomic publication/fsync, exclusive ownership, restart replay
@@ -234,6 +271,11 @@ queued payloads and 256 KiB per payload, with a bounded recent-ID cache. These
 library defaults are not a promise of runtime tuning flags. Capacity or storage
 failure fences admission rather than evicting accepted records. Preserve corrupt
 records for investigation; do not delete the reporting directory to force readiness.
+
+During a live planned handoff, process-local ownership routes each usage event to
+its issuing Home. Origin routing is not persisted: after process restart, durable
+usage replays through the current Home, matching the reference worker's queue
+behavior. Restart replay must not be described as durable origin affinity.
 
 Durability covers **only events accepted by the outbox**. It cannot reconstruct
 usage never observed before a crash or events rejected for persistence/capacity
@@ -252,9 +294,9 @@ sources include `internal/home/config_yaml.go`, `internal/home/auth_sanitize.go`
 compatibility reference where a shared wire or provider behavior needs comparison;
 that does not establish feature equivalence or automatic version synchronization.
 
-[Implementation status](porting-status.md) records a dated checkpoint, including
-limited reported live results. It is not blanket deployment acceptance; historical
-feature inventories can lag current source. Revalidate the exact
+[Implementation status](porting-status.md) records source-backed capabilities and
+remaining work. It is not deployment acceptance; feature inventories can lag
+current source. Revalidate the exact
 Home/worker revisions and required provider subset using the acceptance runbook.
 No full compatibility, failover, billing reconciliation or live acceptance result
 is asserted by this architecture document.

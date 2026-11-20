@@ -143,7 +143,6 @@ cargo run --locked -- --check-config home-snapshot.yaml
 | `POST /v1/images/generations` | Supported image generation |
 | `POST /v1/images/edits` | Supported image editing, including multipart input |
 | `POST /v1/audio/speech`, `POST /v1/tts` | Supported xAI speech execution |
-
 | `POST /v1/videos`, `POST /v1/videos/generations` | xAI video generation |
 | `POST /v1/videos/edits`, `POST /v1/videos/extensions` | xAI video editing/extension |
 | `GET /v1/videos/{request_id}` | Credential-bound xAI video retrieval |

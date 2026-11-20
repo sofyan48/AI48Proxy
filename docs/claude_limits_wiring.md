@@ -19,7 +19,7 @@ The worker does not generate persistent account/device identity. It constructs r
 
 ## Active wire policy
 
-The provider validates Messages input, normalizes incompatible sampling/thinking combinations for non-confirmed-native requests, handles beta headers/body betas, and prepares focused OAuth CLI headers and body policy. OAuth supports `cloak_mode` values `auto`, `always`, and `never`, plus the focused strict-mode behavior. Confirmed native CLI requests have a separate preservation path; a user-agent alone is not a general native-feature capability guarantee.
+The provider validates Messages input, normalizes incompatible sampling/thinking combinations for non-confirmed-native requests, handles beta headers/body betas, and prepares focused OAuth CLI headers and body policy. OAuth supports `cloak_mode` values `auto`, `always`, and `never`, plus the focused strict-mode behavior. Confirmed native CLI requests have a separate preservation path; a client identification header alone is not a general native-feature capability guarantee.
 
 For transformed OAuth requests, implemented behavior includes CLI identity/billing system blocks, model-dependent system relocation, date reminder placement, cache-control normalization, and the supported thinking context-management edit. Custom function tool declarations retain names rather than using reversible aliases. Foreign tool-use signature metadata is removed during non-native normalization rather than inventing valid Anthropic provenance.
 
@@ -28,7 +28,7 @@ Configured payload rules run after built-in preparation. OAuth CCH signing opera
 Known boundaries:
 
 - OAuth extended `thread`, `fallbacks`, `safeguards`, and `diagnostics` handling, server/advanced tool declarations, and reversible tool aliasing are unsupported.
-- Focused cloaking does not implement helper/subagent/probe profiles, advisor history, Fable/Mythos profiles, arbitrary fingerprint profiles, sensitive-word/pattern replacement, or cached user-ID transformations. Nonempty unsupported settings and recognized unsupported request shapes reject in their applicable paths.
+- Focused cloaking does not implement helper/workload/probe profiles, advisor history, Fable/Mythos profiles, arbitrary fingerprint profiles, sensitive-word/pattern replacement, or cached user-ID transformations. Nonempty unsupported settings and recognized unsupported request shapes reject in their applicable paths.
 - Arbitrary context-management edits and general thinking-signature/replay repair are not implemented.
 - `cloak_mode: never` and confirmed-native preservation are not substitutes for implementing unsupported provider features or obtaining provider entitlement.
 - `POST /v1/messages/count_tokens` requires a non-OAuth Claude API key and native Messages input. It removes generation-only fields before payload rules, calls the upstream count route, and does not provide a local token estimate or OAuth count normalization.
@@ -36,6 +36,13 @@ Known boundaries:
 ## HTTP failure handling
 
 The generation gateway's shared non-success HTTP observation path is used for both buffered requests and initial streaming rejections. It captures upstream status, reads bounded error content, classifies Claude reset/scope information, and preserves sanitized execution attribution before retry or refresh can discard a response.
+
+Configured request-scoped rules match complete original upstream bytes up to 64 KiB,
+not normalized JSON; oversized/incomplete bodies cannot match a partial prefix.
+`stop` suppresses refresh/rotation; `continue` allows otherwise eligible retry.
+Both report `request_scoped`; their `-and-cooldown` variants report `force_cooldown`
+to Home without changing stop/continue behavior. Media retry shares this matching
+and action policy. Raw provider bodies are never persisted in feedback.
 
 `src/providers/claude_limits.rs` exports:
 
@@ -89,7 +96,11 @@ Model and credential scopes are diagnostic here: the worker does not serialize a
 
 ## Streaming boundary
 
-Initial HTTP rejection is classified before downstream SSE commitment, just like buffered rejection. Once a successful HTTP stream starts, terminal SSE errors use the existing event/effective-status parser: `rate_limit_error` is recognized as effective 429 for failure accounting.
+Initial HTTP rejection is classified before upstream body streaming, just like
+buffered rejection. With `send-keepalive-before-ft`, a keepalive can already have
+committed downstream SSE while waiting for upstream headers: errors before
+commitment retain HTTP status; errors after commitment use sanitized SSE envelopes.
+Disconnect drops the pending upstream execution. Once a successful HTTP stream starts, terminal SSE errors use the existing event/effective-status parser: `rate_limit_error` is recognized as effective 429 for failure accounting.
 
 Terminal SSE errors do **not** currently run through the full reset-header classifier with retained initial headers. They must not be described as having the same reset/scope handling as an initial HTTP 429. An interrupted or terminal-error stream is not successful, and no committed response can be replayed safely merely because a reset was parsed.
 

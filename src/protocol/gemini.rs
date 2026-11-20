@@ -17,7 +17,7 @@ fn is_bypass(signature: &str) -> bool {
 }
 #[path = "gemini_stream.rs"]
 mod stream;
-pub use request::{antigravity_chat_request, chat_request};
+pub use request::{antigravity_chat_request, chat_request, openai_request};
 pub use stream::StreamTranslator;
 #[cfg(test)]
 #[path = "gemini_tests.rs"]

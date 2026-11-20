@@ -53,6 +53,7 @@ pub(crate) fn prepare(
     if path == "/v1/messages/count_tokens" {
         return super::count_tokens::prepare(config, selection, headers, body, requested_stream);
     }
+
     if matches!(provider.as_str(), "xai" | "meta" | "kimi" | "kimi-ai") {
         ensure!(
             matches!(path, "/v1/chat/completions" | "/v1/responses"),

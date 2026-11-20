@@ -41,6 +41,31 @@ fn models_credentials_and_temperature() {
 }
 
 #[test]
+fn tool_calls_and_results_are_preserved() {
+    let selected = selection("kimi", json!({"attributes":{"api_key":"key"}}));
+    let request = crate::providers::prepare(
+        &config(),
+        &selected,
+        "/v1/chat/completions",
+        &HeaderMap::new(),
+        json!({
+            "messages":[
+                {"role":"user","content":"weather"},
+                {"role":"assistant","content":null,"tool_calls":[{"id":"call-1","type":"function","function":{"name":"weather","arguments":r#"{"city":"Paris"}"#}}]},
+                {"role":"tool","tool_call_id":"call-1","content":"sunny"}
+            ],
+            "tools":[{"type":"function","name":"weather","parameters":{"type":"object","properties":{"city":{"type":"string"}}}}],
+            "tool_choice":"auto"
+        }),
+        false,
+    ).unwrap();
+    let body = body(&request.request.build().unwrap());
+    assert_eq!(body["tools"][0]["name"], "weather");
+    assert_eq!(body["messages"][1]["tool_calls"][0]["id"], "call-1");
+    assert_eq!(body["messages"][2]["tool_call_id"], "call-1");
+}
+
+#[test]
 fn attribute_access_token_can_be_refreshed_via_home() {
     let selected = selection("kimi", json!({"attributes":{"access_token":"fixture"}}));
     let request = crate::providers::refresh::refresh_request(&selected).unwrap();

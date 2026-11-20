@@ -139,33 +139,24 @@ pub(super) fn prepare(
         ensure!(
             body.get("input")
                 .and_then(Value::as_array)
-                .is_none_or(|items| items
-                    .iter()
-                    .all(|item| matches!(text(item, "/type"), "" | "message"))),
-            "Kimi tool input ordering/replay unsupported"
+                .is_none_or(|items| items.iter().all(|item| {
+                    matches!(
+                        text(item, "/type"),
+                        "" | "message" | "function_call" | "function_call_output"
+                    )
+                })),
+            "Kimi Responses input contains an unsupported item"
         );
     }
-    // These controls require the Go tool/replay bridges, not pass-through behavior.
-    ensure!(
-        body.get("tools")
-            .and_then(Value::as_array)
-            .is_none_or(Vec::is_empty)
-            && body.get("functions").is_none(),
-        "Kimi tool schema/replay normalization unsupported"
-    );
     if let Some(messages) = body.get_mut("messages").and_then(Value::as_array_mut) {
-        for message in messages.iter() {
-            ensure!(
-                message.get("tool_calls").is_none()
-                    && message.get("function_call").is_none()
-                    && text(message, "/role") != "tool",
-                "Kimi tool history/reasoning replay unsupported"
-            );
-        }
-        messages.retain(|m| {
-            !(text(m, "/role") == "assistant"
-                && empty_content(m.get("content"))
-                && text(m, "/reasoning_content").is_empty())
+        // Kimi follows the OpenAI tool-call envelope. Preserve call IDs and tool
+        // results; only remove empty assistant placeholders that have no replay data.
+        messages.retain(|message| {
+            !(text(message, "/role") == "assistant"
+                && empty_content(message.get("content"))
+                && message.get("tool_calls").is_none()
+                && message.get("function_call").is_none()
+                && text(message, "/reasoning_content").is_empty())
         });
     }
     let object = body

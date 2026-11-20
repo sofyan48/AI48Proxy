@@ -31,6 +31,24 @@ fn credential_precedence_dca_rejection_and_identity() {
 }
 
 #[test]
+fn dca_refresh_request_uses_dca_hash_without_exposing_token() {
+    let selected = selection(
+        "meta",
+        json!({"metadata":{"dca_token":"dca:fixture"},"attributes":{}}),
+    );
+    let request = crate::providers::refresh::refresh_request(&selected).unwrap();
+    assert_eq!(request["type"], "refresh");
+    assert!(request.get("dca_token").is_none());
+    assert!(request.get("access_token").is_none());
+    assert!(
+        !request["access_token_sha256"]
+            .as_str()
+            .unwrap()
+            .contains("dca")
+    );
+}
+
+#[test]
 fn retention_cleanup_contributor_and_replay_rejection() {
     let mut selected = selection("meta", json!({"metadata":{"api_key":"minted"}}));
     selected.model = "muse-wonder-1.0-contributor".into();

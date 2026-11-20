@@ -1,0 +1,41 @@
+# Local development only. Production uses docker-compose.yml and GHCR images.
+services:
+  ai48proxy:
+    build:
+      context: .
+      dockerfile: Dockerfile.dev
+      args:
+        RUST_IMAGE: ${RUST_IMAGE:-rust:bookworm}
+    image: ai48proxy:dev
+    container_name: ai48proxy-dev
+    init: true
+    command: ["cargo", "watch", "--why", "-x", "run -- --identity-dir /var/lib/ai48proxy/identity"]
+    environment:
+      HOME_JWT_FILE: /run/secrets/home_jwt
+      RUST_LOG: ${RUST_LOG:-ai48proxy=debug}
+      WORKER_START_DELAY: ${WORKER_START_DELAY:-0}
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    ports:
+      - "${AI48PROXY_PORT:-8317}:8317"
+    volumes:
+      - .:/workspace
+      - ai48proxy-dev-state:/var/lib/ai48proxy
+      - ai48proxy-dev-target:/workspace/target
+      - ai48proxy-dev-cargo:/usr/local/cargo/registry
+      - type: bind
+        source: ${HOME_JWT_FILE:-./home.jwt}
+        target: /run/secrets/home_jwt
+        read_only: true
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD-SHELL", "curl -fsS http://127.0.0.1:8317/healthz >/dev/null"]
+      interval: 10s
+      timeout: 5s
+      start_period: 60s
+      retries: 3
+
+volumes:
+  ai48proxy-dev-state:
+  ai48proxy-dev-target:
+  ai48proxy-dev-cargo:

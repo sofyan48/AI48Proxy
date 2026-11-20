@@ -31,7 +31,7 @@ POSTGRES_USER=ai48home
 POSTGRES_PASSWORD=$pg
 POSTGRES_DB=ai48home
 HOME_IMAGE=ghcr.io/sofyan48/ai48home:latest
-AI48PROXY_IMAGE=ai48proxy:local
+AI48PROXY_IMAGE=ghcr.io/sofyan48/ai48proxy:latest
 RUST_IMAGE=rust:bookworm
 MANAGEMENT_KEY=$management
 GATEWAY_API_KEY=$gateway
@@ -46,6 +46,9 @@ EOF
     log 'Preserving existing .env.'
   fi
   chmod 600 "$ENV_FILE"
+  if [[ "$(value AI48PROXY_IMAGE)" == ai48proxy:local || "$(value AI48PROXY_IMAGE)" == "" ]]; then
+    set_value AI48PROXY_IMAGE ghcr.io/sofyan48/ai48proxy:latest
+  fi
   [[ -n "$(value POSTGRES_PASSWORD)" && -n "$(value MANAGEMENT_KEY)" && -n "$(value GATEWAY_API_KEY)" ]] || fail 'Required secrets missing in .env.'
   if [[ ! -e deploy/cluster.yaml ]]; then
     cat > deploy/cluster.yaml <<EOF
@@ -121,7 +124,7 @@ case "$ACTION" in
       [[ ! -d home-data || -z "$(ls -A home-data)" ]] || fail 'Existing Home data without bootstrap marker: refusing automatic import. Inspect/migrate it explicitly.'
       [[ ! -d postgres-data || -z "$(ls -A postgres-data)" ]] || fail 'Existing PostgreSQL data without bootstrap marker: refusing automatic import. Inspect/migrate it explicitly.'
     fi
-    compose build ai48proxy-1
+    compose pull ai48proxy-1 ai48proxy-2 ai48proxy-3
     compose up -d --wait --wait-timeout 180 postgres
     if [[ ! -e deploy/.home-imported ]]; then
       # Import once into a new database, before starting the persistent Home process.

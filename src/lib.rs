@@ -4,6 +4,7 @@ pub mod gateway;
 pub mod home;
 pub mod observability;
 pub mod payload;
+pub mod plugins;
 pub mod protocol;
 pub mod providers;
 pub mod reporting;

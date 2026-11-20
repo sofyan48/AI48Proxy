@@ -10,3 +10,7 @@
 /home-logs/
 /home-plugins/
 /.env.tmp.*
+
+# Local development support files and runtime state
+/home.jwt
+/dev/

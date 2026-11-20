@@ -353,25 +353,29 @@ pub(super) fn send(
     if selection.provider != "kimi" && selection.provider != "kimi-ai" {
         validate_tools(&body, selection.provider == "meta")?;
     } else {
-        ensure!(
-            body.get("tools")
-                .is_none_or(|v| v.as_array().is_some_and(Vec::is_empty))
-                && body.get("functions").is_none()
-                && body
-                    .get("input")
-                    .and_then(Value::as_array)
-                    .is_none_or(|items| items
-                        .iter()
-                        .all(|item| matches!(text(item, "/type"), "" | "message"))),
-            "Kimi tool normalization/replay unsupported"
-        );
+        // Kimi uses the OpenAI-compatible tool envelope. Validate the structure
+        // without dropping call history or tool results after payload rules.
+        if let Some(tools) = body.get("tools") {
+            ensure!(tools.is_array(), "Kimi tools must be an array");
+        }
+        if let Some(input) = body.get("input").and_then(Value::as_array) {
+            ensure!(
+                input.iter().all(|item| matches!(
+                    text(item, "/type"),
+                    "" | "message" | "function_call" | "function_call_output"
+                )),
+                "Kimi Responses input contains an unsupported item"
+            );
+        }
     }
     if let Some(messages) = body.get("messages").and_then(Value::as_array) {
         ensure!(
-            messages.iter().all(|m| m.get("tool_calls").is_none()
-                && m.get("function_call").is_none()
-                && text(m, "/role") != "tool"),
-            "provider tool history unsupported after payload rules"
+            messages.iter().all(|m| {
+                m.get("tool_calls").is_none_or(Value::is_array)
+                    && m.get("function_call").is_none_or(Value::is_object)
+                    && (text(m, "/role") != "tool" || m.get("tool_call_id").is_some())
+            }),
+            "Kimi tool history has an invalid shape"
         );
     }
     let stream = body.get("stream").and_then(Value::as_bool).unwrap_or(false);

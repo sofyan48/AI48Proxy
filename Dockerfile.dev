@@ -1,0 +1,16 @@
+FROM rust:bookworm
+
+WORKDIR /workspace
+
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends pkg-config libssl-dev ca-certificates curl \
+    && rm -rf /var/lib/apt/lists/* \
+    && cargo install cargo-watch --locked
+
+COPY Cargo.toml Cargo.lock ./
+COPY src ./src
+RUN cargo check --locked
+
+EXPOSE 8317
+
+CMD ["cargo", "watch", "--why", "-x", "run -- --identity-dir /var/lib/ai48proxy/identity"]

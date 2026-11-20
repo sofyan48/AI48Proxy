@@ -8,9 +8,9 @@ control plane, database and API ingress.
 | --- | --- | --- |
 | `postgres` | `postgres:17-alpine`, Home database | None |
 | `ai48home` | `HOME_IMAGE`, alias `ai48home` | `8327:8327` |
-| `ai48proxy-1` | Local Rust build, worker 1 | None |
-| `ai48proxy-2` | Local Rust build, worker 2 | None |
-| `ai48proxy-3` | Local Rust build, worker 3 | None |
+| `ai48proxy-1` | `AI48PROXY_IMAGE`, worker 1 | None |
+| `ai48proxy-2` | `AI48PROXY_IMAGE`, worker 2 | None |
+| `ai48proxy-3` | `AI48PROXY_IMAGE`, worker 3 | None |
 | `nginx` | `nginx:alpine`, least-connections worker ingress | `8317:8317` |
 
 All services join the explicitly named `ai48proxy-network`. nginx uses
@@ -41,8 +41,8 @@ From the AI48Proxy root:
 
 The installer generates the root `.env`, `deploy/cluster.yaml`, and
 `deploy/config.yaml`, starts PostgreSQL, imports the initial Home configuration,
-builds the worker image, starts Home, issues three distinct worker JWTs into
-`.env`, and starts the workers and nginx. No manually provisioned secret files are required.
+pulls the published worker image, starts Home, issues three distinct worker JWTs
+into `.env`, and starts the workers and nginx. No manually provisioned secret files are required.
 Do not start the entire stack before this bootstrap sequence completes.
 
 ### Installer environment and artifact contract
@@ -53,6 +53,7 @@ Do not start the entire stack before this bootstrap sequence completes.
 | `POSTGRES_PASSWORD` | Generated database password |
 | `POSTGRES_DB` | Database name; installer default `ai48home` |
 | `HOME_IMAGE` | Home image; Compose default `ghcr.io/sofyan48/ai48home:latest` |
+| `AI48PROXY_IMAGE` | Worker image; Compose default `ghcr.io/sofyan48/ai48proxy:latest` |
 | `MANAGEMENT_KEY` | Generated management key written to `deploy/config.yaml` |
 | `GATEWAY_API_KEY` | Generated downstream API key written to `deploy/config.yaml` |
 | `HOME_JWT_1` / `HOME_JWT_2` / `HOME_JWT_3` | Distinct Home-issued bootstrap JWTs |
@@ -87,6 +88,23 @@ The installer owns import-once tracking and token issuance. It refuses initial i
 on an existing database as a routine restart operation. JWT fields may be empty
 while the installer starts/imports Home; all three must be populated and distinct
 before workers start. Missing PostgreSQL variables fail Compose interpolation.
+
+## Publish the worker image
+
+Release tags matching `v*` publish `ghcr.io/sofyan48/ai48proxy:<tag>` and
+`:latest` for `linux/amd64` and `linux/arm64` through
+`.github/workflows/image.yml`. A manual workflow dispatch publishes the tag
+provided in the workflow input without changing `:latest`.
+
+For a local release or emergency image publication, authenticate to GHCR first:
+
+```sh
+docker login ghcr.io
+IMAGE=ghcr.io/sofyan48/ai48proxy ./scripts/publish-image.sh v0.1.0
+```
+
+The script uses Buildx and pushes provenance/SBOM metadata. Do not put a PAT in
+the repository or in `.env`; use a short-lived login or CI `GITHUB_TOKEN`.
 
 ## Operate an initialized stack
 

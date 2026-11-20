@@ -62,7 +62,19 @@ pub(super) fn refresh_request(selection: &Selection) -> Result<Value> {
     );
     let token = match selection.provider.as_str() {
         "kimi" | "kimi-ai" => super::kimi::token(&selection.auth),
-        "meta" => super::meta::token(&selection.auth),
+        "meta" => {
+            let minted = super::meta::token(&selection.auth);
+            if !minted.is_empty() {
+                minted
+            } else {
+                let dca = text(&selection.auth, "/metadata/dca_token");
+                if dca.is_empty() {
+                    text(&selection.auth, "/attributes/dca_token")
+                } else {
+                    dca
+                }
+            }
+        }
         _ => access_token(&selection.auth),
     };
     ensure!(

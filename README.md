@@ -55,8 +55,10 @@ See the [provider guide](docs/provider.md) and
 ## Deployment
 
 The included stack consists of PostgreSQL, AI48Home, three AI48Proxy workers and
-nginx. The installer generates private configuration, initializes a fresh database
-once, provisions distinct worker tokens and starts services in readiness order.
+nginx. Worker containers use the published multi-architecture image
+`ghcr.io/sofyan48/ai48proxy`; the installer pulls it, generates private
+configuration, initializes a fresh database once, provisions distinct worker
+tokens and starts services in readiness order.
 
 ```sh
 ./install.sh init
@@ -64,6 +66,11 @@ once, provisions distinct worker tokens and starts services in readiness order.
 ./install.sh status
 ./install.sh logs ai48proxy-1
 ```
+
+The installer does not build the worker image locally. Set `AI48PROXY_IMAGE` in
+`.env` to pin a release, for example `ghcr.io/sofyan48/ai48proxy:v0.1.0`.
+Images are published by GitHub Actions for `v*` tags; see
+[image publishing](docs/docker.md#publish-the-worker-image).
 
 - AI48Home management: port `8327`.
 - Client API ingress: port `8317`.
@@ -75,6 +82,29 @@ and worker identities require an explicit migration, not reinitialization.
 
 See the [Docker deployment guide](docs/docker.md) for configuration, persistence,
 service naming changes and operational precautions.
+
+## Development Docker Compose
+
+`docker-compose.dev.yml` is a local-source single-worker development stack. It
+uses `cargo-watch` to rebuild and restart the worker process from this checkout
+and does not affect the production Compose or GHCR workflow. Create a local Home enrollment token at `home.jwt` (ignored by
+git), then run:
+
+```sh
+./install.sh init  # only if you need the generated Home config
+# or use an existing AI48Home development instance on localhost:8327
+docker compose -f docker-compose.dev.yml up --build
+```
+
+The first command builds the development toolchain image. After that, source
+changes are handled by `cargo watch`; do not rebuild the image for every edit.
+Use `docker compose -f docker-compose.dev.yml build` only when changing the
+Rust toolchain or development Dockerfile.
+
+The worker API is available at `http://localhost:8317`. Override the Home port,
+worker port, or token path with `HOME_PORT`, `AI48PROXY_PORT`, and
+`HOME_JWT_FILE`. Enrollment tokens are one-shot; use a new token and remove the
+local `.ai48proxy` state when re-enrolling.
 
 ## Build and verify
 
@@ -149,21 +179,21 @@ cargo run --locked -- --check-config home-snapshot.yaml
 | `POST /openai/v1/videos`, `GET /openai/v1/videos/{video_id}` | OpenAI-style facade over xAI video jobs |
 | `GET /openai/v1/videos/{video_id}/content` | Video download without forwarding authorization |
 
-Video creation requires JSON; forms are unsupported. Retrieval requires an
+Video creation accepts JSON and multipart form input for reference media. Retrieval requires an
 unexpired Home-KV credential binding (`video-result-auth-cache-ttl`, default `3h`).
 Upstream errors are sanitized because provider messages can contain sensitive information.
 
 ## Operational limits
 
-- Native plugin execution, Gemini CLI and general realtime workflows are unavailable.
+- Native plugin execution and Gemini CLI are unavailable; Home snapshots with `plugins.enabled: true` are rejected during worker registration.
   Devin is intentionally out of scope and is not supported.
 - Native WebSocket proxy transport, overlapping turns, advanced steering, xAI
   WebSockets, advanced Claude/Antigravity signed replay and complete provider-specific
   schema behavior remain unimplemented or limited.
-- xAI, Kimi and Meta reject unsupported source formats, advanced tools/replay and
-  continuation/compaction. Meta requires a pre-minted usable key; the worker does
-  not mint one from DCA-only credentials. See the provider guide for exact subsets.
-- Video is xAI-only and JSON-only; compatible/Codex image SSE remains rejected.
+- xAI, Kimi and Meta still reject unsupported source formats, advanced replay and
+  continuation/compaction. Meta DCA credentials are refreshed through Home before use.
+  Native plugin execution remains unavailable. See the provider guide for exact subsets.
+- Video is xAI-only; compatible/Codex image SSE is available only when the upstream returns a validated SSE stream.
 - Planned rebalance moves only the replacement connection, not active execution
   ownership. Releases and usage remain origin-bound during the process lifetime;
   failures roll back to the origin. Restart usage replay uses the current Home,

@@ -20,7 +20,7 @@ configuration is production-ready.
 | Claude | Messages, Chat translation, focused OAuth wire preparation, final-body attribution signing and HTTP failure classification |
 | Google-format upstreams | Gemini, Vertex native/OpenAPI routing, Antigravity envelopes and supported function-tool translation |
 | New text providers | xAI and Meta native Responses/Chat bridges; Kimi and `kimi-ai` native Chat/Responses; unsupported sources/tools/replay fail closed |
-| Media | Supported images, xAI image completion SSE, xAI speech and JSON-only xAI video generation/edit/extension/retrieval with OpenAI-style facade and Home-KV credential binding |
+| Media | Supported images, xAI image completion SSE, xAI speech and JSON/multipart xAI video generation/edit/extension/retrieval with OpenAI-style facade and Home-KV credential binding |
 | Media lifecycle | Shared Home-owned refresh, eligible retry, request-scoped actions, cancellation and release-before-redispatch; video retrieval stays credential-pinned |
 | Runtime controls | Payload rules, bounded original-byte request-scoped error matching, reasoning controls, response filtering, pre-header SSE keepalives, shutdown bounds and image-generation modes |
 
@@ -41,9 +41,11 @@ account details do not belong in public documentation.
 
 ## Remaining work
 
-- Native plugin execution and Gemini CLI execution.
-- General realtime workflows, xAI WebSockets, video forms/streaming and non-xAI
-  video execution; compatible/Codex image SSE.
+- Native plugin execution and Gemini CLI execution. Home snapshots with
+  `plugins.enabled: true` are rejected because this worker does not yet have the
+  plugin ABI/runtime host.
+- General realtime workflows, xAI WebSockets, video streaming and non-xAI video
+  execution.
 - WebSocket proxy transport, overlapping turns, advanced steering and recovery.
 - Advanced Claude helper/workload profiles, tool alias reversal, continuity/date
   pinning and signed reasoning replay.
@@ -52,7 +54,7 @@ account details do not belong in public documentation.
 - Remaining provider-specific controls, specialized Vertex operations and
   cross-format conversions.
 - Broader xAI/Kimi/Meta source bridges, advanced tools/reasoning replay and stateful
-  continuation/compaction; Meta DCA-only key pre-minting and subscription attestation.
+  continuation/compaction; Meta subscription attestation.
 - Deployment qualification of live handoff/rollback, negotiated latency telemetry,
   keepalive/error/disconnect behavior, media binding expiry and billing dimensions.
   These are validation tasks, not claims that the source wiring is absent.

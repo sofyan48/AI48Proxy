@@ -33,6 +33,100 @@ pub fn antigravity_chat_request(body: &Value, model: &str) -> Result<Value> {
     chat_request_inner(body, model, true)
 }
 
+/// Convert a native Gemini request received by the gateway into OpenAI Chat.
+/// This is intentionally strict: unknown native controls are rejected rather
+/// than silently discarded before an OpenAI-compatible provider receives them.
+pub fn openai_request(body: &Value, model: &str) -> Result<Value> {
+    let object = body
+        .as_object()
+        .ok_or_else(|| anyhow::anyhow!("Gemini request must be an object"))?;
+    for key in object.keys() {
+        ensure!(
+            matches!(
+                key.as_str(),
+                "contents" | "systemInstruction" | "generationConfig" | "tools" | "toolConfig"
+            ),
+            "unsupported Gemini request field"
+        )
+    }
+    let mut messages = Vec::new();
+    if let Some(system) = body
+        .get("systemInstruction")
+        .and_then(|v| v.get("parts"))
+        .and_then(Value::as_array)
+    {
+        let text = system
+            .iter()
+            .filter_map(|part| part.get("text").and_then(Value::as_str))
+            .collect::<Vec<_>>()
+            .join("\n");
+        if !text.is_empty() {
+            messages.push(json!({"role":"system","content":text}));
+        }
+    }
+    for content in body
+        .get("contents")
+        .and_then(Value::as_array)
+        .ok_or_else(|| anyhow::anyhow!("Gemini contents required"))?
+    {
+        let role = match content
+            .get("role")
+            .and_then(Value::as_str)
+            .unwrap_or("user")
+        {
+            "model" => "assistant",
+            "user" => "user",
+            _ => anyhow::bail!("unsupported Gemini role"),
+        };
+        let parts = content
+            .get("parts")
+            .and_then(Value::as_array)
+            .ok_or_else(|| anyhow::anyhow!("Gemini parts required"))?;
+        let mut text_parts = Vec::new();
+        let mut calls = Vec::new();
+        for part in parts {
+            if let Some(text) = part.get("text").and_then(Value::as_str) {
+                text_parts.push(text.to_owned());
+            }
+            if let Some(call) = part.get("functionCall") {
+                let name = call
+                    .get("name")
+                    .and_then(Value::as_str)
+                    .ok_or_else(|| anyhow::anyhow!("functionCall name required"))?;
+                calls.push(json!({"id":format!("gemini-call-{}", calls.len()),"type":"function","function":{"name":name,"arguments":serde_json::to_string(call.get("args").unwrap_or(&Value::Null))?}}));
+            }
+        }
+        let mut message = json!({"role":role,"content":text_parts.join("\n")});
+        if !calls.is_empty() {
+            message["tool_calls"] = calls.into();
+            message["content"] = Value::Null;
+        }
+        messages.push(message);
+    }
+    let mut out = json!({"model":model,"messages":messages});
+    if let Some(config) = body.get("generationConfig").and_then(Value::as_object) {
+        for (source, target) in [
+            ("temperature", "temperature"),
+            ("topP", "top_p"),
+            ("maxOutputTokens", "max_tokens"),
+        ] {
+            if let Some(value) = config.get(source) {
+                out[target] = value.clone();
+            }
+        }
+        if config.get("stopSequences").is_some() {
+            out["stop"] = config["stopSequences"].clone();
+        }
+    }
+    if let Some(tools) = body.get("tools") {
+        out["tools"] = tools.clone();
+    }
+    if let Some(stream) = body.get("stream") {
+        out["stream"] = stream.clone();
+    }
+    Ok(out)
+}
+
 fn chat_request_inner(body: &Value, model: &str, antigravity: bool) -> Result<Value> {
     object(body)?;
     ensure!(!model.is_empty(), "target model is required");

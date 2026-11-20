@@ -24,9 +24,10 @@ pub(super) fn credentials(selection: &Selection, protocol: &str) -> Result<Crede
         "Meta Chat translation/response bridge unsupported; native Responses input required"
     );
     let auth = &selection.auth;
+    let api_key = token(auth);
     ensure!(
-        !token(auth).is_empty(),
-        "Meta requires a Home-minted API key; DCA-only credential preparation unsupported"
+        !api_key.is_empty(),
+        "Meta credential requires Home refresh to mint an API key from DCA"
     );
     let base = [
         "/attributes/base_url",
@@ -38,7 +39,7 @@ pub(super) fn credentials(selection: &Selection, protocol: &str) -> Result<Crede
     .find(|s| !s.is_empty())
     .unwrap_or("https://api.meta.ai/v1");
     let mut headers = HeaderMap::new();
-    bearer(&mut headers, token(auth))?;
+    bearer(&mut headers, api_key)?;
     let os = std::env::consts::OS;
     let arch = std::env::consts::ARCH;
     insert(

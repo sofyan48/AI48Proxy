@@ -1,10 +1,6 @@
 # Full installer topology. install.sh generates .env and deploy/*.yaml first.
 x-worker: &worker
-  image: ${AI48PROXY_IMAGE:-ai48proxy:local}
-  build:
-    context: .
-    args:
-      RUST_IMAGE: ${RUST_IMAGE:-rust:bookworm}
+  image: ${AI48PROXY_IMAGE:-ghcr.io/sofyan48/ai48proxy:latest}
   init: true
   user: "10001:10001"
   command: ["--identity-dir", "/var/lib/ai48proxy/identity"]

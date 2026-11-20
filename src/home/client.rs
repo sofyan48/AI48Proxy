@@ -17,6 +17,9 @@ use std::sync::{
 };
 use tokio_util::sync::CancellationToken;
 
+const PLUGIN_SYNC_OPERATION_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(120);
+const PLUGIN_STATUS_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
+
 #[path = "config_validation.rs"]
 mod config_validation;
 #[path = "client_lifecycle.rs"]
@@ -126,6 +129,7 @@ impl HomeClient {
         let bytes = diagnosed(reply.bytes(), "config_response")?;
         let initial = parse_config(&bytes, "config_initial")?;
         validate_support(&initial)?;
+        validate_worker_capabilities(&initial)?;
         drop(bootstrap);
         let mut sub = diagnosed(connector.connect().await, "subscription_connect")?;
         let revision = initial.lifecycle.lifecycle_config_revision;
@@ -158,6 +162,7 @@ impl HomeClient {
         )?;
         let config = parse_config(bytes, "config_snapshot")?;
         validate_support(&config)?;
+        validate_worker_capabilities(&config)?;
         diagnosed(
             (|| {
                 ensure!(
@@ -331,6 +336,54 @@ impl HomeClient {
         Ok(())
     }
 
+    /// Request the Home-owned plugin synchronization plan for this mTLS worker.
+    /// The request and response are sensitive because manifests may contain URLs
+    /// and verification material; callers must not log either body.
+    pub async fn plugin_sync(&self, request: Value) -> Result<Value> {
+        let command = self.command(vec![
+            b"GET".to_vec(),
+            b"plugin-sync".to_vec(),
+            serde_json::to_vec(&request)?,
+        ]);
+        let frame = tokio::time::timeout(PLUGIN_SYNC_OPERATION_TIMEOUT, command)
+            .await
+            .context("Home plugin sync timed out")??;
+        let bytes = frame.bytes().context("invalid Home plugin sync frame")?;
+        let response: Value =
+            serde_json::from_slice(&bytes).context("invalid Home plugin sync response")?;
+        if response
+            .pointer("/error/type")
+            .and_then(Value::as_str)
+            .is_some_and(|kind| kind.eq_ignore_ascii_case("plugin_sync_unsupported"))
+        {
+            bail!("Home plugin sync unsupported")
+        }
+        Ok(response)
+    }
+
+    /// Fetch pending Home plugin tasks for this worker node.
+    pub async fn plugin_tasks(&self) -> Result<Value> {
+        let bytes = self
+            .command(vec![b"GET".to_vec(), b"plugin-tasks".to_vec()])
+            .await?
+            .bytes()
+            .context("invalid Home plugin task frame")?;
+        serde_json::from_slice(&bytes).context("invalid Home plugin task response")
+    }
+
+    /// Acknowledge a plugin status report after local processing has completed.
+    pub async fn push_plugin_status(&self, payload: Vec<u8>) -> Result<()> {
+        let command = self.command(vec![b"RPUSH".to_vec(), b"plugin-status".to_vec(), payload]);
+        let reply = tokio::time::timeout(PLUGIN_STATUS_TIMEOUT, command)
+            .await
+            .context("Home plugin status timed out")??;
+        ensure!(
+            matches!(reply, Frame::Integer(1)),
+            "plugin status not acknowledged"
+        );
+        Ok(())
+    }
+
     async fn send(&self, args: Vec<Vec<u8>>) -> Result<Frame> {
         tokio::select! {
             biased;
@@ -432,6 +485,22 @@ impl HomeClient {
         }
     }
 }
+fn validate_worker_capabilities(config: &Config) -> Result<()> {
+    // AI48Proxy currently has no native plugin host/ABI loader. Home's plugin
+    // scheduler/auth/model/usage paths therefore must not be enabled: accepting
+    // this snapshot would advertise a worker that cannot execute its contract.
+    if config
+        .raw
+        .get("plugins")
+        .and_then(|value| value.get("enabled"))
+        .and_then(serde_yaml::Value::as_bool)
+        == Some(true)
+    {
+        bail!("Home plugin execution is not implemented by this worker")
+    }
+    Ok(())
+}
+
 fn text(frame: &Frame) -> Option<&str> {
     match frame {
         Frame::Simple(s) => Some(s),

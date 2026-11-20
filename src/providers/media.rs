@@ -211,10 +211,7 @@ pub fn prepare(
             original: Some(original_view.as_ref().unwrap_or(original)),
         },
     )?;
-    ensure!(
-        (codex && !direct) || body.get("stream").and_then(Value::as_bool) != Some(true),
-        "image SSE unsupported"
-    );
+
     let (bytes, content_type) = match multipart {
         Some(form) => form.encode(body)?,
         None => (serde_json::to_vec(body)?, "application/json".into()),
@@ -228,6 +225,8 @@ pub fn prepare(
             "text/event-stream"
         } else if speech {
             "*/*"
+        } else if body.get("stream").and_then(Value::as_bool) == Some(true) {
+            "text/event-stream"
         } else {
             "application/json"
         }),

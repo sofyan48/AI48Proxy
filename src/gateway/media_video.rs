@@ -89,21 +89,12 @@ pub(super) async fn handle(State(home): State<Arc<HomeClient>>, request: Request
         let payload = json!({"request_id":id});
         (binding.model.clone(), payload.clone(), payload)
     } else {
-        if !parts
+        let content_type = parts
             .headers
             .get("content-type")
             .and_then(|v| v.to_str().ok())
-            .is_some_and(|s| {
-                s.split(';')
-                    .next()
-                    .is_some_and(|s| s.trim() == "application/json")
-            })
-        {
-            return failure(
-                StatusCode::UNSUPPORTED_MEDIA_TYPE,
-                "Video creation requires JSON",
-            );
-        }
+            .unwrap_or("");
+        let media_type = content_type.split(';').next().unwrap_or("").trim();
         let bytes = match RuntimeControls::from(config.as_ref())
             .read_body(body, None)
             .await
@@ -117,10 +108,56 @@ pub(super) async fn handle(State(home): State<Arc<HomeClient>>, request: Request
             }
             Err(_) => return failure(StatusCode::BAD_REQUEST, "Unable to read video request"),
         };
-        let original: Value = match serde_json::from_slice(&bytes) {
-            Ok(value) => value,
-            Err(_) => return failure(StatusCode::BAD_REQUEST, "Video body must be valid JSON"),
+        let (original, form) = if media_type.eq_ignore_ascii_case("multipart/form-data") {
+            let form = match super::multipart::Form::parse(content_type, &bytes) {
+                Ok(form) => form,
+                Err(_) => return failure(StatusCode::BAD_REQUEST, "Invalid multipart video form"),
+            };
+            let fields = match form.fields() {
+                Ok(fields) => fields,
+                Err(_) => return failure(StatusCode::BAD_REQUEST, "Invalid video form fields"),
+            };
+            (form.payload(&fields), Some(form))
+        } else if media_type.eq_ignore_ascii_case("application/json")
+            || media_type.ends_with("+json")
+        {
+            let value = match serde_json::from_slice(&bytes) {
+                Ok(value) => value,
+                Err(_) => return failure(StatusCode::BAD_REQUEST, "Video body must be valid JSON"),
+            };
+            (value, None)
+        } else {
+            return failure(
+                StatusCode::UNSUPPORTED_MEDIA_TYPE,
+                "Video creation requires JSON or multipart form",
+            );
         };
+        let mut original = original;
+        // OpenAI video forms commonly upload the reference as `input_reference` or `image`.
+        // Convert file parts to data URLs before provider normalization.
+        if let Some(form) = &form {
+            for name in ["input_reference", "image", "input_image"] {
+                if let Some(part) = form
+                    .parts
+                    .iter()
+                    .find(|part| part.name == name && part.filename.is_some())
+                {
+                    let data = format!(
+                        "data:{};base64,{}",
+                        part.content_type,
+                        base64::Engine::encode(
+                            &base64::engine::general_purpose::STANDARD,
+                            &part.bytes
+                        )
+                    );
+                    original[name] = data.into();
+                    if name != "input_reference" {
+                        original["input_reference"] = json!({"image_url": original[name].clone()});
+                    }
+                    break;
+                }
+            }
+        }
         match video::create(&original, openai) {
             Ok((model, payload)) => (model, original, payload),
             Err(_) => {

@@ -289,6 +289,18 @@ pub(super) async fn handle(State(home): State<Arc<HomeClient>>, request: Request
     if speech_route && status.is_success() {
         return audio(response, attempt, audio_type);
     }
+    let upstream_sse = headers
+        .get("content-type")
+        .and_then(|value| value.to_str().ok())
+        .is_some_and(|value| {
+            value
+                .split(';')
+                .next()
+                .is_some_and(|kind| kind.trim().eq_ignore_ascii_case("text/event-stream"))
+        });
+    if image_stream && status.is_success() && upstream_sse {
+        return media_sse(response, attempt, path.ends_with("/edits"));
+    }
     let mut source = response.bytes_stream();
     let mut bytes = Vec::new();
     loop {
@@ -374,6 +386,53 @@ pub(super) async fn handle(State(home): State<Arc<HomeClient>>, request: Request
             )
         }
     }
+}
+
+fn media_sse(response: reqwest::Response, attempt: lifecycle::Attempt, edit: bool) -> Response {
+    let content_type = response
+        .headers()
+        .get("content-type")
+        .cloned()
+        .unwrap_or_else(|| HeaderValue::from_static("text/event-stream"));
+    let body = stream::unfold(
+        Some((response.bytes_stream(), attempt)),
+        move |state| async move {
+            let (mut source, mut attempt) = state?;
+            let cancel = attempt.cancellation();
+            let next = tokio::select! { biased;
+                _ = cancel.cancelled() => Some(Err(std::io::Error::other("Home membership ended"))),
+                next = source.next() => next.map(|result| result.map_err(|_| std::io::Error::other("Image upstream read failed"))),
+            };
+            match next {
+                Some(Ok(bytes)) => {
+                    attempt.first_byte();
+                    Some((Ok(bytes), Some((source, attempt))))
+                }
+                Some(Err(error)) => {
+                    attempt.record.local_failure(502);
+                    drop(attempt);
+                    Some((Err(error), None))
+                }
+                None => {
+                    attempt.record.failed = false;
+                    attempt.record.fail_code.clear();
+                    drop(attempt);
+                    None
+                }
+            }
+        },
+    );
+    let mut result = Body::from_stream(body).into_response();
+    result.headers_mut().insert("content-type", content_type);
+    result
+        .headers_mut()
+        .insert("cache-control", HeaderValue::from_static("no-cache"));
+    if edit {
+        result
+            .headers_mut()
+            .insert("x-ai48-image-operation", HeaderValue::from_static("edit"));
+    }
+    result
 }
 
 fn audio(

@@ -113,6 +113,16 @@ fn overlapping_terminals_only_close_their_own_response() {
 }
 
 #[test]
+fn proxy_and_unknown_controls_remain_fail_closed() {
+    let event = json!({"type":"response.interrupt","response_id":"foreign"});
+    assert!(!control(&event, Some("active")));
+    assert!(!terminal_owns_active(
+        &json!({"type":"response.completed","response":{"id":"foreign"}}),
+        Some("active")
+    ));
+}
+
+#[test]
 fn idless_failures_are_attributed_to_the_active_response() {
     let event = json!({"type":"error","error":{"message":"upstream"}});
     assert_eq!(terminal_response_id(&event, Some("r1")), Some("r1"));

@@ -206,6 +206,16 @@ fn replay_restores_native_function_response_id_from_stable_provenance() {
 }
 
 #[test]
+fn mismatched_stable_provenance_does_not_restore_native_id() {
+    let selection = selected(json!({"metadata":{"project_id":"p"}}));
+    let mut body = json!({"contents":[
+        {"role":"model","parts":[{"functionCall":{"id":"native-call","name":"Read","args":{"path":"/tmp/file"}}}]},
+        {"role":"user","parts":[{"functionResponse":{"id":"cpa_gemini_bad","name":"Read","response":{"result":"ok"}}}]}
+    ]});
+    assert!(normalize(&mut body, &selection).is_err());
+}
+
+#[test]
 fn native_tool_schema_preserves_types_and_claude_placeholders() {
     for model in ["gemini-3-flash", "claude-sonnet-4-5"] {
         let mut selection = selected(json!({"metadata":{"project_id":"p"}}));

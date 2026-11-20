@@ -19,6 +19,10 @@ mod codex;
 #[cfg(test)]
 #[path = "gateway/compat_tests.rs"]
 mod compat_tests;
+use lifecycle::completion;
+#[cfg(test)]
+#[path = "gateway/completion_tests.rs"]
+mod completion_tests;
 #[path = "gateway/cors.rs"]
 pub(crate) mod cors;
 #[path = "gateway/count_tokens.rs"]
@@ -221,7 +225,6 @@ async fn generate(State(home): State<Arc<HomeClient>>, request: Request) -> Resp
         }
     };
     // One Home request log per client request, independent of retries/refresh.
-    let started = std::time::Instant::now();
     let model = body
         .get("model")
         .and_then(Value::as_str)
@@ -235,19 +238,22 @@ async fn generate(State(home): State<Arc<HomeClient>>, request: Request) -> Resp
     .headers(&parts.headers);
     let streaming = parts.uri.path().ends_with(":streamGenerateContent")
         || body.get("stream").and_then(Value::as_bool) == Some(true);
-    let interval = home.config().nonstream_keepalive_interval;
-    let execution = routes::generate(home.clone(), parts.uri, parts.headers, body);
+    let completion = completion::Completion::new(home.clone(), record);
+    let context = completion.context.clone();
+    let path = parts.uri.path().to_owned();
+    let execution = completion::CONTEXT.scope(context.clone(), async move {
+        let response = routes::generate(home, parts.uri, parts.headers, body).await;
+        context.status(response.status().as_u16());
+        response
+    });
     // CPA emits whitespace while a non-stream JSON execution is pending.
     let response = if streaming {
-        execution.await
+        crate::config::keepalive::stream_wait(execution, &config.streaming, &path).await
     } else {
-        crate::config::keepalive::nonstream_wait(execution, interval).await
+        crate::config::keepalive::nonstream_wait(execution, config.nonstream_keepalive_interval)
+            .await
     };
-    crate::observability::submit(
-        &home,
-        record.finish(response.status().as_u16(), started.elapsed()),
-    );
-    response
+    completion.response(response)
 }
 
 const SESSION_HEADERS: &[&str] = &[

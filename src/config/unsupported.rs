@@ -14,6 +14,8 @@ pub(super) fn features(raw: &Value) -> Vec<String> {
         "claude-code",
         "antigravity",
         "xai",
+        "kimi",
+        "meta",
         "devin",
         "codex-header-defaults",
         "claude-header-defaults",
@@ -90,7 +92,6 @@ pub(super) fn features(raw: &Value) -> Vec<String> {
         }
     }
     for key in [
-        "video-result-auth-cache-ttl",
         "antigravity-signature-cache-enabled",
         "antigravity-signature-bypass-strict",
     ] {
@@ -185,7 +186,7 @@ fn inert(value: &Value, path: &str) -> bool {
 }
 
 fn leaves(value: &Value, path: &str, out: &mut Vec<String>) {
-    if inert(value, path) {
+    if path.rsplit('.').next() == Some("video-result-auth-cache-ttl") || inert(value, path) {
         return;
     }
     match value {
@@ -208,6 +209,26 @@ fn leaves(value: &Value, path: &str, out: &mut Vec<String>) {
 #[cfg(test)]
 mod codex_tests {
     use super::*;
+
+    #[test]
+    fn text_provider_defaults_and_unconsumed_controls() {
+        // Home removes credential lists before dispatching config. Do not imply
+        // that this worker consumes local credential catalogs or active X Search.
+        let defaults: Value = serde_yaml::from_str("xai: {inject-x-search: false}\nupstream: {xai: {inject-x-search: false}}\noauth: {providers: {xai: {inject-x-search: false}}}\n").unwrap();
+        assert!(features(&defaults).is_empty());
+        for yaml in [
+            "xai-api-key: [{api-key: fixture}]",
+            "meta-api-key: [{api-key: fixture}]",
+            "upstream: {xai: {inject-x-search: true}}",
+            "kimi: {unported-control: true}",
+        ] {
+            let raw: Value = serde_yaml::from_str(yaml).unwrap();
+            assert!(
+                !features(&raw).is_empty(),
+                "unconsumed provider setting accepted"
+            );
+        }
+    }
 
     #[test]
     fn unported_codex_controls_remain_rejected() {

@@ -25,19 +25,27 @@ usage outbox.
 
 - OpenAI-style Chat Completions and Responses, Claude Messages, and Gemini
   generation APIs, with supported cross-format request and response translation.
-- OpenAI-compatible custom upstreams, Codex, Claude, Gemini, Vertex and
-  Antigravity execution using Home-selected credentials.
+- OpenAI-compatible custom upstreams, Codex, Claude, Gemini, Vertex,
+  Antigravity, xAI, Kimi (including `kimi-ai`) and Meta text execution using
+  Home-selected credentials, within provider-specific format/tool restrictions.
 - Incremental SSE translation, bounded WebSocket sessions and cancellation-aware
   execution accounting.
-- Image generation/editing for supported providers and xAI speech endpoints.
+- Image generation/editing for supported providers, xAI image completion SSE,
+  xAI speech, and JSON-based xAI video jobs with an OpenAI-style video facade
+  and Home-KV credential-bound retrieval.
 - Home configuration subscriptions, immutable configuration snapshots, payload
-  rules, supported reasoning controls, keepalives and response-header filtering.
+  rules, request-scoped error actions, supported reasoning controls, pre-header
+  SSE keepalives and response-header filtering. Codex HTTP cache identity is
+  prepared before payload rules.
 - Certificate enrollment, verified mTLS, heartbeat fencing, cluster discovery,
-  reconnect recovery, conditional membership takeover and drained-worker rebalance.
+  reconnect recovery, conditional membership takeover and planned rebalance that
+  preserves active executions on their origin Home. Negotiated latency telemetry
+  and randomized equal-load node selection are wired.
 - Cumulative concurrency releases, in-flight snapshots and durable accepted usage
-  reporting, including supported image dimensions.
+  reporting, including supported image dimensions and optional `media_counts`.
 - Bounded Home application-log forwarding and opt-in sanitized request metadata
-  logs. Request/response bodies and credential headers are omitted.
+  logs submitted once at generation response-body completion, error or disconnect
+  (499), with the selected provider label. Bodies and credential headers are omitted.
 
 Support depends on the selected provider, credential type, request format and
 configuration. A registered route is not a promise that every combination works.
@@ -136,16 +144,31 @@ cargo run --locked -- --check-config home-snapshot.yaml
 | `POST /v1/images/edits` | Supported image editing, including multipart input |
 | `POST /v1/audio/speech`, `POST /v1/tts` | Supported xAI speech execution |
 
-Video routes currently return explicit unsupported-capability errors. Upstream
-errors are sanitized because provider messages can contain sensitive information.
+| `POST /v1/videos`, `POST /v1/videos/generations` | xAI video generation |
+| `POST /v1/videos/edits`, `POST /v1/videos/extensions` | xAI video editing/extension |
+| `GET /v1/videos/{request_id}` | Credential-bound xAI video retrieval |
+| `POST /openai/v1/videos`, `GET /openai/v1/videos/{video_id}` | OpenAI-style facade over xAI video jobs |
+| `GET /openai/v1/videos/{video_id}/content` | Video download without forwarding authorization |
+
+Video creation requires JSON; forms are unsupported. Retrieval requires an
+unexpired Home-KV credential binding (`video-result-auth-cache-ttl`, default `3h`).
+Upstream errors are sanitized because provider messages can contain sensitive information.
 
 ## Operational limits
 
-- Native plugin execution, Gemini CLI, realtime/video workflows and some advanced
-  provider options are not available.
-- WebSocket proxying, overlapping turns, steering, advanced signed replay and
-  complete provider-specific schema behavior remain limited.
-- Rebalance requires a drained worker; active executions are not transferred.
+- Native plugin execution, Gemini CLI and general realtime workflows are unavailable.
+  Devin is intentionally out of scope and is not supported.
+- Native WebSocket proxy transport, overlapping turns, advanced steering, xAI
+  WebSockets, advanced Claude/Antigravity signed replay and complete provider-specific
+  schema behavior remain unimplemented or limited.
+- xAI, Kimi and Meta reject unsupported source formats, advanced tools/replay and
+  continuation/compaction. Meta requires a pre-minted usable key; the worker does
+  not mint one from DCA-only credentials. See the provider guide for exact subsets.
+- Video is xAI-only and JSON-only; compatible/Codex image SSE remains rejected.
+- Planned rebalance moves only the replacement connection, not active execution
+  ownership. Releases and usage remain origin-bound during the process lifetime;
+  failures roll back to the origin. Restart usage replay uses the current Home,
+  because origin routing is not persisted.
 - Unsupported active execution settings are rejected rather than silently ignored.
 - Durable reporting protects accepted events, not usage never observed before a
   crash. Capacity or persistence failures can fence admission.

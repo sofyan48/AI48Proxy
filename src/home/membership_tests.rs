@@ -125,6 +125,14 @@ async fn cluster_updates_normalize_and_order_failover_targets_without_switching(
 async fn rebalance_claim_preflight_and_signal_leave_source_membership_owned() {
     let home = Home::new().await;
     let (client, mut sub) = home.start().await;
+    client.membership.managed.store(true, Ordering::Release);
+    let mut guard = client.registry.begin(
+        "credential".into(),
+        "model".into(),
+        true,
+        "request".into(),
+        "stream".into(),
+    );
     let target = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let port = target.local_addr().unwrap().port();
     publish(
@@ -156,11 +164,36 @@ async fn rebalance_claim_preflight_and_signal_leave_source_membership_owned() {
     let mut probe = BufReader::new(home.acceptor.accept(socket).await.unwrap());
     assert_eq!(command(&mut probe).await, [b"PING".to_vec()]);
     probe.get_mut().write_all(b"+PONG\r\n").await.unwrap();
-    observed(|| client.cancellation().is_cancelled()).await;
+    observed(|| client.handoff.is_cancelled()).await;
+    assert!(!client.cancellation().is_cancelled());
     let plan = client.membership.take_migration().unwrap();
     assert_eq!(plan.id, "plan");
     assert_eq!(plan.target.port, port);
     assert_eq!(client.connector.target(), home.connector.target());
+    assert!(!guard.cancellation().is_cancelled());
+    let release = guard.finish().unwrap();
+    let exchange = async {
+        let mut peer = home.accept().await;
+        assert_eq!(command(&mut peer).await[1], b"concurrency-release");
+        peer.get_mut().write_all(b":1\r\n").await.unwrap();
+    };
+    let (result, ()) =
+        bounded(async { tokio::join!(client.flush_release(&release), exchange) }).await;
+    result.unwrap();
+    client
+        .reporting
+        .enqueue(serde_json::json!({"execution_id":"origin-usage"}))
+        .unwrap();
+    let delivery = client.reporting.pending_batch(1, 1024).remove(0);
+    let exchange = async {
+        let mut peer = home.accept().await;
+        assert_eq!(command(&mut peer).await[1], b"usage");
+        peer.get_mut().write_all(b":1\r\n").await.unwrap();
+    };
+    let (result, ()) =
+        bounded(async { tokio::join!(client.reporting.deliver(&delivery), exchange) }).await;
+    assert_eq!(result.unwrap(), Frame::Integer(1));
+    client.reporting.acknowledge(&delivery.id);
     client.retire().await.unwrap();
 }
 
@@ -244,7 +277,7 @@ async fn subscription_timeout_fails_over_to_discovered_mtls_node() {
 }
 
 #[tokio::test]
-async fn rebalance_never_claims_with_live_execution_owners() {
+async fn rebalance_claims_with_live_execution_owners_and_rejection_keeps_source() {
     let home = Home::new().await;
     let (client, mut sub) = home.start().await;
     let guard = client.registry.begin(
@@ -263,13 +296,43 @@ async fn rebalance_never_claims_with_live_execution_owners() {
     let mut enable = bounded(home.accept()).await;
     assert_eq!(command(&mut enable).await[2], b"ENABLE");
     bulk(&mut enable, br#"{"ok":true}"#).await;
+    let mut claim = bounded(home.accept()).await;
+    assert_eq!(command(&mut claim).await[2], b"CLAIM");
+    bulk(&mut claim, br#"{"ok":false}"#).await;
     observed(|| !client.control_busy.load(Ordering::Acquire)).await;
+    assert!(!guard.cancellation().is_cancelled());
     assert!(client.ready());
     assert!(client.membership.take_migration().is_none());
     let accept = home.listener.accept();
     tokio::pin!(accept);
     assert!(futures_util::poll!(accept).is_pending());
     drop(guard);
+    client.retire().await.unwrap();
+}
+
+#[tokio::test]
+async fn subscription_telemetry_pong_does_not_extend_heartbeat() {
+    let home = Home::new().await;
+
+    let (client, mut sub) = home.start().await;
+    let mut sampler = super::super::latency::Sampler::default();
+    let token = sampler.begin(&client);
+    assert!(token.starts_with("home-rtt/"));
+    let at = tokio::time::Instant::now();
+    sampler.pong(&client, "unrelated", at);
+    sampler.pong(&client, &token, at + Duration::from_millis(10));
+    sampler.pong(&client, &token, at + Duration::from_secs(1));
+
+    sub.get_mut()
+        .write_all(format!("*2\r\n$4\r\npong\r\n${}\r\n{}\r\n", token.len(), token).as_bytes())
+        .await
+        .unwrap();
+    tokio::task::yield_now().await;
+    tokio::time::pause();
+    tokio::time::advance(Duration::from_secs(11)).await;
+    observed(|| client.cancellation().is_cancelled()).await;
+    tokio::time::resume();
+    assert!(client.membership.take_timeout());
     client.retire().await.unwrap();
 }
 

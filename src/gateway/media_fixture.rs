@@ -21,6 +21,9 @@ use tokio::{
 use tokio_rustls::{TlsAcceptor, server::TlsStream};
 use tower::ServiceExt;
 
+#[path = "media_video_tests.rs"]
+mod video_tests;
+
 type Peer = BufReader<TlsStream<TcpStream>>;
 const CONFIG: &str = "request-retry: 2\ncredential-concurrency:\n  lifecycle-config-revision: 7\n  cpa-heartbeat-timeout: 1h\n  release-flush-interval: 1h\n  release-max-backoff: 1h\n";
 pub(crate) const SECRET: &str = "matrix-upstream-key-not-a-real-credential";

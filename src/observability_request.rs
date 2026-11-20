@@ -77,8 +77,9 @@ impl RequestLogRecord {
         }
         let _ = write!(
             self.request_log,
-            "\n=== REQUEST BODY ===\n[omitted by worker security policy]\n\n=== RESPONSE ===\nStatus: {}\nBody: [omitted by worker security policy]\n",
-            self.status
+            "\n=== REQUEST BODY ===\n[omitted by worker security policy]\n\n=== RESPONSE ===\nStatus: {}\nError: {}\nBody: [omitted by worker security policy]\n",
+            self.status,
+            self.status >= 400
         );
         self
     }

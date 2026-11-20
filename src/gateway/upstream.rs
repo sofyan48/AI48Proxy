@@ -53,6 +53,12 @@ pub(crate) fn prepare(
     if path == "/v1/messages/count_tokens" {
         return super::count_tokens::prepare(config, selection, headers, body, requested_stream);
     }
+    if matches!(provider.as_str(), "xai" | "meta" | "kimi" | "kimi-ai") {
+        ensure!(
+            matches!(path, "/v1/chat/completions" | "/v1/responses"),
+            "provider source format unsupported: only Chat and Responses are implemented; Claude/Gemini delegation requires provider replay bridges"
+        );
+    }
     let requested_model = if incoming == Format::Gemini {
         path.strip_prefix("/v1beta/models/")
             .and_then(|p| p.split_once(':'))
@@ -189,11 +195,15 @@ pub(crate) fn prepare(
     // token/modalities normalization; never infer native Responses from model names.
     let chat_responses = path == "/v1/responses"
         && outgoing == Format::OpenAi
-        && !matches!(provider.as_str(), "codex" | "vertex" | "vertexai");
+        && !matches!(
+            provider.as_str(),
+            "codex" | "vertex" | "vertexai" | "xai" | "meta" | "kimi" | "kimi-ai"
+        );
     if chat_responses {
         body = crate::protocol::responses::responses_request(&body, &selection.model)?;
     }
-    let responses_chat = provider == "codex" && path == "/v1/chat/completions";
+    let responses_chat =
+        matches!(provider.as_str(), "codex" | "xai" | "meta") && path == "/v1/chat/completions";
     if responses_chat {
         body = crate::protocol::responses::chat_request(&body, &selection.model)?;
     }
@@ -236,6 +246,10 @@ pub(crate) fn prepare(
             | "vertex"
             | "vertexai"
             | "antigravity"
+            | "xai"
+            | "meta"
+            | "kimi"
+            | "kimi-ai"
     ) {
         ensure!(
             selection

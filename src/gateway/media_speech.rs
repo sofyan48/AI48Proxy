@@ -1,4 +1,7 @@
 //! Go openai_speech_handlers.go routing and native xAI TTS request normalization.
+//! Go executeSpeech parses OpenAI usage from the response, but raw audio has no
+//! structured usage. Do not infer media counts or audio_seconds from request text,
+//! sample rate, or encoded audio bytes; successful raw speech has zero usage.
 use anyhow::{Result, ensure};
 use serde_json::{Value, json};
 

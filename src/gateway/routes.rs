@@ -139,13 +139,33 @@ pub(super) async fn generate(
                 "Upstream identity preparation failed",
             );
         }
-        let mut prepared = match upstream::prepare(
-            &config,
-            &selection,
-            uri.path(),
-            &headers,
-            body.clone(),
-            requested_stream,
+        let caller_api_key = selection.user_api_key.clone();
+        let cache_context = || crate::providers::codex::cache::Context {
+            execution: String::new(),
+            derived: crate::providers::codex::cache::derived_session(
+                match uri.path() {
+                    "/v1/responses" | "/v1/responses/compact" => "openai-response",
+                    "/v1/messages" => "claude",
+                    _ => "openai",
+                },
+                &body,
+                &headers,
+                &caller_api_key,
+            ),
+            api_key: caller_api_key.clone(),
+        };
+        let mut prepared = match crate::providers::codex::cache::with_context(
+            cache_context(),
+            || {
+                upstream::prepare(
+                    &config,
+                    &selection,
+                    uri.path(),
+                    &headers,
+                    body.clone(),
+                    requested_stream,
+                )
+            },
         ) {
             Ok(prepared) => prepared,
             Err(err) => {
@@ -206,8 +226,7 @@ pub(super) async fn generate(
         let rules =
             crate::config::execution::resolve_rules(&config, &selection.provider, &selection.auth);
         let mut scoped = observe_result_with_rules(&mut result, &mut attempt, &rules).await;
-        if !scoped.is_some_and(|action| action.stops())
-            && !refreshed_once
+        if refresh_allowed(scoped, refreshed_once)
             && result
                 .as_ref()
                 .is_ok_and(|r| r.status() == StatusCode::UNAUTHORIZED)
@@ -248,26 +267,29 @@ pub(super) async fn generate(
                     );
                 }
                 attempt.refreshed(&selection);
-                prepared = match upstream::prepare(
-                    &config,
-                    &selection,
-                    uri.path(),
-                    &headers,
-                    body.clone(),
-                    requested_stream,
-                ) {
-                    Ok(prepared) => prepared,
-                    Err(_) => {
-                        tracing::warn!(parent: &attempt_span, event = "prepare_failed",
+                prepared =
+                    match crate::providers::codex::cache::with_context(cache_context(), || {
+                        upstream::prepare(
+                            &config,
+                            &selection,
+                            uri.path(),
+                            &headers,
+                            body.clone(),
+                            requested_stream,
+                        )
+                    }) {
+                        Ok(prepared) => prepared,
+                        Err(_) => {
+                            tracing::warn!(parent: &attempt_span, event = "prepare_failed",
                             stage = "refresh_prepare", "refreshed request preparation failed");
-                        attempt.record.local_failure(502);
-                        return error(
-                            StatusCode::BAD_GATEWAY,
-                            "refresh_failed",
-                            "Refreshed credential cannot execute request",
-                        );
-                    }
-                };
+                            attempt.record.local_failure(502);
+                            return error(
+                                StatusCode::BAD_GATEWAY,
+                                "refresh_failed",
+                                "Refreshed credential cannot execute request",
+                            );
+                        }
+                    };
                 result = tokio::select! {
                     biased;
                     _ = cancellation.cancelled() => {
@@ -298,8 +320,7 @@ pub(super) async fn generate(
         let cap = config.max_retry_credentials;
         // This decision is strictly before any body read/output. Body failures below
         // never return to dispatch, including SSE failures after response headers.
-        let will_retry = retryable
-            && !scoped.is_some_and(|action| action.stops())
+        let will_retry = rotation_allowed(scoped, retryable)
             && !(result.is_ok()
                 && attempt.record.fail_code == "request_scoped"
                 && scoped.is_none())
@@ -474,7 +495,12 @@ async fn observe_result_with_rules(
         .and_then(|v| v.to_str().ok())
         .and_then(|v| v.parse::<u64>().ok());
     let cancellation = attempt.cancellation();
-    let body = super::diagnostics::error_body(response, &cancellation).await;
+    let Some(raw) = super::rejection::raw_error_body(response, &cancellation).await else {
+        attempt.record.upstream_failure(status, &Value::Null);
+        return None;
+    };
+    let body = serde_json::from_slice(&raw)
+        .unwrap_or_else(|_| Value::String(String::from_utf8_lossy(&raw).into_owned()));
     let mut request_scoped = false;
     if attempt.record.provider == "claude" {
         let limit = super::rejection::claude_limit(status, response.headers(), &body);
@@ -521,18 +547,26 @@ async fn observe_result_with_rules(
     }
     // An unreadable error body does not erase the genuine HTTP failure.
     // Rules see the bounded body text only; it is never returned or logged.
-    let raw = match &body {
-        Value::String(text) => text.clone(),
-        Value::Null => String::new(),
-        other => other.to_string(),
-    };
     let action = attempt
         .record
-        .upstream_failure_with_rules(status, &raw, rules);
+        .upstream_failure_with_rule_bytes(status, &raw, rules);
     if request_scoped && action.is_none() {
         attempt.record.fail_code = "request_scoped".into();
     }
     action
+}
+
+// Go tryRefreshAfterUnauthorized leaves every matched rule in control of the
+// request, including continue actions. Only unmatched 401s may refresh.
+fn refresh_allowed(action: Option<crate::config::execution::ErrorAction>, refreshed: bool) -> bool {
+    action.is_none() && !refreshed
+}
+
+fn rotation_allowed(
+    action: Option<crate::config::execution::ErrorAction>,
+    retryable: bool,
+) -> bool {
+    action.map_or(retryable, |action| !action.stops())
 }
 
 fn accepts_sse(mode: crate::providers::ResponseMode, content_type: &str) -> bool {

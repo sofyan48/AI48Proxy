@@ -7,6 +7,29 @@ use axum::{
 use chrono::Utc;
 use serde_json::Value;
 
+/// Retain original bytes only for local matching. Oversized/incomplete bodies fail
+/// closed rather than matching a misleading prefix. Never log or serialize this value.
+pub(super) async fn raw_error_body(
+    response: &mut reqwest::Response,
+    cancellation: &tokio_util::sync::CancellationToken,
+) -> Option<Vec<u8>> {
+    let mut bytes = Vec::new();
+    loop {
+        let chunk = tokio::select! {
+            biased;
+            _ = cancellation.cancelled() => return None,
+            chunk = response.chunk() => chunk,
+        };
+        match chunk {
+            Ok(Some(chunk)) if chunk.len() <= (64 * 1024usize).saturating_sub(bytes.len()) => {
+                bytes.extend_from_slice(&chunk);
+            }
+            Ok(None) => return Some(bytes),
+            _ => return None,
+        }
+    }
+}
+
 pub(super) fn claude_limit(
     status: u16,
     headers: &HeaderMap,

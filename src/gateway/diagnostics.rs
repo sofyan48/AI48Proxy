@@ -174,36 +174,6 @@ pub(super) fn content_type(value: &str) -> &'static str {
     }
 }
 
-/// Read at most 64 KiB of an error body. No timeout after connection establishment.
-/// Never return a prefix of truncated JSON or log any of these bytes.
-pub(super) async fn error_body(
-    response: &mut reqwest::Response,
-    cancellation: &tokio_util::sync::CancellationToken,
-) -> serde_json::Value {
-    let mut bytes = Vec::new();
-    loop {
-        let chunk = tokio::select! {
-            biased;
-            _ = cancellation.cancelled() => return serde_json::Value::Null,
-            chunk = response.chunk() => chunk,
-        };
-        match chunk {
-            Ok(Some(chunk)) if chunk.len() <= (64 * 1024usize).saturating_sub(bytes.len()) => {
-                bytes.extend_from_slice(&chunk);
-            }
-            Ok(None) => {
-                return serde_json::from_slice(&bytes).unwrap_or_else(|_| {
-                    // Used only by canonical scheduler matchers, never returned or logged.
-                    String::from_utf8(bytes)
-                        .map(serde_json::Value::String)
-                        .unwrap_or_default()
-                });
-            }
-            _ => return serde_json::Value::Null,
-        }
-    }
-}
-
 /// Only structured, known provider failure codes establish upstream attribution.
 /// The typed error carries already-sanitized scheduler hints, not provider text.
 #[derive(Debug)]

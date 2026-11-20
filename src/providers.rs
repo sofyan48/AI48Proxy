@@ -23,12 +23,18 @@ pub mod codex;
 #[cfg(test)]
 #[path = "providers/http_options_tests.rs"]
 mod http_options_tests;
+#[path = "providers/kimi.rs"]
+pub mod kimi;
+#[path = "providers/meta.rs"]
+pub mod meta;
 #[path = "providers/openai.rs"]
 pub mod openai;
 #[path = "providers/refresh.rs"]
 mod refresh;
 #[path = "providers/vertex.rs"]
 pub mod vertex;
+#[path = "providers/xai.rs"]
+pub mod xai;
 pub use refresh::{RefreshedAuth, refresh, refresh_on_401};
 #[cfg(test)]
 #[path = "providers/google_tests.rs"]
@@ -153,6 +159,9 @@ pub fn resolve(selection: &Selection, incoming_protocol: &str) -> Result<Credent
             let (base, oauth) = vertex::credentials(selection, incoming_protocol, &mut headers)?;
             return finish_credentials(selection, headers, base, incoming_protocol, oauth);
         }
+        "xai" => return xai::credentials(selection, incoming_protocol),
+        "kimi" | "kimi-ai" => return kimi::credentials(selection, incoming_protocol),
+        "meta" => return meta::credentials(selection, incoming_protocol),
         _ if openai::is_compat(selection) => {
             ensure!(
                 matches!(incoming_protocol, "openai" | "openai-response"),
@@ -293,6 +302,45 @@ pub fn prepare_context(
         false
     };
     let format = match creds.provider_protocol.as_str() {
+        "xai" => {
+            return xai::prepare(
+                config,
+                selection,
+                path,
+                incoming,
+                body,
+                requested_stream,
+                context,
+                creds,
+            );
+        }
+        "meta" => {
+            return meta::prepare(
+                config,
+                selection,
+                path,
+                incoming,
+                body,
+                requested_stream,
+                context,
+                creds,
+            );
+        }
+        "openai" | "openai-response"
+            if selection.provider.eq_ignore_ascii_case("kimi")
+                || selection.provider.eq_ignore_ascii_case("kimi-ai") =>
+        {
+            return kimi::prepare(
+                config,
+                selection,
+                path,
+                incoming,
+                body,
+                requested_stream,
+                context,
+                creds,
+            );
+        }
         "claude" => ProviderFormat::Claude,
         "gemini" | "antigravity" => ProviderFormat::Gemini,
         _ => ProviderFormat::OpenAi,
@@ -307,9 +355,26 @@ pub fn prepare_context(
         } else {
             codex::normalize_request(&mut body, &selection.model)?;
         }
-        // Go cacheHelperDoc seeds the header from req.Payload before payload rules;
-        // later incoming/custom headers may replace it without changing the body.
-        codex::prompt_cache_header(&mut creds.headers, &original)?;
+        // Read the trusted source before translation, not translated Responses fields
+        // or credential metadata. Built-in cache injection precedes payload rules.
+        let source = context.as_ref().map_or(protocol, |ctx| ctx.from_protocol);
+        let cache_original = context
+            .as_ref()
+            .and_then(|ctx| ctx.original)
+            .unwrap_or(&original);
+        if let Some(key) = codex::cache::http_key(
+            source,
+            cache_original,
+            incoming,
+            &selection.model,
+            &selection.user_api_key,
+        ) {
+            body["prompt_cache_key"] = key.clone().into();
+            codex::prompt_cache_header(
+                &mut creds.headers,
+                &serde_json::json!({"prompt_cache_key": key}),
+            )?;
+        }
         codex::request_headers(
             &mut creds.headers,
             incoming,

@@ -54,7 +54,14 @@ impl NodesReply {
             super::transport::validate_target(&node.ip, node.port).is_ok()
                 && seen.insert((node.ip.clone(), node.port))
         });
-        reply.nodes.sort_by_key(|node| node.client_count);
+        // Randomize equal-load bootstrap and recovery candidates without biasing load order.
+        let mut nodes: Vec<_> = reply
+            .nodes
+            .into_iter()
+            .map(|node| (node, uuid::Uuid::new_v4()))
+            .collect();
+        nodes.sort_by_key(|(node, draw)| (node.client_count, *draw));
+        reply.nodes = nodes.into_iter().map(|(node, _)| node).collect();
         Ok(reply)
     }
 }

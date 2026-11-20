@@ -330,6 +330,97 @@ async fn claude_rejection_keeps_reset_header_and_safe_home_attribution() {
 }
 
 #[tokio::test]
+async fn scoped_actions_preserve_raw_text_and_control_refresh_and_rotation() {
+    use crate::config::execution::{ErrorAction, RequestScopedRule};
+    let raw = r#"{ "error" : {"message":"CaseSensitive\\u0020failure"} }"#;
+    for (name, action, stops, code) in [
+        ("stop", ErrorAction::Stop, true, "request_scoped"),
+        ("continue", ErrorAction::Continue, false, "request_scoped"),
+        (
+            "stop-and-cooldown",
+            ErrorAction::StopAndCooldown,
+            true,
+            "force_cooldown",
+        ),
+        (
+            "continue-and-cooldown",
+            ErrorAction::ContinueAndCooldown,
+            false,
+            "force_cooldown",
+        ),
+    ] {
+        let home = Home::new().await;
+        let (client, _subscription) = home.start().await;
+        let mut attempt = home.attempt(client.clone(), "codex").await;
+        for status in [401, 422, 503] {
+            let rules = [RequestScopedRule {
+                status: i64::from(status),
+                substrings: vec![raw.into()],
+                action: name.into(),
+                ..Default::default()
+            }];
+            let mut result = Ok(upstream(status, raw).await);
+            let matched = super::observe_result_with_rules(&mut result, &mut attempt, &rules).await;
+            assert_eq!(matched, Some(action));
+            assert!(
+                !super::refresh_allowed(matched, false),
+                "all matched 401s bypass refresh"
+            );
+            assert!(!super::refresh_allowed(matched, true));
+            assert_eq!(
+                super::rotation_allowed(matched, false),
+                !stops,
+                "continue overrides nonretryable statuses"
+            );
+            assert_eq!(super::rotation_allowed(matched, true), !stops);
+            assert_eq!(attempt.record.fail_code, code);
+            assert!(attempt.record.fail_body.is_empty());
+            assert!(!super::can_retry(1, 1, "credential", 0, 0));
+        }
+        // A refreshed attempt must match its own body, never reuse the previous action.
+        let rules = [RequestScopedRule {
+            status: 401,
+            substrings: vec![raw.to_lowercase()],
+            action: name.into(),
+            ..Default::default()
+        }];
+        let mut result = Ok(upstream(401, raw).await);
+        assert_eq!(
+            super::observe_result_with_rules(&mut result, &mut attempt, &rules).await,
+            None
+        );
+        assert!(super::refresh_allowed(None, false));
+        assert!(!super::refresh_allowed(None, true));
+        assert!(attempt.record.fail_code.is_empty());
+        let payload = finish(&client, attempt);
+        assert!(!payload.to_string().contains("CaseSensitive"));
+        client.fence();
+    }
+}
+
+#[tokio::test]
+async fn raw_rule_body_is_bounded_and_never_matches_an_oversized_prefix() {
+    use crate::config::execution::RequestScopedRule;
+    let home = Home::new().await;
+    let (client, _subscription) = home.start().await;
+    let mut attempt = home.attempt(client.clone(), "codex").await;
+    let rules = [RequestScopedRule {
+        status: 401,
+        substrings: vec!["trigger".into()],
+        action: "stop".into(),
+        ..Default::default()
+    }];
+    for (size, matched) in [(64 * 1024, true), (64 * 1024 + 1, false)] {
+        let body = format!("trigger{}", "x".repeat(size - 7));
+        let mut result = Ok(upstream(401, &body).await);
+        let action = super::observe_result_with_rules(&mut result, &mut attempt, &rules).await;
+        assert_eq!(action.is_some(), matched);
+    }
+    finish(&client, attempt);
+    client.fence();
+}
+
+#[tokio::test]
 async fn feedback_local_connect_failure_is_request_scoped() {
     let home = Home::new().await;
     let (client, _subscription) = home.start().await;

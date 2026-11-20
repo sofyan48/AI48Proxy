@@ -85,6 +85,14 @@ pub fn submit(home: &Arc<HomeClient>, record: RequestLogRecord) -> bool {
     if !home.config().request_log {
         return false;
     }
+    #[cfg(test)]
+    if let Some(sender) = request_test_sinks()
+        .lock()
+        .unwrap()
+        .get(&Arc::as_ptr(home).addr())
+    {
+        return sender.try_send(record.render()).is_ok();
+    }
     let Some(queue) = SINK.get() else {
         return false;
     };
@@ -95,6 +103,33 @@ pub fn submit(home: &Arc<HomeClient>, record: RequestLogRecord) -> bool {
             false
         }
     }
+}
+
+#[cfg(test)]
+fn request_test_sinks()
+-> &'static std::sync::Mutex<std::collections::HashMap<usize, mpsc::Sender<RequestLogRecord>>> {
+    static SINKS: OnceLock<
+        std::sync::Mutex<std::collections::HashMap<usize, mpsc::Sender<RequestLogRecord>>>,
+    > = OnceLock::new();
+    SINKS.get_or_init(Default::default)
+}
+
+#[cfg(test)]
+pub(crate) fn capture_requests(home: &Arc<HomeClient>) -> mpsc::Receiver<RequestLogRecord> {
+    let (tx, rx) = mpsc::channel(16);
+    request_test_sinks()
+        .lock()
+        .unwrap()
+        .insert(Arc::as_ptr(home).addr(), tx);
+    rx
+}
+
+#[cfg(test)]
+pub(crate) fn stop_capture_requests(home: &Arc<HomeClient>) {
+    request_test_sinks()
+        .lock()
+        .unwrap()
+        .remove(&Arc::as_ptr(home).addr());
 }
 
 pub struct LogForwarder {

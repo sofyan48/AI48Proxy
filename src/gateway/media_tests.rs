@@ -1,4 +1,6 @@
 use super::*;
+use crate::config::Config;
+use http::HeaderMap;
 #[path = "media_fixture.rs"]
 mod fixture;
 
@@ -44,6 +46,8 @@ async fn speech_alias_forwards_native_payload_and_binary_audio() {
         assert_eq!(result.upstream.target, "/tenant/v1/tts");
         assert_eq!(result.upstream.body, payload);
         assert_eq!(result.usage["failed"], false);
+        assert!(result.usage.get("media_counts").is_none());
+        assert_eq!(result.usage["tokens"]["total_tokens"], 0);
         assert_eq!(
             result.upstream.headers["authorization"],
             format!("Bearer {}", fixture::SECRET)
@@ -193,7 +197,73 @@ async fn codex_responses_bridge_requires_completion_and_reports_images() {
     }
 }
 
-#[tokio::test]
-async fn video_routes_fail_closed() {
-    assert_eq!(unsupported().await.status(), StatusCode::NOT_IMPLEMENTED);
+#[test]
+fn video_aliases_facade_and_payload_barrier() {
+    let video = &json!({"model":"sora-2-pro","prompt":"waves","seconds":"99","size":"1280x720","image":"https://example.invalid/a.png"});
+    let (routing, mut payload) = provider::video::create(video, true).unwrap();
+    assert_eq!(routing, "grok-imagine-video");
+    assert_eq!(payload["duration"], 15);
+    assert_eq!(payload["aspect_ratio"], "16:9");
+    assert_eq!(payload["image"]["url"], "https://example.invalid/a.png");
+    assert!(provider::video::create(video, false).is_err());
+    assert!(
+        provider::video::create(
+            &json!({"model":"sora-2","prompt":"waves","input_reference":{"file_id":"f"}}),
+            true
+        )
+        .is_err()
+    );
+    let config = Config::parse(b"credential-concurrency:\n  lifecycle-config-revision: 1\npayload:\n  filter:\n    - models:\n        - name: '*'\n      params: [prompt]\n").unwrap();
+    let mut selected: crate::home::client::Selection = serde_json::from_value(json!({"provider":"xai","model":"grok-imagine-video","auth_index":"test","auth":{"id":"test-auth","attributes":{"api_key":"synthetic-key","base_url":"http://127.0.0.1:9/tenant/v1"}}})).unwrap();
+    selected.provider = "xai".into();
+    selected.model = routing;
+    let mut headers = HeaderMap::new();
+    headers.insert("x-idempotency-key", "stable-key".parse().unwrap());
+    let request = provider::prepare(
+        &config,
+        &selected,
+        "/openai/v1/videos",
+        &headers,
+        &mut payload,
+        video,
+        None,
+    )
+    .unwrap()
+    .build()
+    .unwrap();
+    assert_eq!(request.url().path(), "/tenant/v1/videos/generations");
+    assert_eq!(request.headers()["x-idempotency-key"], "stable-key");
+    assert!(
+        serde_json::from_slice::<Value>(request.body().unwrap().as_bytes().unwrap())
+            .unwrap()
+            .get("prompt")
+            .is_none()
+    );
+    let mut payload = json!({"request_id":"id/with?reserved"});
+    let request = provider::prepare(
+        &config,
+        &selected,
+        "/v1/videos/id",
+        &headers,
+        &mut payload,
+        &json!({}),
+        None,
+    )
+    .unwrap()
+    .build()
+    .unwrap();
+    assert_eq!(request.method(), http::Method::GET);
+    assert_eq!(
+        request.url().path(),
+        "/tenant/v1/videos/id%2Fwith%3Freserved"
+    );
+    assert!(request.body().is_none());
+    let out = provider::video::facade(
+        &json!({"status":"done","video":{"url":"https://example.invalid/v.mp4","duration":6}}),
+        "job",
+        "grok-imagine-video",
+        None,
+    );
+    assert_eq!(out["status"], "completed");
+    assert_eq!(out["seconds"], "6");
 }

@@ -22,6 +22,8 @@ mod config_validation;
 #[path = "client_lifecycle.rs"]
 mod lifecycle;
 use config_validation::{parse_config, validate_support};
+#[path = "latency.rs"]
+pub(super) mod latency;
 #[path = "rebalance.rs"]
 mod rebalance;
 #[path = "supervisor.rs"]
@@ -75,6 +77,12 @@ pub struct HomeClient {
     membership: Arc<super::membership::Membership>,
     control_busy: AtomicBool,
     balance_enabled: AtomicBool,
+    stable: AtomicBool,
+    latency_supported: AtomicBool,
+    sampler: std::sync::Mutex<latency::Sampler>,
+    handoff: CancellationToken,
+
+    instance: String,
     config: RwLock<Arc<Config>>,
     cancel: CancellationToken,
     ready: AtomicBool,
@@ -82,7 +90,7 @@ pub struct HomeClient {
     tasks: std::sync::Mutex<Vec<tokio::task::JoinHandle<()>>>,
     targets: RwLock<Vec<super::cluster::Target>>,
     pub registry: Arc<Registry>,
-    pub reporting: Arc<ReportingQueue>,
+    pub reporting: super::reporting::HomeReporting,
 }
 impl HomeClient {
     pub async fn start(connector: Connector, reporting: Arc<ReportingQueue>) -> Result<Arc<Self>> {
@@ -176,10 +184,21 @@ impl HomeClient {
         drop(worker);
         let cancel = CancellationToken::new();
         let client = Arc::new(Self {
+            reporting: super::reporting::HomeReporting::new(
+                reporting,
+                membership.clone(),
+                connector.clone(),
+            ),
             connector,
-            membership,
+            membership: membership.clone(),
             control_busy: AtomicBool::new(false),
+            stable: AtomicBool::new(!membership.managed.load(Ordering::Acquire)),
             balance_enabled: AtomicBool::new(false),
+            latency_supported: AtomicBool::new(false),
+            sampler: std::sync::Mutex::new(latency::Sampler::default()),
+            handoff: CancellationToken::new(),
+
+            instance: instance.to_owned(),
             config: RwLock::new(Arc::new(config)),
             registry: Registry::new(cancel.clone()),
             cancel,
@@ -187,12 +206,12 @@ impl HomeClient {
             retired: CancellationToken::new(),
             tasks: std::sync::Mutex::new(Vec::new()),
             targets: RwLock::new(Vec::new()),
-            reporting,
         });
         {
             let mut tasks = client.tasks.lock().unwrap_or_else(|e| e.into_inner());
             tasks.push(tokio::spawn(client.clone().subscription(sub)));
             tasks.push(tokio::spawn(client.clone().maintenance()));
+            tasks.push(tokio::spawn(client.clone().latency_reports()));
         }
         tracing::info!(operation = "register", revision, "Home membership ready");
         Ok(client)
@@ -266,7 +285,7 @@ impl HomeClient {
             }
             for delivery in self.reporting.pending_batch(64, 1024 * 1024) {
                 let reply =
-                    tokio::time::timeout_at(deadline, self.send(delivery.command())).await??;
+                    tokio::time::timeout_at(deadline, self.reporting.deliver(&delivery)).await??;
                 ensure!(
                     matches!(reply, Frame::Integer(1)),
                     "usage drain not acknowledged"
@@ -285,7 +304,7 @@ impl HomeClient {
     }
 
     pub async fn command(&self, args: Vec<Vec<u8>>) -> Result<Frame> {
-        ensure!(self.ready(), "Home lifetime unavailable");
+        ensure!(!self.cancel.is_cancelled(), "Home lifetime unavailable");
         self.send(args).await
     }
     /// Forward one request-log envelope over the existing mTLS command path.

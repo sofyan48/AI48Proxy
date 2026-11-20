@@ -23,6 +23,12 @@ pub async fn refresh(home: &HomeClient, selection: &Selection) -> Result<Refresh
         .map_err(|_| anyhow::anyhow!("invalid Home refresh frame"))?;
     let response: Value =
         serde_json::from_slice(&bytes).map_err(|_| anyhow::anyhow!("invalid Home refresh JSON"))?;
+    if matches!(
+        selection.provider.as_str(),
+        "kimi" | "kimi-ai" | "meta" | "xai"
+    ) {
+        return parse_provider_refresh(response, selection);
+    }
     parse_refresh(response, &selection.auth_index)
 }
 
@@ -34,6 +40,13 @@ pub async fn refresh_on_401(
 ) -> Result<Option<RefreshedAuth>> {
     if status != reqwest::StatusCode::UNAUTHORIZED {
         return Ok(None);
+    }
+    // Meta's minted key is refreshable only when Home retains its DCA token.
+    if selection.provider == "meta"
+        && (!text(&selection.auth, "/metadata/dca_token").is_empty()
+            || !text(&selection.auth, "/attributes/dca_token").is_empty())
+    {
+        return Ok(Some(refresh(home, selection).await?));
     }
     // API-key selections have no refreshable token; do not trigger OAuth refresh.
     if !text(&selection.auth, "/attributes/api_key").is_empty() {
@@ -47,7 +60,11 @@ pub(super) fn refresh_request(selection: &Selection) -> Result<Value> {
         !selection.auth_index.trim().is_empty(),
         "Home refresh auth_index missing"
     );
-    let token = access_token(&selection.auth);
+    let token = match selection.provider.as_str() {
+        "kimi" | "kimi-ai" => super::kimi::token(&selection.auth),
+        "meta" => super::meta::token(&selection.auth),
+        _ => access_token(&selection.auth),
+    };
     ensure!(
         !token.is_empty(),
         "Home refresh requires observed access token"
@@ -56,6 +73,37 @@ pub(super) fn refresh_request(selection: &Selection) -> Result<Value> {
         json!({"type":"refresh", "auth_index":selection.auth_index.trim(),
         "access_token_sha256":hex::encode(Sha256::digest(token.as_bytes()))}),
     )
+}
+
+fn parse_provider_refresh(response: Value, selection: &Selection) -> Result<RefreshedAuth> {
+    ensure!(
+        response.is_object() && response.get("error").is_none(),
+        "Home credential refresh rejected"
+    );
+    let index = text(&response, "/auth_index").to_owned();
+    let auth = response.get("auth").cloned().unwrap_or(response);
+    let token = match selection.provider.as_str() {
+        "meta" => super::meta::token(&auth),
+        "kimi" | "kimi-ai" => super::kimi::token(&auth),
+        _ => access_token(&auth),
+    };
+    ensure!(
+        auth.is_object() && !token.is_empty(),
+        "Home returned invalid refreshed credential"
+    );
+    ensure!(
+        auth.get("disabled").and_then(Value::as_bool) != Some(true)
+            && text(&auth, "/status") != "disabled",
+        "Home refreshed credential disabled"
+    );
+    Ok(RefreshedAuth {
+        auth,
+        auth_index: if index.is_empty() {
+            selection.auth_index.clone()
+        } else {
+            index
+        },
+    })
 }
 
 pub(super) fn parse_refresh(response: Value, previous_index: &str) -> Result<RefreshedAuth> {

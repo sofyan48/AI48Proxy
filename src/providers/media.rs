@@ -5,6 +5,8 @@ use http::{HeaderMap, HeaderValue};
 use serde_json::Value;
 #[path = "media_codex.rs"]
 pub mod codex;
+#[path = "media_video.rs"]
+pub mod video;
 
 pub fn compat(selection: &Selection) -> bool {
     matches!(
@@ -98,8 +100,23 @@ pub fn prepare(
     multipart: Option<&super::multipart::Form>,
 ) -> Result<reqwest::RequestBuilder> {
     let speech = path == "/v1/audio/speech" || path == "/v1/tts";
+    let video = path.contains("/videos");
+    let retrieve = video
+        && body.get("request_id").is_some()
+        && !matches!(
+            path,
+            "/v1/videos"
+                | "/openai/v1/videos"
+                | "/v1/videos/generations"
+                | "/v1/videos/edits"
+                | "/v1/videos/extensions"
+        );
     let codex = selection.provider == "codex";
     let direct = codex && codex::direct(original, &selection.model);
+    ensure!(
+        !video || selection.provider == "xai",
+        "unsupported video provider"
+    );
     ensure!(
         (speech && selection.provider == "xai")
             || (!speech && (selection.provider == "xai" || codex || compat(selection))),
@@ -114,7 +131,11 @@ pub fn prepare(
     };
     let mut url = url::Url::parse(&creds.base_url)?;
     let root = url.path().trim_end_matches('/').to_owned();
-    let suffix = if codex && !direct {
+    let suffix = if video && !retrieve && matches!(path, "/v1/videos" | "/openai/v1/videos") {
+        "videos/generations"
+    } else if retrieve {
+        "videos"
+    } else if codex && !direct {
         "responses"
     } else if speech {
         "tts"
@@ -122,6 +143,18 @@ pub fn prepare(
         path.trim_start_matches("/v1/")
     };
     url.set_path(&format!("{root}/{suffix}"));
+    if retrieve {
+        url.path_segments_mut()
+            .map_err(|_| anyhow::anyhow!("invalid video URL"))?
+            .push(
+                body["request_id"]
+                    .as_str()
+                    .ok_or_else(|| anyhow::anyhow!("missing video ID"))?,
+            );
+    }
+    if video && let Some(key) = incoming.get("x-idempotency-key") {
+        creds.headers.insert("x-idempotency-key", key.clone());
+    }
     let mut client = reqwest::Client::builder()
         .no_proxy()
         .redirect(reqwest::redirect::Policy::none())
@@ -164,6 +197,8 @@ pub fn prepare(
             protocol: if codex && !direct { "codex" } else { "openai" },
             from_protocol: if speech {
                 "openai-speech"
+            } else if video {
+                "openai-video"
             } else {
                 "openai-image"
             },
@@ -197,5 +232,10 @@ pub fn prepare(
             "application/json"
         }),
     );
-    Ok(client.build()?.post(url).headers(creds.headers).body(bytes))
+    let client = client.build()?;
+    if retrieve {
+        Ok(client.get(url).headers(creds.headers))
+    } else {
+        Ok(client.post(url).headers(creds.headers).body(bytes))
+    }
 }

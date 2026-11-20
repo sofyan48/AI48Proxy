@@ -1,8 +1,5 @@
 //! Home-dispatched multimedia endpoints. Unsupported executors fail before upstream I/O.
-use super::{
-    auth_headers, auth_query, diagnostics, error, lifecycle, rejection, routes, upstream::Format,
-    usage::Usage,
-};
+use super::{error, lifecycle, rejection, upstream::Format, usage::Usage};
 use crate::{
     config::runtime_controls::{BodyReadError, RuntimeControls},
     home::client::HomeClient,
@@ -15,7 +12,9 @@ use axum::{
     response::{IntoResponse, Response},
 };
 use futures_util::{StreamExt, stream};
-use serde_json::{Value, json};
+use serde_json::Value;
+#[cfg(test)]
+use serde_json::json;
 use std::sync::Arc;
 #[path = "media_images.rs"]
 mod images;
@@ -26,18 +25,18 @@ mod provider;
 #[cfg(test)]
 #[path = "media_provider_tests.rs"]
 mod provider_tests;
+#[path = "media_retry.rs"]
+mod retry;
 #[path = "media_speech.rs"]
 mod speech;
 #[cfg(test)]
 #[path = "media_tests.rs"]
 mod tests;
+#[path = "media_video.rs"]
+mod video;
 
-pub(super) async fn unsupported() -> Response {
-    error(
-        StatusCode::NOT_IMPLEMENTED,
-        "unsupported_capability",
-        "Video execution and credential-bound retrieval are not implemented",
-    )
+pub(super) async fn unsupported(state: State<Arc<HomeClient>>, request: Request) -> Response {
+    video::handle(state, request).await
 }
 
 pub(super) async fn handle(State(home): State<Arc<HomeClient>>, request: Request) -> Response {
@@ -143,14 +142,9 @@ pub(super) async fn handle(State(home): State<Arc<HomeClient>>, request: Request
             "stream must be boolean",
         );
     }
-    if original.get("stream").and_then(Value::as_bool) == Some(true) {
-        return error(
-            StatusCode::NOT_IMPLEMENTED,
-            "unsupported_capability",
-            "Image SSE is not implemented",
-        );
-    }
-    let (model, mut payload, audio_type) = if speech_route {
+    let image_stream =
+        !speech_route && original.get("stream").and_then(Value::as_bool) == Some(true);
+    let (model, payload, audio_type) = if speech_route {
         match speech::prepare(&original) {
             Ok(prepared) => prepared,
             Err(_) => {
@@ -190,104 +184,107 @@ pub(super) async fn handle(State(home): State<Arc<HomeClient>>, request: Request
             .unwrap_or("gpt-image-2");
         (model.to_owned(), original.clone(), "")
     };
-    let mut dispatch = json!({"type":"auth","model":model,"count":1,"concurrency_protocol":1,
-        "retry_round":0,"excluded_auth_ids":[],"headers":auth_headers(&parts.headers),"query":auth_query(parts.uri.query())});
-    super::session::dispatch_fields(&parts.headers, &original, &mut dispatch);
-    let (selection, mut attempt) = match lifecycle::dispatch(
-        home.clone(),
-        dispatch,
-        diagnostics::request_id(),
-        speech_route,
-    )
-    .await
-    {
-        Ok(selected) => selected,
-        Err(err) => return routes::dispatch_error(&err),
-    };
-    let xai = selection.provider == "xai";
-    let codex = selection.provider == "codex";
-    let codex_bridge = codex && !provider::codex::direct(&original, &selection.model);
-    if (speech_route && !xai) || (!speech_route && !xai && !codex && !provider::compat(&selection))
-    {
-        attempt.record.local_failure(501);
-        return error(
-            StatusCode::NOT_IMPLEMENTED,
-            "unsupported_capability",
-            "Selected provider does not support this media route in Rust",
-        );
-    }
-    let edit = path == "/v1/images/edits";
-    if !speech_route {
-        payload = if codex {
-            match provider::codex::payload(&config, &selection, &original, form.as_ref(), edit) {
-                Ok(payload) => payload,
-                Err(_) => {
-                    attempt.record.local_failure(400);
-                    return error(
-                        StatusCode::BAD_REQUEST,
-                        "invalid_request_error",
-                        "Invalid Codex image input",
-                    );
+
+    #[allow(clippy::result_large_err)]
+    let prepare = |selection: &crate::home::client::Selection| {
+        let xai = selection.provider == "xai";
+        let codex = selection.provider == "codex";
+        if image_stream && !xai {
+            return Err(error(
+                StatusCode::NOT_IMPLEMENTED,
+                "unsupported_capability",
+                "Native compatible and Codex image SSE is not implemented",
+            ));
+        }
+
+        if (speech_route && !xai)
+            || (!speech_route && !xai && !codex && !provider::compat(selection))
+        {
+            return Err(error(
+                StatusCode::NOT_IMPLEMENTED,
+                "unsupported_capability",
+                "Selected provider does not support this media route in Rust",
+            ));
+        }
+        let mut payload = payload.clone();
+        let edit = path == "/v1/images/edits";
+        if !speech_route {
+            payload = if codex {
+                match provider::codex::payload(&config, selection, &original, form.as_ref(), edit) {
+                    Ok(payload) => payload,
+                    Err(_) => {
+                        return Err(error(
+                            StatusCode::BAD_REQUEST,
+                            "invalid_request_error",
+                            "Invalid Codex image input",
+                        ));
+                    }
                 }
-            }
-        } else if xai {
-            match images::xai_request(&original, &selection.model, form.as_ref(), edit) {
-                Ok(payload) => payload,
-                Err(_) => {
-                    attempt.record.local_failure(400);
-                    return error(
-                        StatusCode::BAD_REQUEST,
-                        "invalid_request_error",
-                        "Unsupported xAI image model or missing edit image",
-                    );
+            } else if xai {
+                match images::xai_request(&original, &selection.model, form.as_ref(), edit) {
+                    Ok(payload) => payload,
+                    Err(_) => {
+                        return Err(error(
+                            StatusCode::BAD_REQUEST,
+                            "invalid_request_error",
+                            "Unsupported xAI image model or missing edit image",
+                        ));
+                    }
                 }
-            }
-        } else {
-            let mut payload = original.clone();
-            payload["model"] = selection
-                .model
-                .split('(')
-                .next()
-                .unwrap_or(&selection.model)
-                .trim()
-                .into();
-            payload
-                .as_object_mut()
-                .expect("validated object")
-                .remove("stream");
-            payload
-        };
-    }
-    let request = match provider::prepare(
-        &config,
-        &selection,
-        path,
-        &parts.headers,
-        &mut payload,
-        &original,
-        if xai || codex { None } else { form.as_ref() },
-    ) {
-        Ok(request) => request,
-        Err(_) => {
-            attempt.record.local_failure(501);
-            return error(
+            } else {
+                let mut payload = original.clone();
+                payload["model"] = selection
+                    .model
+                    .split('(')
+                    .next()
+                    .unwrap_or(&selection.model)
+                    .trim()
+                    .into();
+                payload
+                    .as_object_mut()
+                    .expect("validated object")
+                    .remove("stream");
+                payload
+            };
+        }
+        provider::prepare(
+            &config,
+            selection,
+            path,
+            &parts.headers,
+            &mut payload,
+            &original,
+            if xai || codex { None } else { form.as_ref() },
+        )
+        .map_err(|_| {
+            error(
                 StatusCode::NOT_IMPLEMENTED,
                 "unsupported_capability",
                 "Media credentials, transport, or payload configuration is unsupported",
-            );
-        }
+            )
+        })
     };
+    let (selection, mut attempt, response) = match retry::execute(
+        home.clone(),
+        &config,
+        &model,
+        &original,
+        &parts.headers,
+        &parts.uri,
+        speech_route || image_stream,
+        None,
+        prepare,
+    )
+    .await
+    {
+        Ok(result) => result,
+        Err(response) => return response,
+    };
+    let codex_bridge =
+        selection.provider == "codex" && !provider::codex::direct(&original, &selection.model);
     let cancel = attempt.cancellation();
-    let response = tokio::select! {
-        biased;
-        _ = cancel.cancelled() => { attempt.record.local_failure(503); return error(StatusCode::SERVICE_UNAVAILABLE,"not_ready","Home membership ended"); }
-        result = request.send() => match result {
-            Ok(response) => response,
-            Err(_) => { attempt.record.local_failure(502); return error(StatusCode::BAD_GATEWAY,"upstream_error","Media upstream connection failed"); }
-        }
-    };
     let status = response.status();
-    attempt.record.upstream_status(status.as_u16());
+
     let headers = response.headers().clone();
     if speech_route && status.is_success() {
         return audio(response, attempt, audio_type);
@@ -324,9 +321,6 @@ pub(super) async fn handle(State(home): State<Arc<HomeClient>>, request: Request
         serde_json::from_slice::<Value>(&bytes).map_err(|_| ())
     };
     if !status.is_success() {
-        if let Ok(value) = &value {
-            attempt.record.upstream_failure(status.as_u16(), value);
-        }
         if speech_route
             && status == StatusCode::NOT_FOUND
             && !value.as_ref().is_ok_and(speech::model_unavailable)
@@ -359,7 +353,16 @@ pub(super) async fn handle(State(home): State<Arc<HomeClient>>, request: Request
     match images::response(value.clone(), images::response_format(&original)) {
         Ok(value) => {
             attempt.record.failed = false;
+            attempt.record.fail_code.clear();
             attempt.record.image_usage(&value, &original);
+            if image_stream {
+                let prefix = if path.ends_with("/edits") {
+                    "image_edit"
+                } else {
+                    "image_generation"
+                };
+                return images::completed_sse(&value, prefix, attempt);
+            }
             (status, Json(value)).into_response()
         }
         Err(_) => {

@@ -164,6 +164,19 @@ pub(super) fn base_model(raw: &Value) -> Result<String> {
     )
 }
 
+/// Go defaults empty, invalid, zero and negative binding durations to three hours.
+pub fn video_binding_ttl(config: &super::Config) -> std::time::Duration {
+    let raw = field(&config.raw, "video-result-auth-cache-ttl").or_else(|| {
+        field(&config.raw, "multimedia").and_then(|v| field(v, "video-result-auth-cache-ttl"))
+    });
+    let mut value = serde_yaml::Mapping::new();
+    if let Some(serde_yaml::Value::String(s)) = raw {
+        value.insert("ttl".into(), s.trim().into());
+    }
+    super::wire::duration(&Value::Mapping(value), "ttl", "3h", false)
+        .unwrap_or(std::time::Duration::from_secs(10800))
+}
+
 pub fn lite_model(model: &str) -> bool {
     model
         .split('(')
@@ -236,15 +249,31 @@ mod tests {
     }
 
     #[test]
+    fn video_binding_duration_matches_go_default_and_fractional_units() {
+        for (raw, nanos) in [
+            ("45m", 2_700_000_000_000),
+            ("1h30m", 5_400_000_000_000),
+            ("1.5ms", 1_500_000),
+            ("invalid", 10_800_000_000_000),
+            ("0", 10_800_000_000_000),
+            ("-1h", 10_800_000_000_000),
+            ("", 10_800_000_000_000),
+        ] {
+            for prefix in ["", "multimedia:\n  "] {
+                let config = Config::parse(format!("credential-concurrency:\n  lifecycle-config-revision: 1\n{prefix}video-result-auth-cache-ttl: '{raw}'\n").as_bytes()).unwrap();
+                assert_eq!(video_binding_ttl(&config).as_nanos(), nanos);
+                assert!(config.unsupported_features().is_empty());
+            }
+        }
+    }
+
+    #[test]
     fn remaining_multimedia_settings_stay_gated() {
         let config = Config::parse(b"credential-concurrency:\n  lifecycle-config-revision: 1\nmultimedia:\n  gpt-image-2-base-model: gpt-5.5\n  video-result-auth-cache-ttl: 1h\n  unknown-control: true\n").unwrap();
         assert_eq!(config.gpt_image_2_base_model, "gpt-5.5");
         assert_eq!(
             config.unsupported_features(),
-            vec![
-                "multimedia.unknown-control",
-                "multimedia.video-result-auth-cache-ttl"
-            ]
+            vec!["multimedia.unknown-control"]
         );
         for model in ["", "other", "gpt-6-sol"] {
             let raw = serde_yaml::from_str(&format!("gpt-image-2-base-model: '{model}'")).unwrap();

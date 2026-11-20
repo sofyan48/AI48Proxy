@@ -18,6 +18,8 @@ fn unsupported_field_names(paths: &[String]) -> Vec<&'static str> {
         "claude-code",
         "antigravity",
         "xai",
+        "kimi",
+        "meta",
         "devin",
         "codex-header-defaults",
         "claude-header-defaults",

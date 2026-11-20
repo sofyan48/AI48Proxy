@@ -67,7 +67,7 @@ impl Supervisor {
             connector,
             reporting,
             instance: uuid::Uuid::new_v4().to_string(),
-            membership: Arc::new(crate::home::membership::Membership::default()),
+            membership: Arc::new(crate::home::membership::Membership::managed()),
             discovered: RwLock::new(Vec::new()),
             stop: CancellationToken::new(),
         })
@@ -89,6 +89,8 @@ impl Supervisor {
             .layer(axum::middleware::from_fn(gateway::cors::cors))
     }
     fn install(&self, home: Arc<HomeClient>) {
+        home.stable
+            .store(true, std::sync::atomic::Ordering::Release);
         let router = gateway::router(home.clone());
         *self.current.write().unwrap_or_else(|e| e.into_inner()) = Some(Current { home, router });
     }
@@ -179,6 +181,7 @@ impl Supervisor {
                     return Ok(());
                 }
                 _ = lifetime_cancel.cancelled() => {}
+                _ = home.handoff.cancelled() => {}
             }
             *self.current.write().unwrap_or_else(|e| e.into_inner()) = None;
             tracing::warn!(
@@ -204,29 +207,56 @@ impl Supervisor {
                     ),
                 }
             }
+            let migration = self.membership.take_migration();
+            let planned = migration.is_some() && !home.cancel.is_cancelled();
             // All releases below use the OLD connector and registry. No release is replayed
             // after normal registration: reclaimed counters belong exclusively to Home.
-            match tokio::time::timeout(home.config().lifecycle.cancel_bound, home.drain()).await {
-                Ok(Ok(())) => tracing::info!(operation = "drain", "Old Home membership drained"),
-                Ok(Err(_)) => tracing::warn!(
-                    operation = "drain",
-                    reason = "operation_failed",
-                    "Old Home drain incomplete; waiting for reclamation"
-                ),
-                Err(_) => tracing::warn!(
-                    operation = "drain",
-                    reason = "timeout",
-                    "Old Home drain deadline reached; waiting for reclamation"
-                ),
+            if !planned {
+                match tokio::time::timeout(home.config().lifecycle.cancel_bound, home.drain()).await
+                {
+                    Ok(Ok(())) => {
+                        tracing::info!(operation = "drain", "Old Home membership drained")
+                    }
+                    Ok(Err(_)) => tracing::warn!(
+                        operation = "drain",
+                        reason = "operation_failed",
+                        "Old Home drain incomplete; waiting for reclamation"
+                    ),
+                    Err(_) => tracing::warn!(
+                        operation = "drain",
+                        reason = "timeout",
+                        "Old Home drain deadline reached; waiting for reclamation"
+                    ),
+                }
+                home.retire().await?;
+                // Preserving counters is safe only when all old releases are acknowledged.
+                // This worker cannot rebind a live registry as the Go worker does.
+                if !home.registry.is_drained() {
+                    self.membership.suppress_takeover();
+                }
             }
-            home.retire().await?;
-            // Preserving counters is safe only when all old releases are acknowledged.
-            // This worker cannot rebind a live registry as the Go worker does.
-            if !home.registry.is_drained() {
-                self.membership.suppress_takeover();
-            }
-            let migration = self.membership.take_migration();
             let origin = connector.clone();
+            let source = home.clone();
+            // Start the origin owner before registration: target or rollback failures must
+            // not orphan source executions, maintenance tasks, or shutdown cancellation.
+            if planned {
+                let source = source.clone();
+                let stop = self.stop.clone();
+                tokio::spawn(async move {
+                    loop {
+                        tokio::select! {
+                            _ = stop.cancelled() => break,
+                            _ = source.cancel.cancelled() => break,
+                            _ = tokio::time::sleep(source.config().lifecycle.release_flush_interval) => {}
+                        }
+                        if source.registry.is_drained() && source.reporting.is_empty() {
+                            break;
+                        }
+                    }
+                    let _ = source.retire().await;
+                });
+            }
+
             if let Some(plan) = &migration {
                 connector = self
                     .connector
@@ -242,6 +272,7 @@ impl Supervisor {
                     failures = 0;
                 }
             }
+            let reporting = source.reporting.clone();
             let mut index = 0;
             loop {
                 let delay = if migration.is_some() && index == 0 {
@@ -265,7 +296,7 @@ impl Supervisor {
                 index += 1;
                 let result = tokio::select! {
                     _ = self.stop.cancelled() => return Ok(()),
-                    result = register(connector.clone(), self.reporting.clone(), &self.instance, self.membership.clone()) => result,
+                    result = register(connector.clone(), reporting.clone(), &self.instance, self.membership.clone()) => result,
                 };
                 match result {
                     Ok(next) => {
@@ -281,6 +312,12 @@ impl Supervisor {
                             } else {
                                 crate::home::cluster::Outcome::Failed
                             };
+                            *self
+                                .membership
+                                .pending_result
+                                .lock()
+                                .unwrap_or_else(|e| e.into_inner()) =
+                                Some((plan.id.clone(), outcome));
                             let cluster = crate::home::cluster::Cluster::with_migration_support(
                                 &home,
                                 crate::home::cluster::MigrationCapability::SupportedByCaller,
@@ -289,18 +326,28 @@ impl Supervisor {
                                 _ = self.stop.cancelled() => return Ok(()),
                                 _ = home.cancel.cancelled() => None,
                                 result = async {
-                                    if !cluster.enable_rebalance().await?.ok {
+                                    let enabled = cluster.enable_rebalance().await?;
+                                    if !enabled.ok {
                                         bail!("Home rebalance enable rejected");
                                     }
+                                    home.latency_supported.store(enabled.supports_latency(), std::sync::atomic::Ordering::Release);
+                                    home.balance_enabled.store(true, std::sync::atomic::Ordering::Release);
                                     cluster.result(&plan.id, outcome).await
                                 } => Some(result),
                             };
                             if !matches!(result, Some(Ok(reply)) if reply.ok) {
                                 home.fence_reason("rebalance_result");
                                 home.retire().await?;
+                                connector = origin.clone();
                                 continue;
                             }
                         }
+
+                        *self
+                            .membership
+                            .pending_result
+                            .lock()
+                            .unwrap_or_else(|e| e.into_inner()) = None;
                         self.install(home.clone());
                         backoff.reset();
                         tracing::info!(

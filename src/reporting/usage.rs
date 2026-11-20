@@ -141,6 +141,19 @@ impl TokenBreakdown {
     }
 }
 
+/// Go usage.MediaCounts uses optional int64 counts and float64 audio/video seconds.
+#[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq)]
+pub struct MediaCounts {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub prompt_media: Option<i64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub completion_media: Option<i64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub prompt_audio: Option<i64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub audio_seconds: Option<f64>,
+}
+
 /// IDs are metadata, not raw credentials/API keys. Allocate execution_id once per execution,
 /// not once per inbound HTTP request (which can have multiple execution attempts).
 #[derive(Clone, Debug, Default)]
@@ -165,9 +178,21 @@ pub struct UsageRecord {
     pub image_count: usize,
     pub image_details: Option<Value>,
     pub requested_image_details: Option<Value>,
+    pub media_counts: Option<MediaCounts>,
 }
 
 impl UsageRecord {
+    /// Go video usage counts one completed output only when duration is known.
+    pub fn video_usage(&mut self, seconds: Option<f64>) {
+        self.media_counts = seconds
+            .filter(|n| n.is_finite() && *n > 0.0)
+            .map(|seconds| MediaCounts {
+                completion_media: Some(1),
+                audio_seconds: Some(seconds),
+                ..Default::default()
+            });
+    }
+
     /// Explicit image billing metadata only; never include prompts, URLs or image bytes.
     pub fn image_usage(&mut self, response: &Value, request: &Value) {
         fn details(value: &Value) -> Value {
@@ -240,10 +265,39 @@ impl UsageRecord {
         raw_body: &str,
         rules: &[crate::config::execution::RequestScopedRule],
     ) -> Option<crate::config::execution::ErrorAction> {
+        self.upstream_failure_with_rule_bytes(status, raw_body.as_bytes(), rules)
+    }
+
+    /// Substrings operate on original bytes, including invalid UTF-8. Like Go's
+    /// regexp engine, regex matching treats invalid UTF-8 as replacement runes.
+    pub fn upstream_failure_with_rule_bytes(
+        &mut self,
+        status: u16,
+        raw_body: &[u8],
+        rules: &[crate::config::execution::RequestScopedRule],
+    ) -> Option<crate::config::execution::ErrorAction> {
+        let text = String::from_utf8_lossy(raw_body);
         let body =
-            serde_json::from_str(raw_body).unwrap_or_else(|_| Value::String(raw_body.to_owned()));
+            serde_json::from_slice(raw_body).unwrap_or_else(|_| Value::String(text.to_string()));
         self.upstream_failure(status, &body);
-        let action = rules.iter().find_map(|rule| rule.matches(status, raw_body));
+        let action = rules.iter().find_map(|rule| {
+            let mut candidate = rule.clone();
+            let substring_match = candidate.substrings.iter().any(|substring| {
+                !substring.is_empty()
+                    && raw_body
+                        .windows(substring.len())
+                        .any(|bytes| bytes == substring.as_bytes())
+            });
+            candidate.substrings.clear();
+            if substring_match {
+                // Preserve the existing status/action validation and first-rule order.
+                candidate.substrings.push(text.to_string());
+                if text.is_empty() {
+                    return None;
+                }
+            }
+            candidate.matches(status, &text)
+        });
         if let Some(action) = action {
             self.fail_code = action.fail_code().into();
         }
@@ -426,6 +480,16 @@ pub fn usage_payload(record: &UsageRecord) -> Result<Value, &'static str> {
     if record.latency_ms < 0 || record.ttft_ms < 0 {
         return Err("negative usage duration");
     }
+    if let Some(media) = &record.media_counts
+        && (media.prompt_media.is_some_and(|n| n < 0)
+            || media.completion_media.is_some_and(|n| n < 0)
+            || media.prompt_audio.is_some_and(|n| n < 0)
+            || media
+                .audio_seconds
+                .is_some_and(|n| !n.is_finite() || n < 0.0))
+    {
+        return Err("invalid media counts");
+    }
     let b = &record.breakdown;
     let status = if record.status_code != 0 {
         record.status_code
@@ -457,6 +521,9 @@ pub fn usage_payload(record: &UsageRecord) -> Result<Value, &'static str> {
     }
     if let Some(details) = &record.requested_image_details {
         payload["requested_image_details"] = details.clone();
+    }
+    if let Some(media) = &record.media_counts {
+        payload["media_counts"] = json!(media);
     }
     Ok(payload)
 }

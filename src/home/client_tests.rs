@@ -3,6 +3,8 @@ use super::*;
 mod gateway_client_tests;
 #[path = "membership_tests.rs"]
 mod membership_tests;
+#[path = "rebalance_tests.rs"]
+mod rebalance_tests;
 use crate::home::resp;
 use rcgen::{BasicConstraints, CertificateParams, IsCa, Issuer, KeyPair, KeyUsagePurpose};
 use std::{future::Future, time::Duration};
@@ -152,6 +154,7 @@ impl Home {
         })
         .await;
         let client = client.unwrap();
+        client.membership.managed.store(true, Ordering::Release);
         assert!(client.ready());
         assert!(!client.cancellation().is_cancelled());
         assert_eq!(

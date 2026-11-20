@@ -6,12 +6,22 @@ use std::sync::{
 
 #[derive(Default)]
 pub struct Membership {
+    pub(super) managed: AtomicBool,
+    pub(super) pending_result: Mutex<Option<(String, super::cluster::Outcome)>>,
     eligible: AtomicBool,
     legacy: AtomicBool,
     timeout: AtomicBool,
     migration: Mutex<Option<super::cluster::Instruction>>,
+    pub(super) usage_owners: Mutex<std::collections::BTreeMap<String, super::transport::Connector>>,
+    pub(super) latency: Mutex<super::client::latency::History>,
 }
 impl Membership {
+    pub(super) fn managed() -> Self {
+        Self {
+            managed: AtomicBool::new(true),
+            ..Self::default()
+        }
+    }
     pub fn mark_eligible(&self) {
         if !self.legacy() {
             self.eligible.store(true, Ordering::Release);

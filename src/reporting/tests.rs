@@ -125,6 +125,48 @@ fn usage_v2_buckets_do_not_overlap_and_payload_has_no_raw_secrets() {
 }
 
 #[test]
+fn media_billing_fields_preserve_go_types_presence_and_validate_duration() {
+    use super::usage::MediaCounts;
+    let mut record = UsageRecord {
+        execution_id: "media".into(),
+        ..Default::default()
+    };
+    assert!(
+        usage_payload(&record)
+            .unwrap()
+            .get("media_counts")
+            .is_none()
+    );
+    record.media_counts = Some(MediaCounts {
+        prompt_media: Some(0),
+        completion_media: Some(1),
+        prompt_audio: Some(2),
+        audio_seconds: Some(3.25),
+    });
+    assert_eq!(
+        usage_payload(&record).unwrap()["media_counts"],
+        json!({"prompt_media":0,"completion_media":1,"prompt_audio":2,"audio_seconds":3.25})
+    );
+    record.media_counts = Some(MediaCounts {
+        audio_seconds: Some(0.0),
+        ..Default::default()
+    });
+    assert_eq!(
+        usage_payload(&record).unwrap()["media_counts"],
+        json!({"audio_seconds":0.0})
+    );
+    for seconds in [-1.0, f64::NAN, f64::INFINITY] {
+        record.media_counts.as_mut().unwrap().audio_seconds = Some(seconds);
+        assert_eq!(usage_payload(&record), Err("invalid media counts"));
+    }
+    record.media_counts = Some(MediaCounts {
+        prompt_media: Some(-1),
+        ..Default::default()
+    });
+    assert_eq!(usage_payload(&record), Err("invalid media counts"));
+}
+
+#[test]
 fn local_failures_are_request_scoped_but_real_upstream_failures_are_not() {
     let mut record = UsageRecord {
         execution_id: "attribution".into(),
@@ -384,6 +426,96 @@ async fn dropped_output_owner_releases_once_and_reporting_does_not_release_again
     assert_eq!(registry.pending_releases(), releases);
     registry.acknowledge(&releases[0]);
     assert!(registry.is_drained());
+}
+
+#[test]
+fn raw_scoped_matching_preserves_order_status_regex_and_json_escapes() {
+    use crate::config::execution::{ErrorAction, RequestScopedRule};
+    let mut record = UsageRecord {
+        execution_id: "raw-rules".into(),
+        ..Default::default()
+    };
+    let raw = r#"{ "message" : "Sensitive\u0020Text" }"#;
+    let rules = vec![
+        RequestScopedRule {
+            status: 403,
+            substrings: vec![raw.into()],
+            action: "stop".into(),
+            ..Default::default()
+        },
+        RequestScopedRule {
+            status: 401,
+            substrings: vec!["sensitive".into()],
+            action: "stop".into(),
+            ..Default::default()
+        },
+        RequestScopedRule {
+            status: 401,
+            regexes: vec![
+                "[".into(),
+                r#"^\{ \"message\" : \"Sensitive\\u0020Text\" \}$"#.into(),
+            ],
+            action: "unknown".into(),
+            ..Default::default()
+        },
+        RequestScopedRule {
+            status: 401,
+            substrings: vec![raw.into()],
+            action: " CONTINUE-AND-COOLDOWN ".into(),
+            ..Default::default()
+        },
+        RequestScopedRule {
+            status: 401,
+            substrings: vec![raw.into()],
+            action: "stop".into(),
+            ..Default::default()
+        },
+    ];
+    assert_eq!(
+        record.upstream_failure_with_rules(401, raw, &rules),
+        Some(ErrorAction::ContinueAndCooldown)
+    );
+    assert_eq!(record.fail_code, "force_cooldown");
+    let mut regex_rules = rules[2..3].to_vec();
+    regex_rules[0].action = "stop".into();
+    assert_eq!(
+        record.upstream_failure_with_rules(401, raw, &regex_rules),
+        Some(ErrorAction::Stop)
+    );
+    let serialized = serde_json::from_str::<Value>(raw).unwrap().to_string();
+    assert_eq!(
+        record.upstream_failure_with_rules(401, &serialized, &rules),
+        None
+    );
+    assert!(record.fail_code.is_empty());
+    assert!(record.fail_body.is_empty());
+    let invalid_utf8 = b"before\xffafter";
+    let replacement = [RequestScopedRule {
+        status: 401,
+        substrings: vec!["\u{fffd}".into()],
+        action: "stop".into(),
+        ..Default::default()
+    }];
+    assert_eq!(
+        record.upstream_failure_with_rule_bytes(401, invalid_utf8, &replacement),
+        None
+    );
+    let replacement_regex = [RequestScopedRule {
+        status: 401,
+        regexes: vec!["\u{fffd}".into()],
+        action: "stop".into(),
+        ..Default::default()
+    }];
+    assert_eq!(
+        record.upstream_failure_with_rule_bytes(401, invalid_utf8, &replacement_regex),
+        Some(ErrorAction::Stop)
+    );
+    assert!(
+        !usage_payload(&record)
+            .unwrap()
+            .to_string()
+            .contains("Sensitive")
+    );
 }
 
 #[test]

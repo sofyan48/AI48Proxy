@@ -75,6 +75,12 @@ impl Connector {
         })
     }
 
+    pub(super) fn node(&self) -> super::cluster::Target {
+        super::cluster::Target {
+            ip: self.host.clone(),
+            port: self.port,
+        }
+    }
     pub fn target(&self) -> String {
         if self.host.contains(':') {
             format!("[{}]:{}", self.host, self.port)
@@ -115,6 +121,15 @@ impl Connector {
 }
 
 impl Connection {
+    pub(super) fn split(
+        self,
+    ) -> (
+        impl tokio::io::AsyncBufRead + Unpin + Send,
+        impl tokio::io::AsyncWrite + Unpin + Send,
+    ) {
+        let (read, write) = tokio::io::split(self.stream);
+        (BufReader::new(read), write)
+    }
     pub async fn command(&mut self, args: &[Vec<u8>]) -> Result<Frame> {
         self.send(args).await?;
         self.receive().await

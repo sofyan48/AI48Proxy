@@ -1,5 +1,4 @@
-//! Planned handoffs are accepted only after local execution and release owners drain.
-//! Unlike Go's shared registry, Rust registries are lifetime-owned; never move live counters.
+//! Planned handoffs preserve origin-bound executions and release ledgers.
 use crate::home::{
     client::HomeClient,
     cluster::{Cluster, Instruction, MigrationCapability, Outcome},
@@ -8,7 +7,11 @@ use std::sync::{Arc, atomic::Ordering};
 
 impl HomeClient {
     pub(super) fn cluster_control(self: &Arc<Self>, instruction: Option<Instruction>) {
-        if self.membership.legacy()
+        if !self.stable.load(Ordering::Acquire)
+            || !self.membership.managed.load(Ordering::Acquire)
+            || !self.ready()
+            || self.handoff.is_cancelled()
+            || self.membership.legacy()
             || self.config().lifecycle.lifecycle_config_revision <= 0
             || self.control_busy.swap(true, Ordering::AcqRel)
         {
@@ -29,10 +32,32 @@ impl HomeClient {
     async fn balance(&self, instruction: Option<Instruction>) {
         let cluster = Cluster::with_migration_support(self, MigrationCapability::SupportedByCaller);
         if !self.balance_enabled.load(Ordering::Acquire) {
-            if !matches!(cluster.enable_rebalance().await, Ok(reply) if reply.ok) {
+            let Ok(reply) = cluster.enable_rebalance().await else {
+                return;
+            };
+            if !reply.ok {
                 return;
             }
+            self.latency_supported
+                .store(reply.supports_latency(), Ordering::Release);
             self.balance_enabled.store(true, Ordering::Release);
+        }
+        let pending = self
+            .membership
+            .pending_result
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone();
+        if let Some((id, outcome)) = pending {
+            if matches!(cluster.result(&id, outcome).await, Ok(reply) if reply.ok) {
+                *self
+                    .membership
+                    .pending_result
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner()) = None;
+            } else {
+                return;
+            }
         }
         let Some(instruction) = instruction else {
             return;
@@ -47,16 +72,8 @@ impl HomeClient {
         if target.target() == self.connector.target() || !self.ready() {
             return;
         }
-        // Fence admission before examining owners. Issued dispatches are represented by
-        // pending_admissions until their guard owns the resulting accounting identity.
-        self.stop_admission();
-        if !self.registry.is_drained() || self.registry.pending_admissions() != 0 {
-            self.ready.store(true, Ordering::Release);
-            return;
-        }
-        // Control RPCs must remain available while gateway admission is stopped.
+        // Active and pending executions retain this lifetime; they do not block a move.
         let Ok(claim) = instruction.claim_command() else {
-            self.ready.store(true, Ordering::Release);
             return;
         };
         let accepted = crate::home::cluster::RebalanceReply::decode(match self.send(claim).await {
@@ -66,19 +83,26 @@ impl HomeClient {
                 return;
             }
         });
-        if !matches!(accepted, Ok(reply) if reply.ok) {
-            self.ready.store(true, Ordering::Release);
-            return;
+        match accepted {
+            Ok(reply) if reply.ok => {}
+            Ok(_) => return,
+            Err(_) => {
+                self.fence_reason("rebalance_claim_response");
+                return;
+            }
         }
         let preflight = async {
             let mut connection = target.connect().await?;
             anyhow::ensure!(matches!(connection.command(&[b"PING".to_vec()]).await?, crate::home::resp::Frame::Simple(ref pong) if pong == "PONG"), "rebalance preflight rejected");
             anyhow::Ok(())
         }.await;
-        if preflight.is_err()
-            || !self.registry.is_drained()
-            || self.registry.pending_admissions() != 0
-        {
+        if preflight.is_err() {
+            *self
+                .membership
+                .pending_result
+                .lock()
+                .unwrap_or_else(|e| e.into_inner()) =
+                Some((instruction.id.clone(), Outcome::Failed));
             let acknowledged = match Outcome::Failed.command(&instruction.id) {
                 Ok(command) => match self.send(command).await {
                     Ok(reply) => {
@@ -92,12 +116,17 @@ impl HomeClient {
                 self.fence_reason("rebalance_failure_result");
                 return;
             }
-            self.ready.store(true, Ordering::Release);
+            *self
+                .membership
+                .pending_result
+                .lock()
+                .unwrap_or_else(|e| e.into_inner()) = None;
             return;
         }
-        if !self.cancel.is_cancelled() {
+        if self.ready() {
+            self.stop_admission();
             self.membership.migrate(instruction);
-            self.fence_reason("planned_rebalance");
+            self.handoff.cancel();
         }
     }
 }

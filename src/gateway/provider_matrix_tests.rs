@@ -226,6 +226,181 @@ async fn named_openai_provider_uses_home_auth_and_trusted_base() {
     assert_eq!(serde_json::from_str::<Value>(&result.body).unwrap(), value);
 }
 
+fn responses_wire(tools: bool) -> String {
+    let output = if tools {
+        json!([{"type":"function_call","id":"fc_matrix","call_id":"call_matrix","name":"lookup","arguments":"{\"city\":\"Oslo\"}","status":"completed"}])
+    } else {
+        json!([{"type":"message","id":"msg_matrix","role":"assistant","status":"completed","content":[{"type":"output_text","text":"hello matrix","annotations":[]}]}])
+    };
+    let response = json!({"id":"resp_matrix","object":"response","status":"completed","model":"resolved-model","created_at":1,
+        "output":output,"usage":{"input_tokens":10,"output_tokens":4,"total_tokens":14}});
+    let mut events = vec![
+        json!({"type":"response.created","response":{"id":"resp_matrix","object":"response","status":"in_progress","model":"resolved-model","created_at":1,"output":[]}}),
+    ];
+    events.push(json!({"type":"response.output_item.added","output_index":0,"item":if tools {json!({"type":"function_call","id":"fc_matrix","call_id":"call_matrix","name":"lookup","arguments":""})} else {json!({"type":"message","id":"msg_matrix","role":"assistant","content":[]})}}));
+    if tools {
+        events.push(json!({"type":"response.function_call_arguments.delta","item_id":"fc_matrix","output_index":0,"delta":"{\"city\":\"Oslo\"}"}));
+        events.push(json!({"type":"response.function_call_arguments.done","item_id":"fc_matrix","output_index":0,"arguments":"{\"city\":\"Oslo\"}"}));
+    } else {
+        events.push(json!({"type":"response.output_text.delta","item_id":"msg_matrix","output_index":0,"content_index":0,"delta":"hello matrix"}));
+    }
+    events.push(
+        json!({"type":"response.output_item.done","output_index":0,"item":response["output"][0]}),
+    );
+    events.push(json!({"type":"response.completed","response":response}));
+    events
+        .iter()
+        .map(|event| {
+            format!(
+                "event: {}\ndata: {event}\n\n",
+                event["type"].as_str().unwrap()
+            )
+        })
+        .collect()
+}
+
+async fn text_provider_case(provider: &str, responses: bool, stream: bool, tools: bool) {
+    let path = if responses {
+        "/v1/responses"
+    } else {
+        "/v1/chat/completions"
+    };
+    let mut body = if responses {
+        json!({"model":"public-alias","input":"hi","stream":stream})
+    } else {
+        json!({"model":"public-alias","messages":[{"role":"user","content":"hi"}],"stream":stream,"stream_options":{"include_usage":true}})
+    };
+    if tools {
+        if responses {
+            body["tools"] = json!([{"type":"function","name":"lookup","parameters":{"type":"object","properties":{"city":{"type":"string"}}}}]);
+            body["input"] = json!([{"type":"function_call","call_id":"prior_call","name":"lookup","arguments":"{}"},{"type":"function_call_output","call_id":"prior_call","output":"prior result"},{"type":"message","role":"user","content":[{"type":"input_text","text":"hi"}]}]);
+        } else {
+            body["tools"] = json!([{"type":"function","function":{"name":"lookup","parameters":{"type":"object","properties":{"city":{"type":"string"}}}}}]);
+            body["messages"] = json!([{"role":"assistant","content":null,"tool_calls":[{"id":"prior_call","type":"function","function":{"name":"lookup","arguments":"{}"}}]},{"role":"tool","tool_call_id":"prior_call","content":"prior result"},{"role":"user","content":"hi"}]);
+        }
+    }
+    let native_responses = matches!(provider, "xai" | "meta") || responses;
+    let wire = if native_responses && (provider != "kimi" || stream) {
+        responses_wire(tools)
+    } else if responses {
+        json!({"id":"resp_matrix","object":"response","status":"completed","model":"resolved-model","output":[{"type":"message","role":"assistant","content":[{"type":"output_text","text":"hello matrix"}]}],"usage":{"input_tokens":10,"output_tokens":4,"total_tokens":14}}).to_string()
+    } else if stream {
+        format!(
+            "data: {}\n\ndata: {}\n\ndata: [DONE]\n\n",
+            json!({"id":"chat_matrix","object":"chat.completion.chunk","model":"resolved-model","choices":[{"index":0,"delta":{"role":"assistant","content":"hello matrix"},"finish_reason":null}]}),
+            json!({"id":"chat_matrix","object":"chat.completion.chunk","model":"resolved-model","choices":[{"index":0,"delta":{},"finish_reason":"stop"}],"usage":{"prompt_tokens":10,"completion_tokens":4,"total_tokens":14}})
+        )
+    } else {
+        json!({"id":"chat_matrix","object":"chat.completion","model":"resolved-model","choices":[{"index":0,"message":{"role":"assistant","content":"hello matrix"},"finish_reason":"stop"}],"usage":{"prompt_tokens":10,"completion_tokens":4,"total_tokens":14}}).to_string()
+    };
+    let upstream_sse = stream || matches!(provider, "xai" | "meta");
+    let result = run(
+        provider,
+        path,
+        body,
+        if upstream_sse {
+            "text/event-stream"
+        } else {
+            "application/json"
+        },
+        &wire,
+    )
+    .await;
+    assert_success(&result, stream, 10, 4);
+    assert_eq!(
+        result.upstream.target,
+        if native_responses {
+            "/tenant/v1/responses"
+        } else {
+            "/tenant/v1/chat/completions"
+        }
+    );
+    assert_eq!(
+        result.upstream.headers["authorization"],
+        format!("Bearer {SECRET}")
+    );
+    assert_eq!(result.upstream.body["model"], "resolved-model");
+    assert_eq!(result.upstream.body["stream"], upstream_sse);
+    if tools {
+        assert_eq!(result.upstream.body["tools"][0]["name"], "lookup");
+        assert_eq!(result.upstream.body["input"][0]["call_id"], "prior_call");
+        assert_eq!(result.upstream.body["input"][1]["output"], "prior result");
+        if provider == "meta" {
+            assert_eq!(result.upstream.body["tools"][1]["name"], "muse");
+        }
+        if !responses && !stream {
+            let value: Value = serde_json::from_str(&result.body).unwrap();
+            assert_eq!(value["choices"][0]["finish_reason"], "tool_calls");
+            assert_eq!(
+                value["choices"][0]["message"]["tool_calls"][0]["id"],
+                "call_matrix"
+            );
+        } else {
+            assert!(result.body.contains("lookup"));
+        }
+    } else {
+        assert!(result.body.contains("hello matrix"));
+    }
+    if stream && !responses {
+        assert!(result.body.contains("[DONE]"));
+    }
+}
+
+#[tokio::test]
+async fn native_text_provider_matrix() {
+    for provider in ["xai", "kimi", "meta"] {
+        for responses in [false, true] {
+            for stream in [false, true] {
+                text_provider_case(provider, responses, stream, false).await;
+            }
+        }
+    }
+}
+
+#[tokio::test]
+async fn xai_meta_function_tool_bridge_matrix() {
+    for provider in ["xai", "meta"] {
+        for responses in [false, true] {
+            for stream in [false, true] {
+                text_provider_case(provider, responses, stream, true).await;
+            }
+        }
+    }
+}
+
+#[test]
+fn unported_text_sources_fail_closed_before_transport() {
+    let config =
+        crate::config::Config::parse(b"credential-concurrency:\n  lifecycle-config-revision: 7\n")
+            .unwrap();
+    for provider in ["xai", "meta", "kimi", "kimi-ai"] {
+        let selection = serde_json::from_value(json!({"provider":provider,"model":"resolved-model","auth_index":"matrix-index","auth":{"attributes":{"api_key":SECRET}}})).unwrap();
+        for (path, body) in [
+            (
+                "/v1/messages",
+                json!({"model":"public-alias","messages":[],"max_tokens":32}),
+            ),
+            (
+                "/v1beta/models/public-alias:generateContent",
+                json!({"contents":[]}),
+            ),
+        ] {
+            let error = match super::upstream::prepare(
+                &config,
+                &selection,
+                path,
+                &http::HeaderMap::new(),
+                body,
+                false,
+            ) {
+                Ok(_) => panic!("unported source accepted"),
+                Err(error) => error,
+            };
+            assert!(error.to_string().contains("source format unsupported"));
+        }
+    }
+}
+
 #[tokio::test]
 async fn local_json_parse_failure_releases_without_credential_cooldown() {
     for (provider, path, body) in [

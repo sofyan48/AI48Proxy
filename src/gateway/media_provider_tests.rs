@@ -8,6 +8,36 @@ fn selection() -> Selection {
 }
 
 #[test]
+fn video_media_counts_match_go_completed_output_and_duration_precedence() {
+    let request = json!({"duration":5.5});
+    assert!(provider::video::duration_seconds(&request, &json!({"request_id":"job"})).is_none());
+    for (response, seconds) in [
+        (json!({"video":{"duration":6.25}}), Some(6.25)),
+        (
+            json!({"usage":{},"duration":2,"video":{"duration":7}}),
+            Some(2.0),
+        ),
+        (json!({"status":" COMPLETED "}), Some(5.5)),
+        (json!({"url":"private-url","duration":"9"}), Some(5.5)),
+        (
+            json!({"data":[],"duration":0,"video":{"duration":9}}),
+            Some(5.5),
+        ),
+    ] {
+        assert_eq!(
+            provider::video::duration_seconds(&request, &response),
+            seconds
+        );
+    }
+    for duration in [json!(0), json!(-1), json!("5"), Value::Null] {
+        assert!(
+            provider::video::duration_seconds(&json!({"duration":duration}), &json!({"video":{}}))
+                .is_none()
+        );
+    }
+}
+
+#[test]
 fn payload_configuration_is_final_for_json_and_multipart() {
     let config = Config::parse(b"credential-concurrency:\n  lifecycle-config-revision: 1\npayload:\n  override:\n    - models:\n        - name: selected\n          protocol: openai\n      params:\n        model: final-model\n        quality: high\n  filter:\n    - models:\n        - name: selected\n          protocol: openai\n      params: [prompt]\n").unwrap();
     let original = json!({"model":"alias","prompt":"private","quality":"low"});

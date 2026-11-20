@@ -1,3 +1,123 @@
+pub(super) mod completion {
+    use crate::{home::client::HomeClient, observability::RequestLogRecord};
+    use axum::{
+        body::{Body, BodyDataStream},
+        response::Response,
+    };
+    use bytes::Bytes;
+    use futures_util::Stream;
+    use std::{
+        pin::Pin,
+        sync::{
+            Arc, Mutex,
+            atomic::{AtomicU16, Ordering},
+        },
+        task::{Context, Poll},
+        time::Instant,
+    };
+
+    tokio::task_local! { pub(in crate::gateway) static CONTEXT: Arc<RequestContext>; }
+
+    #[derive(Default)]
+    pub(in crate::gateway) struct RequestContext {
+        provider: Mutex<String>,
+        status: AtomicU16,
+    }
+    impl RequestContext {
+        pub(in crate::gateway) fn selected(&self, provider: &str) {
+            *self.provider.lock().unwrap_or_else(|e| e.into_inner()) = provider.to_owned();
+        }
+        pub(in crate::gateway) fn status(&self, status: u16) {
+            self.status.store(status, Ordering::Release);
+        }
+    }
+
+    pub(in crate::gateway) struct Completion {
+        home: Arc<HomeClient>,
+        record: Option<RequestLogRecord>,
+        started: Instant,
+        pub(in crate::gateway) context: Arc<RequestContext>,
+    }
+    impl Completion {
+        pub(in crate::gateway) fn new(home: Arc<HomeClient>, record: RequestLogRecord) -> Self {
+            Self {
+                home,
+                record: Some(record),
+                started: Instant::now(),
+                context: Arc::default(),
+            }
+        }
+        fn finish(&mut self, status: u16) {
+            if let Some(record) = self.record.take() {
+                let provider = self
+                    .context
+                    .provider
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner());
+                crate::observability::submit(
+                    &self.home,
+                    record
+                        .provider(&provider)
+                        .finish(status, self.started.elapsed()),
+                );
+            }
+        }
+        pub(in crate::gateway) fn response(self, response: Response) -> Response {
+            let (mut parts, body) = response.into_parts();
+            parts.extensions.insert(self.context.clone());
+            let status = parts.status.as_u16();
+            Response::from_parts(
+                parts,
+                Body::from_stream(LoggedBody {
+                    source: Some(body.into_data_stream()),
+                    completion: self,
+                    status,
+                }),
+            )
+        }
+    }
+    impl Drop for Completion {
+        fn drop(&mut self) {
+            self.finish(499);
+        }
+    }
+    struct LoggedBody {
+        source: Option<BodyDataStream>,
+        completion: Completion,
+        status: u16,
+    }
+    impl Stream for LoggedBody {
+        type Item = Result<Bytes, axum::Error>;
+        fn poll_next(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
+            let Some(source) = self.source.as_mut() else {
+                return Poll::Ready(None);
+            };
+            let next = Pin::new(source).poll_next(cx);
+            match &next {
+                Poll::Ready(None) => {
+                    self.source.take();
+                    let observed = self.completion.context.status.load(Ordering::Acquire);
+                    let status = if observed == 0 { self.status } else { observed };
+                    self.completion.finish(status);
+                }
+                Poll::Ready(Some(Err(_))) => {
+                    self.source.take();
+                    let observed = self.completion.context.status.load(Ordering::Acquire);
+                    self.completion
+                        .finish(if observed >= 400 { observed } else { 502 });
+                }
+                _ => {}
+            }
+            next
+        }
+    }
+    impl Drop for LoggedBody {
+        fn drop(&mut self) {
+            // Cancel transport/body work before recording the disconnect.
+            self.source.take();
+        }
+    }
+}
 use std::{sync::Arc, time::Instant};
 
 use chrono::Utc;
@@ -18,6 +138,8 @@ pub(super) struct Attempt {
     pub record: UsageRecord,
     started: Instant,
     attribution: Value,
+    context: Option<Arc<super::completion::RequestContext>>,
+    pub(super) downstream_complete: Option<Arc<std::sync::atomic::AtomicBool>>,
 }
 
 impl Attempt {
@@ -49,6 +171,17 @@ impl Attempt {
 
 impl Drop for Attempt {
     fn drop(&mut self) {
+        if self
+            .downstream_complete
+            .as_ref()
+            .is_some_and(|done| !done.load(std::sync::atomic::Ordering::Acquire))
+            && self.record.status_code < 400
+        {
+            self.record.local_failure(499);
+        }
+        if let Some(context) = &self.context {
+            context.status(self.record.status_code);
+        }
         // Synchronous completion is safe even if the HTTP future/body is dropped.
         self.guard.finish();
         self.record.latency_ms = self.started.elapsed().as_millis().min(i64::MAX as u128) as i64;
@@ -186,6 +319,7 @@ pub(super) async fn dispatch(
         .and_then(Value::as_str)
         .unwrap_or("")
         .to_owned();
+    let context = super::completion::CONTEXT.try_with(Arc::clone).ok();
     let (tx, rx) = oneshot::channel();
     // Register synchronously, before the task can be delayed by the scheduler.
     let admission = home.registry.admission();
@@ -193,6 +327,9 @@ pub(super) async fn dispatch(
         let mut admission = admission;
         let result = match home.dispatch(request).await {
             Ok(selection) => {
+                if let Some(context) = &context {
+                    context.selected(&selection.provider);
+                }
                 let (credential, model, accounted) = match &selection.concurrency {
                     Some(c) => (c.credential_id.clone(), c.model.clone(), c.accounted),
                     None => (
@@ -218,6 +355,8 @@ pub(super) async fn dispatch(
                     guard,
                     started: Instant::now(),
                     attribution: attribution(&selection, &alias),
+                    context,
+                    downstream_complete: None,
                     record: UsageRecord {
                         execution_id: Uuid::new_v4().to_string(),
                         request_id,

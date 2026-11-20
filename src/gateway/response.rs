@@ -200,6 +200,10 @@ pub(super) fn streaming(
     let (tx, rx) = tokio::sync::mpsc::channel::<Result<Bytes, io::Error>>(1);
     let completed = Arc::new(std::sync::atomic::AtomicBool::new(false));
     let producer_completed = completed.clone();
+    let downstream_complete = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let mut attempt = attempt;
+    attempt.downstream_complete = Some(downstream_complete.clone());
+    let (attempt_tx, attempt_rx) = tokio::sync::oneshot::channel();
     tokio::spawn(
         async move {
             let started = std::time::Instant::now();
@@ -251,7 +255,7 @@ pub(super) fn streaming(
                     _ = cancellation.cancelled() => {
                         diagnostics::stage("sse_cancelled");
                         attempt.record.status_code = 503;
-                        let _ = tx.try_send(Err(io::Error::other("execution cancelled")));
+
                         break;
                     }
                     _ = tx.closed() => {
@@ -270,12 +274,7 @@ pub(super) fn streaming(
                             "upstream stream read failed"
                         );
                         attempt.record.status_code = 502;
-                        tokio::select! {
-                            biased;
-                            _ = cancellation.cancelled() => {},
-                            _ = tx.closed() => {},
-                            _ = tx.send(Err(io::Error::other("upstream stream failed"))) => {},
-                        }
+
                         break;
                     }
                     None => {
@@ -407,6 +406,9 @@ pub(super) fn streaming(
                     break;
                 }
             }
+            if attempt.record.failed && attempt.record.status_code < 400 && !tx.is_closed() {
+                attempt.record.status_code = 502;
+            }
             attempt.record.breakdown = usage.breakdown();
             tracing::info!(
                 event = "stream_finished",
@@ -417,20 +419,31 @@ pub(super) fn streaming(
             );
             // Transport must stop before the execution guard completes.
             drop(source);
-            drop(attempt);
+            // The downstream body owns final release/accounting, even when the
+            // producer has already buffered its last chunk.
+            let _ = attempt_tx.send(attempt);
         }
         .in_current_span(),
     );
-    let body = stream::unfold(rx, |mut rx| async move {
-        rx.recv().await.map(|item| (item, rx))
-    })
-    .chain(stream::once(async move {
-        if completed.load(std::sync::atomic::Ordering::Acquire) {
-            Ok(Bytes::new())
-        } else {
-            Err(io::Error::other("upstream stream incomplete"))
+    let body = stream::unfold((rx, Some(attempt_rx)), move |(mut rx, mut owner)| {
+        let completed = completed.clone();
+        let downstream_complete = downstream_complete.clone();
+        async move {
+            if let Some(item) = rx.recv().await {
+                return Some((item, (rx, owner)));
+            }
+            let receiver = owner.take()?;
+            let attempt = receiver.await.ok();
+            downstream_complete.store(true, std::sync::atomic::Ordering::Release);
+            drop(attempt);
+            let terminal = if completed.load(std::sync::atomic::Ordering::Acquire) {
+                Ok(Bytes::new())
+            } else {
+                Err(io::Error::other("upstream stream incomplete"))
+            };
+            Some((terminal, (rx, owner)))
         }
-    }));
+    });
     let mut response = Response::new(Body::from_stream(body));
     *response.status_mut() = status;
     response

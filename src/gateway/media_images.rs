@@ -103,6 +103,60 @@ pub fn xai_request(body: &Value, model: &str, form: Option<&Form>, edit: bool) -
     }
     Ok(out)
 }
+/// xAI's Go handler emits one completed event per image, without a DONE sentinel.
+pub fn completed_sse(
+    value: &Value,
+    prefix: &str,
+    mut attempt: super::lifecycle::Attempt,
+) -> axum::response::Response {
+    use axum::{body::Body, response::IntoResponse};
+    let event = format!("{prefix}.completed");
+    let chunks: Vec<_> = value["data"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .map(|image| {
+            let mut data = json!({"type":event});
+            for key in ["b64_json", "url"] {
+                if let Some(value) = image.get(key) {
+                    data[key] = value.clone();
+                }
+            }
+            if let Some(usage) = value.get("usage") {
+                data["usage"] = usage.clone();
+            }
+            format!("event: {event}\ndata: {data}\n\n")
+        })
+        .collect();
+    attempt.record.failed = true;
+    attempt.record.fail_code = "request_scoped".into();
+    let body = futures_util::stream::unfold(
+        (chunks.into_iter(), Some(attempt)),
+        |(mut chunks, mut attempt)| async move {
+            let owner = attempt.as_mut()?;
+            if owner.cancellation().is_cancelled() {
+                owner.record.local_failure(503);
+                return None;
+            }
+            if let Some(chunk) = chunks.next() {
+                Some((Ok::<_, std::io::Error>(chunk), (chunks, attempt)))
+            } else {
+                owner.record.failed = false;
+                owner.record.fail_code.clear();
+                None
+            }
+        },
+    );
+    (
+        [
+            ("content-type", "text/event-stream"),
+            ("cache-control", "no-cache"),
+        ],
+        Body::from_stream(body),
+    )
+        .into_response()
+}
+
 pub fn response_format(body: &Value) -> &'static str {
     if text(body, "response_format").eq_ignore_ascii_case("url") {
         "url"

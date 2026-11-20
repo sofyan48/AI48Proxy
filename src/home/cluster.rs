@@ -1,4 +1,4 @@
-//! Home discovery and opt-in rebalance wire helpers; never select or migrate a Home.
+//! Home discovery and rebalance wire helpers.
 //! Schemas: Home internal/cluster/{resp.go,rebalance.go,rebalance_latency.go}.
 use super::{client::HomeClient, resp::Frame};
 use anyhow::{Context, Result, ensure};
@@ -27,9 +27,17 @@ impl Target {
 pub struct Node {
     pub ip: String,
     pub port: u16,
+    #[serde(default, deserialize_with = "nonnegative_count")]
     pub client_count: u64,
+    #[serde(default)]
     pub is_master: bool,
-    pub last_seen_at: DateTime<Utc>,
+    #[serde(default)]
+    pub last_seen_at: Option<DateTime<Utc>>,
+}
+fn nonnegative_count<'de, D: serde::Deserializer<'de>>(
+    deserializer: D,
+) -> std::result::Result<u64, D::Error> {
+    Ok(i64::deserialize(deserializer)?.max(0) as u64)
 }
 #[derive(Debug, Clone, Deserialize)]
 pub struct NodesReply {
@@ -38,15 +46,15 @@ pub struct NodesReply {
 }
 impl NodesReply {
     pub fn decode(frame: Frame) -> Result<Self> {
-        let reply: Self = decode_json(frame)?;
+        let mut reply: Self = decode_json(frame)?;
         ensure!(reply.ok, "Home rejected cluster discovery");
-        for node in &reply.nodes {
-            Target {
-                ip: node.ip.clone(),
-                port: node.port,
-            }
-            .validate()?;
-        }
+        let mut seen = std::collections::HashSet::new();
+        reply.nodes.retain_mut(|node| {
+            node.ip = node.ip.trim().to_owned();
+            super::transport::validate_target(&node.ip, node.port).is_ok()
+                && seen.insert((node.ip.clone(), node.port))
+        });
+        reply.nodes.sort_by_key(|node| node.client_count);
         Ok(reply)
     }
 }
@@ -232,7 +240,7 @@ impl<'a> Cluster<'a> {
 fn rebalance_command(action: &str) -> Vec<Vec<u8>> {
     vec![
         b"CLUSTER".to_vec(),
-        b"REBALANCE".to_vec(),
+        b"BALANCE".to_vec(),
         action.as_bytes().to_vec(),
     ]
 }
@@ -269,7 +277,7 @@ mod tests {
                 .unwrap();
         assert_eq!(
             instruction.claim_command().unwrap(),
-            ["CLUSTER", "REBALANCE", "CLAIM", "plan", "4", "::1", "8327"]
+            ["CLUSTER", "BALANCE", "CLAIM", "plan", "4", "::1", "8327"]
                 .map(|v| v.as_bytes().to_vec())
         );
         assert_eq!(Outcome::Failed.command("plan").unwrap()[4], b"failed");

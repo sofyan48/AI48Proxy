@@ -18,6 +18,8 @@ use tokio_util::sync::CancellationToken;
 
 #[path = "ws_home.rs"]
 mod ws_home;
+#[path = "ws_http.rs"]
+mod ws_http;
 #[path = "ws_state.rs"]
 mod ws_state;
 #[cfg(test)]
@@ -135,7 +137,8 @@ async fn session(
     limit: usize,
 ) -> Result<()> {
     let mut history = ws_state::History::default();
-    let first = loop {
+    history.native = true;
+    let mut first = loop {
         let frame = decode(
             input
                 .recv()
@@ -154,6 +157,16 @@ async fn session(
             }
         }
     };
+    // Go scopes a long-lived WS execution session before deriving its prompt key.
+    let execution = uuid::Uuid::new_v4().to_string();
+    if first
+        .get("prompt_cache_key")
+        .and_then(Value::as_str)
+        .is_none_or(str::is_empty)
+        && let Some(key) = crate::providers::codex::cache::provider_session(&execution, "")
+    {
+        first["prompt_cache_key"] = key.into();
+    }
     let alias = first["model"].as_str().unwrap_or("").to_owned();
     ws_home::authorize(&home, headers, Some(principal), Some(&alias)).await?;
     // No redispatch loop: an ambiguous admission/write/output can never replay.
@@ -166,6 +179,13 @@ async fn session(
     let cancel = lease.cancellation();
     ensure!(!cancel.is_cancelled(), "membership ended");
     let prepared = ws_transport::prepare(&home.config(), &selection, headers, first.clone())?;
+    if !prepared.native {
+        return ws_http::session(
+            &home, headers, principal, &selection, first, writer, input, limit, cancel,
+        )
+        .await;
+    }
+    history.native = true;
     let mut turn = Some(ws_home::Turn::new(home.clone(), &selection, &alias));
     // CPA bounds connection acquisition, never the established response stream.
     let (mut upstream, _) = tokio::time::timeout(
@@ -178,16 +198,20 @@ async fn session(
         .await?;
     let mut pending = Some(first);
     let mut active_id: Option<String> = None;
+    let idle = tokio::time::sleep(std::time::Duration::from_secs(300));
+    tokio::pin!(idle);
     loop {
         tokio::select! {
             biased;
             _ = cancel.cancelled() => break,
+            _ = &mut idle => anyhow::bail!("Codex websocket idle deadline"),
             message = upstream.next() => {
+                idle.as_mut().reset(tokio::time::Instant::now() + std::time::Duration::from_secs(300));
                 let Some(Ok(message)) = message else { anyhow::bail!("upstream disconnected"); };
                 let text = match message {
                     UpMessage::Text(text) => text.to_string(),
                     UpMessage::Binary(bytes) => String::from_utf8(bytes.to_vec())?,
-                    UpMessage::Ping(bytes) => { upstream.send(UpMessage::Pong(bytes)).await?; continue; },
+                    UpMessage::Ping(bytes) => { tokio::time::timeout(std::time::Duration::from_secs(10), upstream.send(UpMessage::Pong(bytes))).await??; continue; },
                     UpMessage::Pong(_) => continue,
                     UpMessage::Close(_) => anyhow::bail!("upstream closed"),
                     _ => continue,
@@ -240,10 +264,13 @@ async fn session(
                     send_error(writer, "response_in_progress", "Wait for the active response terminal event").await?;
                     continue;
                 }
-                let body = match history.hydrate(frame, limit) {
+                let mut body = match history.hydrate(frame, limit) {
                     Ok(body) => body,
                     Err(_) => { send_error(writer, "invalid_continuation", "Continuation requires known history or a full replacement transcript").await?; continue; },
                 };
+                if body.get("prompt_cache_key").and_then(Value::as_str).is_none_or(str::is_empty)
+                    && let Some(key) = crate::providers::codex::cache::provider_session(&execution, "")
+                { body["prompt_cache_key"] = key.into(); }
                 if body["model"].as_str() != Some(&alias) {
                     send_error(writer, "model_changed", "Reconnect to change the model").await?;
                     continue;

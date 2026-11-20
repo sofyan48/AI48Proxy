@@ -8,6 +8,7 @@ pub(super) struct History {
     output: Vec<Value>,
     response_id: String,
     valid: bool,
+    pub native: bool,
 }
 
 impl History {
@@ -32,7 +33,7 @@ impl History {
             _ => anyhow::bail!("input must be an array"),
         };
         let explicit = !previous.is_empty();
-        if explicit {
+        if explicit && !self.native {
             ensure!(
                 self.valid && previous == self.response_id,
                 "previous_response_id is not available in this session"
@@ -47,7 +48,7 @@ impl History {
                     )
             });
         let mut merged = input.clone();
-        if self.request.is_some() && !replacement {
+        if self.request.is_some() && !replacement && !self.native {
             ensure!(
                 self.valid,
                 "prior response cannot be replayed; send a full replacement transcript"
@@ -76,7 +77,16 @@ impl History {
             .as_object_mut()
             .ok_or_else(|| anyhow::anyhow!("request must be an object"))?;
         object.remove("type");
-        object.remove("previous_response_id");
+        if self.native && !replacement {
+            if !explicit && self.valid {
+                object.insert(
+                    "previous_response_id".into(),
+                    self.response_id.clone().into(),
+                );
+            }
+        } else {
+            object.remove("previous_response_id");
+        }
         object.remove("event_id");
         for field in ["model", "instructions"] {
             if !object.contains_key(field)
@@ -142,6 +152,43 @@ pub(super) fn control(frame: &Value, active_id: Option<&str>) -> bool {
         .get("response_id")
         .and_then(Value::as_str)
         .is_some_and(|id| !id.is_empty() && Some(id) == active_id)
+}
+
+#[cfg(test)]
+mod native_tests {
+    use super::*;
+
+    #[test]
+    fn native_chain_preserves_incremental_ids_and_unknown_first_ids() {
+        let mut history = History {
+            native: true,
+            ..Default::default()
+        };
+        let first = history.hydrate(json!({"type":"response.create","model":"m","previous_response_id":"upstream-id","input":[]}), 10000).unwrap();
+        assert_eq!(first["previous_response_id"], "upstream-id");
+        history
+            .commit(
+                first,
+                &json!({"response":{"id":"r1","output":[{"role":"assistant","content":"answer"}]}}),
+                10000,
+            )
+            .unwrap();
+        let next = history
+            .hydrate(
+                json!({"type":"response.create","input":[{"role":"user","content":"next"}]}),
+                10000,
+            )
+            .unwrap();
+        assert_eq!(next["previous_response_id"], "r1");
+        assert_eq!(next["input"].as_array().unwrap().len(), 1);
+        let replacement = history
+            .hydrate(
+                json!({"type":"response.create","input":[{"role":"assistant","content":"full"}]}),
+                10000,
+            )
+            .unwrap();
+        assert!(replacement.get("previous_response_id").is_none());
+    }
 }
 
 #[cfg(test)]

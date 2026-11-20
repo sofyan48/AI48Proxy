@@ -8,7 +8,7 @@ fn parse(extra: &str) -> Config {
 }
 
 #[test]
-fn typed_transport_fields_do_not_pretend_to_have_consumers() {
+fn typed_transport_fields_are_consumed_or_explicitly_rejected() {
     let c = parse(
         "requests: {streaming: {keepalive-seconds: 7, bootstrap-retries: 2, send-keepalive-before-ft: true}, nonstream-keepalive-interval: 5, tls-handshake-timeout-seconds: 9}\nserver: {max-request-body-bytes: 4096}\nrouting: {retry: {max-retry-interval: 30}}\n",
     );
@@ -19,14 +19,11 @@ fn typed_transport_fields_do_not_pretend_to_have_consumers() {
     assert_eq!(c.tls_handshake_timeout, Duration::from_secs(9));
     assert_eq!(c.max_request_body_bytes, Some(4096));
     let unsupported = c.unsupported_features();
-    for key in [
-        "streaming.keepalive-seconds",
-        "streaming.send-keepalive-before-ft",
-        "nonstream-keepalive-interval",
-        "tls-handshake-timeout-seconds",
-    ] {
-        assert!(unsupported.contains(&key.into()), "{key}");
-    }
+    // Keepalives are consumed by the gateway response path.
+    assert_eq!(
+        unsupported,
+        vec!["tls-handshake-timeout-seconds".to_owned()]
+    );
     assert!(!unsupported.contains(&"max-retry-interval".into()));
     assert!(!unsupported.contains(&"max-request-body-bytes".into()));
 }

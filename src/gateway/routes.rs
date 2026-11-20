@@ -370,6 +370,8 @@ pub(super) async fn generate(
             .and_then(|v| v.to_str().ok())
             .unwrap_or("")
             .to_owned();
+        // Captured before the body is consumed; only filtered names can pass through.
+        let upstream_headers = response.headers().clone();
         if prepared.response_mode != crate::providers::ResponseMode::Json {
             // CPA feeds successful Codex responses into its bounded SSE scanner
             // regardless of the media-type header. Terminal validation remains mandatory.
@@ -386,7 +388,7 @@ pub(super) async fn generate(
             if prepared.response_mode == crate::providers::ResponseMode::CodexSse
                 && !requested_stream
             {
-                return super::codex::buffered(
+                let output = super::codex::buffered(
                     response,
                     attempt,
                     prepared.response_kind,
@@ -394,9 +396,10 @@ pub(super) async fn generate(
                 )
                 .instrument(attempt_span.clone())
                 .await;
+                return super::response::configured(output, &upstream_headers, &config, false);
             }
             let _entered = attempt_span.enter();
-            return streaming(
+            let output = streaming(
                 response,
                 attempt,
                 prepared.format,
@@ -405,6 +408,8 @@ pub(super) async fn generate(
                 prepared.response_mode,
                 prepared.response_kind,
             );
+            let sse = output.status().is_success();
+            return super::response::configured(output, &upstream_headers, &config, sse);
         }
         if !content_type
             .to_ascii_lowercase()
@@ -419,7 +424,7 @@ pub(super) async fn generate(
                 "Expected an upstream JSON response",
             );
         }
-        return buffered(
+        let output = buffered(
             response,
             attempt,
             prepared.format,
@@ -429,6 +434,7 @@ pub(super) async fn generate(
         )
         .instrument(attempt_span)
         .await;
+        return super::response::configured(output, &upstream_headers, &config, false);
     }
 }
 

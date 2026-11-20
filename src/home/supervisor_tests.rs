@@ -40,7 +40,7 @@ fn late_release_cannot_acknowledge_fresh_registry() {
 }
 
 #[tokio::test]
-async fn supervisor_recovers_normal_registration_with_stable_instance_and_new_registry() {
+async fn supervisor_recovers_takeover_with_stable_instance_and_new_registry() {
     let mut params = CertificateParams::default();
     params.is_ca = IsCa::Ca(BasicConstraints::Unconstrained);
     params.key_usages = vec![
@@ -93,6 +93,15 @@ async fn supervisor_recovers_normal_registration_with_stable_instance_and_new_re
     let supervisor = Supervisor::new(connector, Arc::new(ReportingQueue::default()));
     let script = tokio::spawn(async move {
         let mut instances = Vec::new();
+        let (socket, _) = listener.accept().await.unwrap();
+        let mut discovery = BufReader::new(acceptor.accept(socket).await.unwrap());
+        let _ = resp::read_frame(&mut discovery).await.unwrap();
+        discovery
+            .get_mut()
+            .write_all(b"-ERR unsupported command\r\n")
+            .await
+            .unwrap();
+        drop(discovery);
         for _ in 0..2 {
             let config = b"port: 8317\ncredential-concurrency:\n  lifecycle-config-revision: 7\n  cpa-heartbeat-timeout: 10s\n  release-flush-interval: 1h\n  release-max-backoff: 1h\n";
             let (socket, _) = listener.accept().await.unwrap();
@@ -117,9 +126,12 @@ async fn supervisor_recovers_normal_registration_with_stable_instance_and_new_re
             let Frame::Array(Some(args)) = resp::read_frame(&mut sub).await.unwrap() else {
                 panic!("subscribe");
             };
-            assert_eq!(args.len(), 4, "normal registration only; never takeover");
+            assert_eq!(args.len(), if instances.is_empty() { 4 } else { 5 });
             assert_eq!(args[0], Frame::Bulk(Some(b"SUBSCRIBE".to_vec())));
-            instances.push(args[3].clone());
+            if !instances.is_empty() {
+                assert_eq!(args[3], Frame::Bulk(Some(b"takeover".to_vec())));
+            }
+            instances.push(args.last().unwrap().clone());
             sub.get_mut().write_all(b"*3\r\n$9\r\nsubscribe\r\n$6\r\nconfig\r\n:1\r\n*3\r\n$7\r\nmessage\r\n$6\r\nconfig\r\n").await.unwrap();
             sub.get_mut()
                 .write_all(format!("${}\r\n", config.len()).as_bytes())

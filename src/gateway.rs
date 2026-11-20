@@ -210,7 +210,7 @@ async fn generate(State(home): State<Arc<HomeClient>>, request: Request) -> Resp
             );
         }
     };
-    let body = match serde_json::from_slice(&bytes) {
+    let body: Value = match serde_json::from_slice(&bytes) {
         Ok(body) => body,
         Err(_) => {
             return error(
@@ -233,7 +233,16 @@ async fn generate(State(home): State<Arc<HomeClient>>, request: Request) -> Resp
         &model,
     )
     .headers(&parts.headers);
-    let response = routes::generate(home.clone(), parts.uri, parts.headers, body).await;
+    let streaming = parts.uri.path().ends_with(":streamGenerateContent")
+        || body.get("stream").and_then(Value::as_bool) == Some(true);
+    let interval = home.config().nonstream_keepalive_interval;
+    let execution = routes::generate(home.clone(), parts.uri, parts.headers, body);
+    // CPA emits whitespace while a non-stream JSON execution is pending.
+    let response = if streaming {
+        execution.await
+    } else {
+        crate::config::keepalive::nonstream_wait(execution, interval).await
+    };
     crate::observability::submit(
         &home,
         record.finish(response.status().as_u16(), started.elapsed()),

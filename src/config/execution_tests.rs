@@ -20,15 +20,8 @@ fn home_execution_layouts_and_support_boundary() {
         assert!(c.force_model_prefix);
         assert!(c.passthrough_headers);
         assert_eq!(c.streaming.bootstrap_retries, 5);
-        let keys = c.unsupported_features();
-        assert!(keys.contains(&"passthrough-headers".into()));
-        assert!(
-            keys.iter()
-                .any(|s| s.starts_with("oauth-request-scoped-errors"))
-        );
-        assert!(!keys.iter().any(|s| s.contains("bootstrap-retries")
-            || s.contains("force-model-prefix")
-            || s.contains("shutdown-timeout")));
+        // Every control in these Home layouts is consumed by the worker.
+        assert!(c.unsupported_features().is_empty());
         let rules =
             execution::resolve_rules(&c, " Codex ", &json!({"attributes":{"auth_kind":"oauth"}}));
         assert_eq!(

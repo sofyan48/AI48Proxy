@@ -13,7 +13,6 @@ const MAX_RESPONSE: usize = 32 * 1024 * 1024;
 
 /// Route owners call this after translation for both JSON and SSE responses.
 /// The original upstream headers must be captured before consuming the response.
-#[allow(dead_code)] // Awaiting wiring in the separately owned routes module.
 pub(super) fn configured(
     mut response: Response,
     headers: &http::HeaderMap,

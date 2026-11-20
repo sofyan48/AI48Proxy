@@ -1,4 +1,4 @@
-//! Recovery never takes over: normal registration must prove Home reclaimed the old lifetime.
+//! A stable process identity owns recovery policy across fenced transport lifetimes.
 use super::{HomeClient, TerminalConfig};
 use crate::{gateway, home::transport::Connector, reporting::ReportingQueue};
 use anyhow::{Result, bail};
@@ -56,6 +56,8 @@ pub struct Supervisor {
     connector: Connector,
     reporting: Arc<ReportingQueue>,
     instance: String,
+    membership: Arc<crate::home::membership::Membership>,
+    discovered: RwLock<Vec<Connector>>,
     stop: CancellationToken,
 }
 impl Supervisor {
@@ -65,6 +67,8 @@ impl Supervisor {
             connector,
             reporting,
             instance: uuid::Uuid::new_v4().to_string(),
+            membership: Arc::new(crate::home::membership::Membership::default()),
+            discovered: RwLock::new(Vec::new()),
             stop: CancellationToken::new(),
         })
     }
@@ -91,18 +95,43 @@ impl Supervisor {
     /// Initial configuration supplies the immutable listener address. Startup remains cancellable.
     pub async fn connect(&self) -> Result<Arc<HomeClient>> {
         let mut backoff = Backoff::new(seed(&self.instance));
+        let mut connector = self.connector.clone();
+        let discovery = tokio::select! {
+            _ = self.stop.cancelled() => bail!("Home startup cancelled"),
+            result = discover(&connector) => result,
+        };
+        if let Ok(nodes) = discovery {
+            let mut targets = Vec::new();
+            for node in nodes.nodes {
+                if let Ok(target) = self.connector.for_target(node.ip, node.port).await {
+                    targets.push(target);
+                }
+            }
+            if let Some(target) = targets.first() {
+                connector = target.clone();
+            }
+            *self.discovered.write().unwrap_or_else(|e| e.into_inner()) = targets;
+        }
+        let mut failures = 0;
         loop {
             tokio::select! {
                 biased;
                 _ = self.stop.cancelled() => bail!("Home startup cancelled"),
-                result = register(self.connector.clone(), self.reporting.clone(), &self.instance) => {
+                result = register(connector.clone(), self.reporting.clone(), &self.instance, self.membership.clone()) => {
                     match result {
                         Ok(home) => { self.install(home.clone()); return Ok(home); }
                         Err(err) if err.downcast_ref::<TerminalConfig>().is_some() => {
                             tracing::error!(operation = "register", target_category = "configured", reason = "terminal_config", "Home startup stopped");
                             return Err(err);
                         }
-                        Err(_) => tracing::warn!(operation = "register", target_category = "configured", reason = "admission_unavailable", "Home registration unavailable; waiting for normal admission"),
+                        Err(_) => {
+                                                    failures += 1;
+                                                    if failures >= 3 {
+                                                        connector = next_target(&connector, &self.discovered.read().unwrap_or_else(|e| e.into_inner()), &self.connector);
+                                                        failures = 0;
+                                                    }
+                                                    tracing::warn!(operation = "register", target_category = "configured", reason = "admission_unavailable", "Home registration unavailable");
+                                                },
                     }
                 }
             }
@@ -117,7 +146,19 @@ impl Supervisor {
         let mut home = self
             .current()
             .ok_or_else(|| anyhow::anyhow!("supervisor not connected"))?;
-        let mut targets = vec![self.connector.clone()];
+        let mut targets = self
+            .discovered
+            .read()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone();
+        if !targets
+            .iter()
+            .any(|target| target.target() == self.connector.target())
+        {
+            targets.push(self.connector.clone());
+        }
+        let mut connector = home.connector.clone();
+        let mut failures = 0usize;
         let mut backoff = Backoff::new(seed(&self.instance));
         loop {
             let lifetime_cancel = home.cancellation();
@@ -145,7 +186,11 @@ impl Supervisor {
                 reason = "membership_fenced",
                 "Home disconnected; gateway admission unavailable"
             );
-            for target in home.discovered_targets() {
+            let snapshot = home.discovered_targets();
+            if !snapshot.is_empty() {
+                targets.clear();
+            }
+            for target in snapshot {
                 match self.connector.for_target(target.ip, target.port).await {
                     Ok(connector) if !targets.iter().any(|v| v.target() == connector.target()) => {
                         targets.push(connector)
@@ -175,28 +220,87 @@ impl Supervisor {
                 ),
             }
             home.retire().await?;
+            // Preserving counters is safe only when all old releases are acknowledged.
+            // This worker cannot rebind a live registry as the Go worker does.
+            if !home.registry.is_drained() {
+                self.membership.suppress_takeover();
+            }
+            let migration = self.membership.take_migration();
+            let origin = connector.clone();
+            if let Some(plan) = &migration {
+                connector = self
+                    .connector
+                    .for_target(plan.target.ip.clone(), plan.target.port)
+                    .await?;
+            } else if self.membership.take_timeout() {
+                connector = next_target(&connector, &targets, &self.connector);
+                failures = 0;
+            } else {
+                failures += 1;
+                if failures >= 3 {
+                    connector = next_target(&connector, &targets, &self.connector);
+                    failures = 0;
+                }
+            }
             let mut index = 0;
             loop {
+                let delay = if migration.is_some() && index == 0 {
+                    Duration::ZERO
+                } else {
+                    backoff.next_delay()
+                };
                 tokio::select! {
                     _ = self.stop.cancelled() => return Ok(()),
-                    _ = tokio::time::sleep(backoff.next_delay()) => {}
+                    _ = tokio::time::sleep(delay) => {}
                 }
-                let target_category = recovery_target_category(index % targets.len());
+                let target_category = recovery_target_category(usize::from(
+                    connector.target() != self.connector.target(),
+                ));
                 tracing::info!(
                     operation = "recovery_register",
                     target_category,
                     attempt = index + 1,
                     "Home recovery registration started"
                 );
-                let connector = targets[index % targets.len()].clone();
                 index += 1;
                 let result = tokio::select! {
                     _ = self.stop.cancelled() => return Ok(()),
-                    result = register(connector, self.reporting.clone(), &self.instance) => result,
+                    result = register(connector.clone(), self.reporting.clone(), &self.instance, self.membership.clone()) => result,
                 };
                 match result {
                     Ok(next) => {
                         home = next;
+                        failures = 0;
+                        if let Some(plan) = migration.as_ref() {
+                            let planned_target = self
+                                .connector
+                                .for_target(plan.target.ip.clone(), plan.target.port)
+                                .await?;
+                            let outcome = if connector.target() == planned_target.target() {
+                                crate::home::cluster::Outcome::Success
+                            } else {
+                                crate::home::cluster::Outcome::Failed
+                            };
+                            let cluster = crate::home::cluster::Cluster::with_migration_support(
+                                &home,
+                                crate::home::cluster::MigrationCapability::SupportedByCaller,
+                            );
+                            let result = tokio::select! {
+                                _ = self.stop.cancelled() => return Ok(()),
+                                _ = home.cancel.cancelled() => None,
+                                result = async {
+                                    if !cluster.enable_rebalance().await?.ok {
+                                        bail!("Home rebalance enable rejected");
+                                    }
+                                    cluster.result(&plan.id, outcome).await
+                                } => Some(result),
+                            };
+                            if !matches!(result, Some(Ok(reply)) if reply.ok) {
+                                home.fence_reason("rebalance_result");
+                                home.retire().await?;
+                                continue;
+                            }
+                        }
                         self.install(home.clone());
                         backoff.reset();
                         tracing::info!(
@@ -207,6 +311,10 @@ impl Supervisor {
                         break;
                     }
                     Err(err) if err.downcast_ref::<TerminalConfig>().is_some() => {
+                        if migration.is_some() && connector.target() != origin.target() {
+                            connector = origin.clone();
+                            continue;
+                        }
                         tracing::error!(
                             operation = "recovery",
                             target_category,
@@ -216,6 +324,15 @@ impl Supervisor {
                         return Err(err);
                     }
                     Err(_) => {
+                        if migration.is_some() && connector.target() != origin.target() {
+                            connector = origin.clone();
+                        } else {
+                            failures += 1;
+                            if failures >= 3 {
+                                connector = next_target(&connector, &targets, &self.connector);
+                                failures = 0;
+                            }
+                        }
                         tracing::warn!(
                             operation = "recovery",
                             target_category,
@@ -228,14 +345,26 @@ impl Supervisor {
         }
     }
 }
+async fn discover(connector: &Connector) -> Result<crate::home::cluster::NodesReply> {
+    tokio::time::timeout(Duration::from_secs(30), async {
+        let mut connection = connector.connect().await?;
+        crate::home::cluster::NodesReply::decode(
+            connection
+                .command(&[b"CLUSTER".to_vec(), b"NODES".to_vec()])
+                .await?,
+        )
+    })
+    .await?
+}
 async fn register(
     connector: Connector,
     reporting: Arc<ReportingQueue>,
     instance: &str,
+    membership: Arc<crate::home::membership::Membership>,
 ) -> Result<Arc<HomeClient>> {
     tokio::time::timeout(
         Duration::from_secs(30),
-        HomeClient::start_with_instance(connector, reporting, instance),
+        HomeClient::start_membership(connector, reporting, instance, membership),
     )
     .await
     .map_err(|_| {
@@ -246,6 +375,13 @@ async fn register(
         );
         anyhow::anyhow!("Home registration deadline exceeded")
     })?
+}
+fn next_target(current: &Connector, targets: &[Connector], seed: &Connector) -> Connector {
+    targets
+        .iter()
+        .find(|target| target.target() != current.target())
+        .unwrap_or(seed)
+        .clone()
 }
 fn recovery_target_category(index: usize) -> &'static str {
     if index == 0 {

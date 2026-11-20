@@ -4,6 +4,11 @@ use anyhow::{Result, ensure};
 use http::HeaderMap;
 use serde_json::{Value, json};
 
+#[path = "codex_cache.rs"]
+pub mod cache;
+#[path = "codex_ws.rs"]
+pub mod websocket;
+
 pub(super) fn headers(headers: &mut HeaderMap, auth: &Value, oauth: bool) -> Result<()> {
     insert(
         headers,
@@ -93,7 +98,7 @@ pub(super) fn request_headers(
 }
 
 /// Normalize native Responses input *before* user payload rules. Not a Chat translator.
-/// Stateful continuations require history reconstruction by the gateway/WS owner.
+/// HTTP drops previous_response_id like Go; native WS preserves it before payload rules.
 /// Hosted tools pass through; automatic image-tool injection/replay is not implemented.
 pub fn normalize_request(body: &mut Value, model: &str) -> Result<()> {
     let object = body
@@ -104,11 +109,13 @@ pub fn normalize_request(body: &mut Value, model: &str) -> Result<()> {
         !object.contains_key("messages"),
         "Codex requires translated Responses input"
     );
+
     ensure!(
-        object
+        !object
             .get("previous_response_id")
-            .is_none_or(|v| v.is_null() || v.as_str() == Some("")),
-        "Codex HTTP requires full conversation input, not previous_response_id"
+            .and_then(Value::as_str)
+            .is_some_and(|id| id.trim().starts_with("resp_ag_compact_")),
+        "local compaction continuation requires full input"
     );
     ensure!(
         !object.contains_key("context_management"),

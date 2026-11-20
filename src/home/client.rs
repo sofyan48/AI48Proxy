@@ -17,6 +17,13 @@ use std::sync::{
 };
 use tokio_util::sync::CancellationToken;
 
+#[path = "config_validation.rs"]
+mod config_validation;
+#[path = "client_lifecycle.rs"]
+mod lifecycle;
+use config_validation::{parse_config, validate_support};
+#[path = "rebalance.rs"]
+mod rebalance;
 #[path = "supervisor.rs"]
 pub mod supervisor;
 
@@ -65,6 +72,9 @@ impl std::error::Error for Rejection {}
 
 pub struct HomeClient {
     connector: Connector,
+    membership: Arc<super::membership::Membership>,
+    control_busy: AtomicBool,
+    balance_enabled: AtomicBool,
     config: RwLock<Arc<Config>>,
     cancel: CancellationToken,
     ready: AtomicBool,
@@ -83,6 +93,20 @@ impl HomeClient {
         reporting: Arc<ReportingQueue>,
         instance: &str,
     ) -> Result<Arc<Self>> {
+        Self::start_membership(
+            connector,
+            reporting,
+            instance,
+            Arc::new(super::membership::Membership::default()),
+        )
+        .await
+    }
+    pub(super) async fn start_membership(
+        connector: Connector,
+        reporting: Arc<ReportingQueue>,
+        instance: &str,
+        membership: Arc<super::membership::Membership>,
+    ) -> Result<Arc<Self>> {
         tracing::info!(operation = "register", "Home registration started");
         let mut bootstrap = diagnosed(connector.connect().await, "config_connect")?;
         let reply = diagnosed(
@@ -99,15 +123,13 @@ impl HomeClient {
         let revision = initial.lifecycle.lifecycle_config_revision;
 
         let ack = diagnosed(
-            sub.command(&[
-                b"SUBSCRIBE".to_vec(),
-                b"config".to_vec(),
-                revision.to_string().into_bytes(),
-                instance.as_bytes().to_vec(),
-            ])
-            .await,
+            sub.command(&membership.subscription(revision, instance))
+                .await,
             "subscription_register",
         )?;
+        if let Frame::Error(error) = &ack {
+            membership.rejection(error);
+        }
         diagnosed(
             (|| {
                 ensure!(
@@ -118,6 +140,9 @@ impl HomeClient {
             })(),
             "subscription_ack",
         )?;
+        if revision > 0 {
+            membership.mark_eligible();
+        }
         let first = diagnosed(sub.receive().await, "config_snapshot_receive")?;
         let bytes = diagnosed(
             message(&first, "config").context("missing initial configuration snapshot"),
@@ -152,6 +177,9 @@ impl HomeClient {
         let cancel = CancellationToken::new();
         let client = Arc::new(Self {
             connector,
+            membership,
+            control_busy: AtomicBool::new(false),
+            balance_enabled: AtomicBool::new(false),
             config: RwLock::new(Arc::new(config)),
             registry: Registry::new(cancel.clone()),
             cancel,
@@ -306,13 +334,14 @@ impl HomeClient {
             _ = self.cancel.cancelled() => {
                 match tokio::time::timeout(self.config().lifecycle.cancel_bound, &mut send).await {
                     Ok(result) => result,
-                    Err(_) => { self.fence_reason("dispatch_settlement_timeout"); bail!("Home admission settlement deadline exceeded"); }
+                    Err(_) => { self.membership.suppress_takeover(); self.fence_reason("dispatch_settlement_timeout"); bail!("Home admission settlement deadline exceeded"); }
                 }
             }
         };
         let bytes = match result.and_then(Frame::bytes) {
             Ok(v) => v,
             Err(_) => {
+                self.membership.suppress_takeover();
                 self.fence_reason("dispatch_transport");
                 bail!("ambiguous Home dispatch transport failure")
             }
@@ -320,6 +349,7 @@ impl HomeClient {
         let value: Value = match serde_json::from_slice(&bytes) {
             Ok(v) => v,
             Err(_) => {
+                self.membership.suppress_takeover();
                 self.fence_reason("dispatch_response");
                 bail!("invalid Home dispatch response")
             }
@@ -330,6 +360,7 @@ impl HomeClient {
         let selection: Selection = match serde_json::from_value(value) {
             Ok(v) => v,
             Err(_) => {
+                self.membership.suppress_takeover();
                 self.fence_reason("dispatch_selection");
                 bail!("malformed Home selection")
             }
@@ -346,6 +377,7 @@ impl HomeClient {
                 .as_ref()
                 .is_some_and(|v| v.accounted && (v.credential_id.is_empty() || v.model.is_empty()))
         {
+            self.membership.suppress_takeover();
             self.fence_reason("dispatch_identity");
             bail!("invalid Home admission identity");
         }
@@ -378,138 +410,6 @@ impl HomeClient {
             }
             tokio::time::sleep_until((tokio::time::Instant::now() + delay).min(deadline)).await;
             delay = (delay * 2).min(config.lifecycle.release_max_backoff);
-        }
-    }
-    async fn subscription(self: Arc<Self>, mut sub: Connection) {
-        let mut last_heartbeat = tokio::time::Instant::now();
-        let reason = loop {
-            let deadline = last_heartbeat + self.config().lifecycle.heartbeat_timeout;
-            let frame = tokio::select! {
-                _=self.cancel.cancelled()=>return,
-                result=tokio::time::timeout_at(deadline,sub.receive())=>match result {
-                    Ok(Ok(v))=>v,
-                    Ok(Err(_))=>break "subscription_socket",
-                    Err(_)=>break "heartbeat_timeout",
-                }
-            };
-            if matches!(&frame,Frame::Array(Some(v)) if v.len()==2 && text(&v[0])==Some("pong") && text(&v[1])==Some(""))
-            {
-                last_heartbeat = tokio::time::Instant::now();
-                tracing::debug!(operation = "heartbeat", "Home heartbeat received");
-            } else if let Some(bytes) = message(&frame, "config") {
-                let mut next = match parse_config(bytes, "config_update") {
-                    Ok(next) => next,
-                    Err(_) => break "config_parse",
-                };
-                if validate_support(&next).is_err() {
-                    break "config_unsupported";
-                }
-                let old = self.config();
-                if next.lifecycle.lifecycle_config_revision
-                    != old.lifecycle.lifecycle_config_revision
-                {
-                    break "config_revision";
-                }
-                next.host = old.host.clone();
-                next.port = old.port;
-                *self.config.write().unwrap_or_else(|e| e.into_inner()) = Arc::new(next);
-                tracing::info!(operation = "config_update", "Home configuration applied");
-            } else if let Some(bytes) = message(&frame, "cluster") {
-                self.install_targets(bytes);
-            } else if message(&frame, "rebalance").is_some() {
-                tracing::warn!("Home rebalance is not supported in this release");
-            }
-        };
-        self.fence_reason(reason);
-    }
-    fn install_targets(&self, bytes: &[u8]) {
-        if let Ok(reply) = super::cluster::NodesReply::decode(Frame::Bulk(Some(bytes.to_vec()))) {
-            *self.targets.write().unwrap_or_else(|e| e.into_inner()) = reply
-                .nodes
-                .into_iter()
-                .map(|node| super::cluster::Target {
-                    ip: node.ip,
-                    port: node.port,
-                })
-                .collect();
-        }
-    }
-    async fn maintenance(self: Arc<Self>) {
-        let mut next_snapshot = tokio::time::Instant::now();
-        let mut usage_failed = false;
-        loop {
-            let cfg = self.config();
-            tokio::select! { _=self.cancel.cancelled()=>break, _=tokio::time::sleep(cfg.lifecycle.release_flush_interval)=>{} }
-            for frame in self.registry.pending_releases() {
-                if self.flush_release(&frame).await.is_err() {
-                    self.fence_reason("release_ack_deadline");
-                    return;
-                }
-            }
-            for delivery in self.reporting.pending_batch(64, 1024 * 1024) {
-                match self.command(delivery.command()).await {
-                    Ok(Frame::Integer(1)) => {
-                        self.reporting.acknowledge(&delivery.id);
-                        if usage_failed {
-                            tracing::info!(operation = "usage", "Home usage delivery recovered");
-                            usage_failed = false;
-                        }
-                    }
-                    _ => {
-                        if !usage_failed {
-                            tracing::warn!(
-                                operation = "usage",
-                                reason = "delivery_not_acknowledged",
-                                "Home usage delivery deferred; durable batch retained"
-                            );
-                            usage_failed = true;
-                        }
-                        break;
-                    }
-                }
-            }
-            if tokio::time::Instant::now() >= next_snapshot {
-                // Discovery is advisory; older standalone Homes may not support it.
-                if let Ok(Ok(Frame::Bulk(Some(bytes)))) = tokio::time::timeout(
-                    cfg.lifecycle.cancel_bound,
-                    self.command(vec![b"CLUSTER".to_vec(), b"NODES".to_vec()]),
-                )
-                .await
-                {
-                    self.install_targets(&bytes);
-                }
-                match self.registry.snapshot(
-                    &cfg.observation,
-                    chrono::Utc::now(),
-                    cfg.lifecycle.observation_barrier_revision,
-                ) {
-                    Ok(snapshot) => {
-                        for frame in snapshot.frames {
-                            let Ok(bytes) = serde_json::to_vec(&frame) else {
-                                self.fence_reason("snapshot_serialize");
-                                return;
-                            };
-                            if !matches!(
-                                self.command(vec![
-                                    b"LPUSH".to_vec(),
-                                    b"in-flight-snapshot".to_vec(),
-                                    bytes
-                                ])
-                                .await,
-                                Ok(Frame::Integer(1))
-                            ) {
-                                self.fence_reason("snapshot_not_acknowledged");
-                                return;
-                            }
-                        }
-                    }
-                    Err(_) => {
-                        self.fence_reason("snapshot_build");
-                        return;
-                    }
-                }
-                next_snapshot = tokio::time::Instant::now() + cfg.observation.snapshot_interval;
-            }
         }
     }
 }
@@ -556,183 +456,4 @@ fn diagnosed<T>(result: Result<T>, operation: &'static str) -> Result<T> {
         );
     }
     result
-}
-fn parse_config(bytes: &[u8], operation: &'static str) -> Result<Config> {
-    diagnosed(
-        Config::parse(bytes).map_err(|_| TerminalConfig.into()),
-        operation,
-    )
-}
-// unsupported_features includes arbitrary nested YAML keys. Emit only known schema
-// families, deduplicated and bounded, never a user-controlled path or value.
-fn unsupported_field_names(paths: &[String]) -> Vec<&'static str> {
-    const FIELDS: &[&str] = &[
-        "upstream",
-        "client",
-        "providers",
-        "codex",
-        "claude",
-        "claude-code",
-        "antigravity",
-        "xai",
-        "devin",
-        "codex-header-defaults",
-        "claude-header-defaults",
-        "gemini-api-key",
-        "interactions-api-key",
-        "vertex-api-key",
-        "codex-api-key",
-        "claude-api-key",
-        "xai-api-key",
-        "meta-api-key",
-        "openai-compatibility",
-        "multimedia",
-        "oauth-request-scoped-errors",
-        "disable-claude-cloak-mode",
-        "force-model-prefix",
-        "request-log",
-        "ws-auth",
-        "api-keys",
-        "shutdown-timeout",
-        "redis-usage-queue-retention-seconds",
-        "plugins",
-        "oauth",
-        "requests",
-        "streaming",
-        "nonstream-keepalive-interval",
-        "passthrough-headers",
-        "tls-handshake-timeout-seconds",
-        "server",
-        "response-compression",
-        "trusted-proxies",
-        "tls",
-        "disable-image-generation",
-        "gpt-image-2-base-model",
-        "video-result-auth-cache-ttl",
-        "antigravity-signature-cache-enabled",
-        "antigravity-signature-bypass-strict",
-        "routing",
-        "access",
-        "observability",
-        "proxy-url",
-    ];
-    FIELDS
-        .iter()
-        .copied()
-        .filter(|field| {
-            paths.iter().any(|path| {
-                path == field
-                    || path
-                        .strip_prefix(field)
-                        .is_some_and(|suffix| suffix.starts_with(['.', '[']))
-            })
-        })
-        .collect()
-}
-fn validate_support(config: &Config) -> Result<()> {
-    let unsupported = config.unsupported_features();
-    if !unsupported.is_empty() {
-        for field in unsupported_field_names(&unsupported) {
-            tracing::error!(
-                operation = "config_validate",
-                reason = "unsupported_field",
-                field,
-                "Home configuration unsupported"
-            );
-        }
-        return Err(TerminalConfig.into());
-    }
-    Ok(())
-}
-
-#[cfg(test)]
-mod diagnostic_tests {
-    use super::*;
-    use std::io::Write;
-
-    #[derive(Clone, Default)]
-    struct Capture(Arc<std::sync::Mutex<Vec<u8>>>);
-    impl Write for Capture {
-        fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
-            self.0.lock().unwrap().extend_from_slice(bytes);
-            Ok(bytes.len())
-        }
-        fn flush(&mut self) -> std::io::Result<()> {
-            Ok(())
-        }
-    }
-    impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for Capture {
-        type Writer = Self;
-        fn make_writer(&'a self) -> Self {
-            self.clone()
-        }
-    }
-
-    #[test]
-    fn diagnostics_do_not_format_errors_yaml_or_arbitrary_keys() {
-        let capture = Capture::default();
-        let subscriber = tracing_subscriber::fmt()
-            .without_time()
-            .with_ansi(false)
-            .with_writer(capture.clone())
-            .finish();
-        let _guard = tracing::subscriber::set_default(subscriber);
-        let secret = "https://private.example/eyJ-secret-token";
-        let result: Result<()> = diagnosed(Err(anyhow::anyhow!(secret)), "worker_ping");
-        assert!(result.is_err());
-        assert!(parse_config(secret.as_bytes(), "config_initial").is_err());
-        let config = Config::parse(format!("credential-concurrency:\n  lifecycle-config-revision: 7\nproviders:\n  '{secret}': secret-value\n").as_bytes()).unwrap();
-        assert!(validate_support(&config).is_err());
-        let bytes = capture.0.lock().unwrap();
-        let log = std::str::from_utf8(&bytes).unwrap();
-        assert!(log.contains("worker_ping"));
-        assert!(log.contains("config_initial"));
-        assert!(log.contains("providers"));
-        for forbidden in [
-            secret,
-            "secret-value",
-            "private.example",
-            "eyJ-secret-token",
-        ] {
-            assert!(!log.contains(forbidden), "unsafe diagnostic");
-        }
-    }
-
-    #[test]
-    fn first_fence_logs_once_even_after_admission_stopped() {
-        let capture = Capture::default();
-        let subscriber = tracing_subscriber::fmt()
-            .without_time()
-            .with_ansi(false)
-            .with_writer(capture.clone())
-            .finish();
-        let _guard = tracing::subscriber::set_default(subscriber);
-        let ready = AtomicBool::new(false);
-        let cancel = CancellationToken::new();
-        fence_membership(&ready, &cancel, "heartbeat_timeout");
-        fence_membership(&ready, &cancel, "subscription_socket");
-        assert!(cancel.is_cancelled());
-        assert!(!ready.load(Ordering::Acquire));
-        let bytes = capture.0.lock().unwrap();
-        let log = std::str::from_utf8(&bytes).unwrap();
-        assert_eq!(log.matches("Home membership health lost").count(), 1);
-        assert!(log.contains("heartbeat_timeout"));
-        assert!(!log.contains("subscription_socket"));
-    }
-
-    #[test]
-    fn unsupported_names_are_bounded_schema_families_only() {
-        let paths = [
-            "providers.secret.token",
-            "providers[0].password",
-            "plugins.enabled",
-            "unknown.secret",
-            "providers-secret",
-        ]
-        .map(str::to_owned);
-        assert_eq!(
-            unsupported_field_names(&paths),
-            vec!["providers", "plugins"]
-        );
-    }
 }

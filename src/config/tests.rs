@@ -154,14 +154,6 @@ fn effective_unsupported_settings_still_fail_support_validation() {
             "antigravity.tos-pause-window",
         ),
         ("plugins: {enabled: true}\n", "plugins.enabled"),
-        (
-            "streaming: {keepalive-seconds: 15}\n",
-            "streaming.keepalive-seconds",
-        ),
-        (
-            "nonstream-keepalive-interval: 10\n",
-            "nonstream-keepalive-interval",
-        ),
         ("proxy-url: socks5://localhost:1080\n", "proxy-url"),
         (
             "upstream: {codex: {response-steering: true}}\n",
@@ -172,8 +164,8 @@ fn effective_unsupported_settings_still_fail_support_validation() {
             "upstream.claude.header-defaults.user-agent",
         ),
         (
-            "requests: {passthrough-headers: true}\n",
-            "passthrough-headers",
+            "tls-handshake-timeout-seconds: 9\n",
+            "tls-handshake-timeout-seconds",
         ),
     ] {
         assert!(
@@ -196,14 +188,10 @@ fn effective_unsupported_settings_still_fail_support_validation() {
 
 #[test]
 fn unsupported_inventory_is_precise_and_never_contains_values() {
-    let c = parse("metadata: {future: true}\nplugins: {enabled: true}\ncodex: {response-steering: true}\nrequests: {streaming: {keepalive-seconds: 5}}\n").unwrap();
+    let c = parse("metadata: {future: true}\nplugins: {enabled: true}\ncodex: {response-steering: true}\nrequests: {streaming: {keepalive-seconds: 5}, passthrough-headers: true}\n").unwrap();
     assert_eq!(
         c.unsupported_features(),
-        vec![
-            "codex.response-steering",
-            "plugins.enabled",
-            "streaming.keepalive-seconds"
-        ]
+        vec!["codex.response-steering", "plugins.enabled"]
     );
     assert!(c.raw.get("metadata").is_some());
 }

@@ -26,7 +26,6 @@ pub(super) fn features(raw: &Value) -> Vec<String> {
         "meta-api-key",
         "openai-compatibility",
         "multimedia",
-        "oauth-request-scoped-errors",
         "disable-claude-cloak-mode",
         "ws-auth",
         "api-keys",
@@ -45,12 +44,9 @@ pub(super) fn features(raw: &Value) -> Vec<String> {
             _ => out.push("plugins.enabled".into()),
         }
     }
-    if let Some(oauth) = field(raw, "oauth") {
-        for key in ["providers", "request-scoped-errors"] {
-            if let Some(value) = field(oauth, key) {
-                leaves(value, &format!("oauth.{key}"), &mut out);
-            }
-        }
+    // oauth(.)request-scoped-errors is matched locally in the gateway, as in CPA.
+    if let Some(value) = field(raw, "oauth").and_then(|oauth| field(oauth, "providers")) {
+        leaves(value, "oauth.providers", &mut out);
     }
     for prefix in ["", "requests."] {
         let container = if prefix.is_empty() {
@@ -59,17 +55,14 @@ pub(super) fn features(raw: &Value) -> Vec<String> {
             field(raw, "requests")
         };
         if let Some(container) = container {
-            if let Some(value) = field(container, "streaming") {
-                streaming(value, &format!("{prefix}streaming"), &mut out);
-            }
-            for key in [
-                "nonstream-keepalive-interval",
-                "passthrough-headers",
-                "tls-handshake-timeout-seconds",
-            ] {
-                if let Some(value) = field(container, key) {
-                    leaves(value, &format!("{prefix}{key}"), &mut out);
-                }
+            // streaming.*, nonstream-keepalive-interval and passthrough-headers are
+            // consumed by the gateway response path.
+            if let Some(value) = field(container, "tls-handshake-timeout-seconds") {
+                leaves(
+                    value,
+                    &format!("{prefix}tls-handshake-timeout-seconds"),
+                    &mut out,
+                );
             }
         }
     }
@@ -135,33 +128,6 @@ pub(super) fn features(raw: &Value) -> Vec<String> {
     out.sort();
     out.dedup();
     out
-}
-
-fn streaming(value: &Value, path: &str, out: &mut Vec<String>) {
-    let Some(map) = value.as_mapping() else {
-        leaves(value, path, out);
-        return;
-    };
-    let keepalive = field(value, "keepalive-seconds");
-    for (key, v) in map {
-        let Some(key) = key.as_str() else {
-            continue;
-        };
-        // CPA disables bootstrap replay unconditionally in Home mode.
-        if key == "bootstrap-retries" {
-            continue;
-        }
-        if key == "keepalive-seconds" && v.as_i64().is_some_and(|n| n <= 0) {
-            continue;
-        }
-        // The pre-first-token switch is ineffective without positive keepalives.
-        if key == "send-keepalive-before-ft"
-            && keepalive.is_none_or(|v| v.as_i64().is_some_and(|n| n <= 0))
-        {
-            continue;
-        }
-        leaves(v, &format!("{path}.{key}"), out);
-    }
 }
 
 fn inert(value: &Value, path: &str) -> bool {
@@ -238,5 +204,28 @@ fn leaves(value: &Value, path: &str, out: &mut Vec<String>) {
             }
         }
         _ => out.push(path.to_owned()),
+    }
+}
+
+#[cfg(test)]
+mod codex_tests {
+    use super::*;
+
+    #[test]
+    fn unported_codex_controls_remain_rejected() {
+        for prefix in ["codex", "upstream.codex"] {
+            for key in [
+                "response-steering",
+                "optimize-multi-agent-v2",
+                "orphan-delegation-compatibility",
+                "websocket-compression",
+                "upstream-request-compression",
+            ] {
+                let path = format!("{prefix}.{key}");
+                let mut out = Vec::new();
+                leaves(&Value::Bool(true), &path, &mut out);
+                assert_eq!(out, vec![path]);
+            }
+        }
     }
 }

@@ -134,8 +134,8 @@ fn codex_forwards_turn_headers_but_not_client_authorization() {
 fn codex_specialized_paths_are_explicitly_blocked_not_claimed_supported() {
     let fixtures = fixtures();
     for input in fixtures["blocked_codex_inputs"].as_array().unwrap() {
-        // Hosted tools now pass through; that is not specialized executor parity.
-        if input.get("tools").is_some() {
+        // Hosted tools pass through and HTTP drops previous_response_id like Go.
+        if input.get("tools").is_some() || input.get("previous_response_id").is_some() {
             continue;
         }
         assert!(
@@ -267,7 +267,7 @@ fn compat_provider_requires_gateway_translated_responses_input() {
 
 #[test]
 
-fn gap_codex_prompt_cache_key_seeds_session_header() {
+fn codex_prompt_cache_key_seeds_session_header() {
     let request = request(
         &selected("codex_selection"),
         "/v1/responses",
@@ -286,7 +286,19 @@ fn gap_codex_prompt_cache_key_seeds_session_header() {
 }
 
 #[test]
+fn codex_http_continuation_matches_go_delete_without_local_store() {
+    let request = request(
+        &selected("codex_selection"),
+        "/v1/responses",
+        &HeaderMap::new(),
+        json!({"input":"next","previous_response_id":"resp_prior"}),
+        false,
+    );
+    assert!(body(&request).get("previous_response_id").is_none());
+    assert_eq!(body(&request)["input"][0]["content"][0]["text"], "next");
+}
 
+#[test]
 fn gap_codex_strips_nested_cache_hints() {
     let request = request(
         &selected("codex_selection"),

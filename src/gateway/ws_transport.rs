@@ -12,6 +12,8 @@ mod tests;
 pub(super) struct Prepared {
     pub handshake: http::Request<()>,
     pub message: String,
+
+    pub native: bool,
 }
 
 pub(super) fn prepare(
@@ -28,17 +30,25 @@ pub(super) fn prepare(
         ),
         "native Responses websocket required"
     );
-    // Do not silently ignore an explicit transport proxy when switching from reqwest.
+    let codex = credentials.provider_protocol == "codex";
+    let native = !codex || providers::codex::websocket::enabled(&selection.auth);
+    // HTTP fallback uses reqwest's configured proxy; native WS must fail closed.
     ensure!(
-        credentials
-            .proxy_url
-            .as_deref()
-            .or(config.proxy_url.as_deref())
-            .is_none_or(|proxy| proxy == "direct"),
+        !native
+            || credentials
+                .proxy_url
+                .as_deref()
+                .or(config.proxy_url.as_deref())
+                .is_none_or(|proxy| proxy == "direct"),
         "websocket transport proxy unsupported"
     );
-    let prepared = providers::prepare(config, selection, "/v1/responses", headers, body, true)?;
-    let request = prepared.request.build()?;
+    let request = if codex {
+        providers::codex::websocket::prepare(config, selection, headers, body)?
+    } else {
+        providers::prepare(config, selection, "/v1/responses", headers, body, true)?
+            .request
+            .build()?
+    };
     let bytes = request
         .body()
         .and_then(reqwest::Body::as_bytes)
@@ -80,5 +90,10 @@ pub(super) fn prepare(
             HeaderValue::from_static("responses_websockets=2026-02-06"),
         );
     }
-    Ok(Prepared { handshake, message })
+    Ok(Prepared {
+        handshake,
+        message,
+
+        native,
+    })
 }

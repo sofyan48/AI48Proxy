@@ -190,7 +190,15 @@ async fn session(
     // CPA bounds connection acquisition, never the established response stream.
     let (mut upstream, _) = tokio::time::timeout(
         std::time::Duration::from_secs(30),
-        tokio_tungstenite::connect_async(prepared.handshake),
+        tokio_tungstenite::connect_async_with_config(
+            prepared.handshake,
+            Some(
+                tokio_tungstenite::tungstenite::protocol::WebSocketConfig::default()
+                    .max_message_size(Some(limit))
+                    .max_frame_size(Some(limit)),
+            ),
+            true,
+        ),
     )
     .await??;
     upstream

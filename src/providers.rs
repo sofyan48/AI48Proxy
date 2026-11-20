@@ -142,14 +142,22 @@ pub fn resolve(selection: &Selection, incoming_protocol: &str) -> Result<Credent
             }
             ("https://api.anthropic.com", "claude", oauth)
         }
-        "gemini" => {
+        "gemini" | "gemini-interactions" => {
             ensure!(
-                incoming_protocol == "gemini",
-                "Gemini requires native Gemini input"
+                matches!(incoming_protocol, "gemini" | "openai" | "openai-response"),
+                "Gemini provider requires a supported native or translated input"
             );
             ensure!(!key.is_empty(), "Gemini API key missing");
             insert(&mut headers, "x-goog-api-key", key)?;
-            ("https://generativelanguage.googleapis.com", "gemini", false)
+            if provider == "gemini-interactions" {
+                (
+                    "https://generativelanguage.googleapis.com",
+                    "gemini-interactions",
+                    false,
+                )
+            } else {
+                ("https://generativelanguage.googleapis.com", "gemini", false)
+            }
         }
         "gemini-cli" => bail!("Gemini CLI is plugin-hosted in current CPA; executor unsupported"),
         "antigravity" => {

@@ -162,9 +162,42 @@ pub struct UsageRecord {
     /// Allowlisted scheduler hints only, never the raw upstream response body.
     pub fail_body: String,
     pub breakdown: TokenBreakdown,
+    pub image_count: usize,
+    pub image_details: Option<Value>,
+    pub requested_image_details: Option<Value>,
 }
 
 impl UsageRecord {
+    /// Explicit image billing metadata only; never include prompts, URLs or image bytes.
+    pub fn image_usage(&mut self, response: &Value, request: &Value) {
+        fn details(value: &Value) -> Value {
+            let mut out = json!({});
+            for key in [
+                "size",
+                "quality",
+                "resolution",
+                "aspect_ratio",
+                "background",
+                "output_format",
+            ] {
+                if let Some(text) = value
+                    .get(key)
+                    .and_then(Value::as_str)
+                    .filter(|s| s.len() <= 128)
+                {
+                    out[key] = text.into();
+                }
+            }
+            out
+        }
+        self.image_count = response
+            .get("data")
+            .and_then(Value::as_array)
+            .map_or(0, Vec::len);
+        self.image_details = Some(details(response));
+        self.requested_image_details = Some(details(request));
+    }
+
     /// Call as soon as upstream headers arrive, before refresh, retry, or body handling.
     /// Local failures must use local_failure rather than inheriting upstream attribution.
     pub fn upstream_status(&mut self, status: u16) {
@@ -401,7 +434,7 @@ pub fn usage_payload(record: &UsageRecord) -> Result<Value, &'static str> {
     } else {
         200
     };
-    Ok(json!({
+    let mut payload = json!({
         "accounting_version": 2, "token_breakdown": b,
         "execution_id": record.execution_id, "request_id": record.request_id,
         "provider": record.provider, "executor_type": record.executor_type, "model": record.model,
@@ -415,5 +448,15 @@ pub fn usage_payload(record: &UsageRecord) -> Result<Value, &'static str> {
             "cache_read_tokens": b.input.cache_read_tokens, "cache_read_tokens_present": true,
             "cache_creation_tokens": b.input.cache_write_tokens, "total_tokens": b.total_tokens
         }
-    }))
+    });
+    if record.image_count > 0 {
+        payload["image_count"] = record.image_count.into();
+    }
+    if let Some(details) = &record.image_details {
+        payload["image_details"] = details.clone();
+    }
+    if let Some(details) = &record.requested_image_details {
+        payload["requested_image_details"] = details.clone();
+    }
+    Ok(payload)
 }

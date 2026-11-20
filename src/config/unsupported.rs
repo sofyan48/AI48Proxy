@@ -90,8 +90,6 @@ pub(super) fn features(raw: &Value) -> Vec<String> {
         }
     }
     for key in [
-        "disable-image-generation",
-        "gpt-image-2-base-model",
         "video-result-auth-cache-ttl",
         "antigravity-signature-cache-enabled",
         "antigravity-signature-bypass-strict",

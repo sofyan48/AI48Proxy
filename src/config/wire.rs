@@ -109,6 +109,14 @@ pub(super) fn normalize(mut root: Value) -> Result<Value> {
     validate_keys(&root)?;
     // Verified in Home internal/config/config_layout.go. No speculative aliases.
     for (flat, nested) in [
+        (
+            "disable-image-generation",
+            "multimedia.disable-image-generation",
+        ),
+        (
+            "gpt-image-2-base-model",
+            "multimedia.gpt-image-2-base-model",
+        ),
         ("host", "server.host"),
         ("port", "server.port"),
         ("request-retry", "routing.retry.request-retry"),

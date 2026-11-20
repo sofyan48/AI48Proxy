@@ -13,6 +13,8 @@ pub mod execution;
 mod execution_tests;
 #[path = "gateway/keepalive.rs"]
 pub mod keepalive;
+#[path = "config/multimedia.rs"]
+pub mod multimedia;
 #[cfg(test)]
 #[path = "config/tests.rs"]
 mod tests;
@@ -33,6 +35,8 @@ mod home_projection_tests;
 
 #[derive(Clone, Debug)]
 pub struct Config {
+    pub disable_image_generation: multimedia::ImageGenerationMode,
+    pub gpt_image_2_base_model: String,
     pub host: String,
     pub port: u16,
     pub request_retry: u32,
@@ -157,6 +161,11 @@ impl Config {
             None => PayloadRules::default(),
         };
         Ok(Self {
+            disable_image_generation: multimedia::ImageGenerationMode::parse(field(
+                &raw,
+                "disable-image-generation",
+            ))?,
+            gpt_image_2_base_model: multimedia::base_model(&raw)?,
             host,
             port,
             request_retry,

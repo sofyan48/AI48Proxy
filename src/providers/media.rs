@@ -3,6 +3,8 @@ use crate::{config::Config, home::client::Selection, payload::ApplyContext, prov
 use anyhow::{Result, ensure};
 use http::{HeaderMap, HeaderValue};
 use serde_json::Value;
+#[path = "media_codex.rs"]
+pub mod codex;
 
 pub fn compat(selection: &Selection) -> bool {
     matches!(
@@ -96,19 +98,25 @@ pub fn prepare(
     multipart: Option<&super::multipart::Form>,
 ) -> Result<reqwest::RequestBuilder> {
     let speech = path == "/v1/audio/speech" || path == "/v1/tts";
+    let codex = selection.provider == "codex";
+    let direct = codex && codex::direct(original, &selection.model);
     ensure!(
         (speech && selection.provider == "xai")
-            || (!speech && (selection.provider == "xai" || compat(selection))),
+            || (!speech && (selection.provider == "xai" || codex || compat(selection))),
         "unsupported media provider"
     );
     let mut creds = if selection.provider == "xai" {
         xai_credentials(selection, speech)?
+    } else if codex {
+        codex::headers(config, selection, incoming, body, direct)?
     } else {
         providers::resolve(selection, "openai")?
     };
     let mut url = url::Url::parse(&creds.base_url)?;
     let root = url.path().trim_end_matches('/').to_owned();
-    let suffix = if speech {
+    let suffix = if codex && !direct {
+        "responses"
+    } else if speech {
         "tts"
     } else {
         path.trim_start_matches("/v1/")
@@ -148,8 +156,12 @@ pub fn prepare(
     config.payload.apply_context(
         body,
         ApplyContext {
-            model: &selection.model,
-            protocol: "openai",
+            model: if codex && !direct {
+                &config.gpt_image_2_base_model
+            } else {
+                &selection.model
+            },
+            protocol: if codex && !direct { "codex" } else { "openai" },
             from_protocol: if speech {
                 "openai-speech"
             } else {
@@ -165,7 +177,7 @@ pub fn prepare(
         },
     )?;
     ensure!(
-        body.get("stream").and_then(Value::as_bool) != Some(true),
+        (codex && !direct) || body.get("stream").and_then(Value::as_bool) != Some(true),
         "image SSE unsupported"
     );
     let (bytes, content_type) = match multipart {
@@ -177,7 +189,13 @@ pub fn prepare(
         .insert("content-type", HeaderValue::from_str(&content_type)?);
     creds.headers.insert(
         "accept",
-        HeaderValue::from_static(if speech { "*/*" } else { "application/json" }),
+        HeaderValue::from_static(if codex && !direct {
+            "text/event-stream"
+        } else if speech {
+            "*/*"
+        } else {
+            "application/json"
+        }),
     );
     Ok(client.build()?.post(url).headers(creds.headers).body(bytes))
 }

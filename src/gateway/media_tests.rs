@@ -13,6 +13,7 @@ async fn compatible_generation_uses_selected_model_and_reports_tokens() {
     assert!(result.upstream.body.get("stream").is_none());
     assert!(result.body.contains("data:image/png;base64,AA=="));
     assert_eq!(result.usage["tokens"]["total_tokens"], 10);
+    assert_eq!(result.usage["image_count"], 1);
 }
 
 #[tokio::test]
@@ -137,7 +138,7 @@ fn xai_image_normalization_and_response_formats() {
 
 #[tokio::test]
 async fn unsupported_provider_combinations_release_without_upstream_io() {
-    for provider in ["codex", "claude", "gemini"] {
+    for provider in ["claude", "gemini"] {
         fixture::rejected_provider(
             provider,
             "/v1/images/generations",
@@ -151,6 +152,45 @@ async fn unsupported_provider_combinations_release_without_upstream_io() {
         json!({"model":"tts-1","input":"hello"}),
     )
     .await;
+}
+
+#[tokio::test]
+async fn codex_responses_bridge_requires_completion_and_reports_images() {
+    let wire = "data: {\"type\":\"response.output_item.done\",\"output_index\":0,\"item\":{\"type\":\"image_generation_call\",\"result\":\"AA==\",\"size\":\"1024x1536\",\"quality\":\"high\",\"output_format\":\"webp\"}}\n\ndata: {\"type\":\"response.completed\",\"response\":{\"created_at\":12,\"output\":[],\"tool_usage\":{\"image_gen\":{\"input_tokens\":3,\"output_tokens\":7,\"total_tokens\":10}}}}\n\n";
+    for path in ["/v1/images/generations", "/v1/images/edits"] {
+        let result = fixture::run("codex", path,
+            json!({"model":"public-alias","prompt":"draw","response_format":"url","images":[{"image_url":"data:image/png;base64,AA=="}]}),
+            "text/event-stream", wire).await;
+        assert_eq!(result.status, StatusCode::OK);
+        assert_eq!(result.upstream.target, "/tenant/v1/responses");
+        assert_eq!(result.upstream.body["model"], "gpt-5.4-mini");
+        assert_eq!(result.upstream.body["tools"][0]["model"], "public-alias");
+        assert_eq!(
+            result.upstream.body["tools"][0]["action"],
+            if path.ends_with("edits") {
+                "edit"
+            } else {
+                "generate"
+            }
+        );
+        assert!(result.body.contains("data:image/webp;base64,AA=="));
+        assert_eq!(result.usage["image_count"], 1);
+        assert_eq!(result.usage["image_details"]["quality"], "high");
+        assert_eq!(result.usage["tokens"]["total_tokens"], 10);
+    }
+    for wire in ["data: {}\n\n", "data: {\"type\":\"response.failed\"}\n\n"] {
+        let result = fixture::run(
+            "codex",
+            "/v1/images/generations",
+            json!({"model":"public-alias","prompt":"draw"}),
+            "text/event-stream",
+            wire,
+        )
+        .await;
+        assert_eq!(result.status, StatusCode::BAD_GATEWAY);
+        assert_eq!(result.usage["failed"], true);
+        assert!(result.usage.get("image_count").is_none());
+    }
 }
 
 #[tokio::test]

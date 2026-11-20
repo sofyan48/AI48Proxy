@@ -35,11 +35,13 @@ fn codex_normalization_fixture() {
     );
     for mut invalid in [
         json!({"messages":[]}),
-        json!({"input":[],"previous_response_id":"resp_x"}),
         json!({"input":[], "tools":["invalid"]}),
     ] {
         assert!(codex::normalize_request(&mut invalid, "model").is_err());
     }
+    let mut continued = json!({"input":[],"previous_response_id":"resp_x"});
+    codex::normalize_request(&mut continued, "model").unwrap();
+    assert!(continued.get("previous_response_id").is_none());
 }
 
 #[test]

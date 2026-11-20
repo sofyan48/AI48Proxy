@@ -52,7 +52,9 @@ pub(super) async fn handle(State(home): State<Arc<HomeClient>>, request: Request
     let path = parts.uri.path();
     let speech_route = matches!(path, "/v1/audio/speech" | "/v1/tts");
     let config = home.config();
-    if !speech_route && images_disabled(&config.raw) {
+    if !speech_route
+        && config.disable_image_generation == crate::config::multimedia::ImageGenerationMode::All
+    {
         return error(
             StatusCode::NOT_FOUND,
             "not_found",
@@ -203,17 +205,32 @@ pub(super) async fn handle(State(home): State<Arc<HomeClient>>, request: Request
         Err(err) => return routes::dispatch_error(&err),
     };
     let xai = selection.provider == "xai";
-    if (speech_route && !xai) || (!speech_route && !xai && !provider::compat(&selection)) {
+    let codex = selection.provider == "codex";
+    let codex_bridge = codex && !provider::codex::direct(&original, &selection.model);
+    if (speech_route && !xai) || (!speech_route && !xai && !codex && !provider::compat(&selection))
+    {
         attempt.record.local_failure(501);
         return error(
             StatusCode::NOT_IMPLEMENTED,
             "unsupported_capability",
-            "Selected provider does not support this media route in Rust; Codex images are not ported",
+            "Selected provider does not support this media route in Rust",
         );
     }
     let edit = path == "/v1/images/edits";
     if !speech_route {
-        payload = if xai {
+        payload = if codex {
+            match provider::codex::payload(&config, &selection, &original, form.as_ref(), edit) {
+                Ok(payload) => payload,
+                Err(_) => {
+                    attempt.record.local_failure(400);
+                    return error(
+                        StatusCode::BAD_REQUEST,
+                        "invalid_request_error",
+                        "Invalid Codex image input",
+                    );
+                }
+            }
+        } else if xai {
             match images::xai_request(&original, &selection.model, form.as_ref(), edit) {
                 Ok(payload) => payload,
                 Err(_) => {
@@ -248,7 +265,7 @@ pub(super) async fn handle(State(home): State<Arc<HomeClient>>, request: Request
         &parts.headers,
         &mut payload,
         &original,
-        if xai { None } else { form.as_ref() },
+        if xai || codex { None } else { form.as_ref() },
     ) {
         Ok(request) => request,
         Err(_) => {
@@ -301,7 +318,11 @@ pub(super) async fn handle(State(home): State<Arc<HomeClient>>, request: Request
             None => break,
         }
     }
-    let value = serde_json::from_slice::<Value>(&bytes);
+    let value = if codex_bridge && status.is_success() {
+        provider::codex::response(&bytes, images::response_format(&original)).map_err(|_| ())
+    } else {
+        serde_json::from_slice::<Value>(&bytes).map_err(|_| ())
+    };
     if !status.is_success() {
         if let Ok(value) = &value {
             attempt.record.upstream_failure(status.as_u16(), value);
@@ -335,9 +356,10 @@ pub(super) async fn handle(State(home): State<Arc<HomeClient>>, request: Request
         );
     }
     // Compatible image responses follow the same Go response-format normalization as xAI.
-    match images::response(value, images::response_format(&payload)) {
+    match images::response(value.clone(), images::response_format(&original)) {
         Ok(value) => {
             attempt.record.failed = false;
+            attempt.record.image_usage(&value, &original);
             (status, Json(value)).into_response()
         }
         Err(_) => {
@@ -349,22 +371,6 @@ pub(super) async fn handle(State(home): State<Arc<HomeClient>>, request: Request
             )
         }
     }
-}
-
-fn images_disabled(raw: &serde_yaml::Value) -> bool {
-    let mode = raw
-        .get("multimedia")
-        .and_then(|v| v.get("disable-image-generation"))
-        .or_else(|| raw.get("disable-image-generation"));
-    mode.is_some_and(|v| {
-        v.as_bool() == Some(true)
-            || v.as_str().is_some_and(|s| {
-                matches!(
-                    s.trim().to_ascii_lowercase().as_str(),
-                    "true" | "1" | "on" | "yes"
-                )
-            })
-    })
 }
 
 fn audio(

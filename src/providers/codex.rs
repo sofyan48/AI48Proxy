@@ -7,7 +7,26 @@ use serde_json::{Value, json};
 #[path = "codex_cache.rs"]
 pub mod cache;
 #[path = "codex_ws.rs"]
-pub mod websocket;
+mod websocket_impl;
+pub mod websocket {
+    pub use super::websocket_impl::enabled;
+
+    pub fn prepare(
+        config: &crate::config::Config,
+        selection: &crate::home::client::Selection,
+        incoming: &http::HeaderMap,
+        mut body: serde_json::Value,
+    ) -> anyhow::Result<reqwest::Request> {
+        config.disable_image_generation.codex_tools(
+            &mut body,
+            &selection.model,
+            &selection.auth,
+            incoming,
+        );
+        config.disable_image_generation.filter(&mut body);
+        super::websocket_impl::prepare(config, selection, incoming, body)
+    }
+}
 
 pub(super) fn headers(headers: &mut HeaderMap, auth: &Value, oauth: bool) -> Result<()> {
     insert(
@@ -55,7 +74,7 @@ pub(super) fn forward_headers(headers: &mut HeaderMap, incoming: &HeaderMap) {
 
 /// Explicit Responses keys only: codex_executor_request.go:cacheHelperDoc reads
 /// req.Payload before FinalizePayloadDoc and sets Session-Id without inventing an ID.
-pub(super) fn prompt_cache_header(headers: &mut HeaderMap, request: &Value) -> Result<()> {
+pub(crate) fn prompt_cache_header(headers: &mut HeaderMap, request: &Value) -> Result<()> {
     if let Some(key) = request.get("prompt_cache_key").and_then(Value::as_str)
         && !key.is_empty()
     {
@@ -65,7 +84,7 @@ pub(super) fn prompt_cache_header(headers: &mut HeaderMap, request: &Value) -> R
 }
 
 /// Config defaults apply to OAuth only; explicit credential headers win last.
-pub(super) fn request_headers(
+pub(crate) fn request_headers(
     headers: &mut HeaderMap,
     incoming: &HeaderMap,
     config: &crate::config::Config,
@@ -99,7 +118,7 @@ pub(super) fn request_headers(
 
 /// Normalize native Responses input *before* user payload rules. Not a Chat translator.
 /// HTTP drops previous_response_id like Go; native WS preserves it before payload rules.
-/// Hosted tools pass through; automatic image-tool injection/replay is not implemented.
+/// Hosted-tool policy is applied by the gateway before this normalization.
 pub fn normalize_request(body: &mut Value, model: &str) -> Result<()> {
     let object = body
         .as_object_mut()

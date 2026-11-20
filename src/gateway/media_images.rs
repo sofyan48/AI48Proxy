@@ -155,6 +155,18 @@ pub fn response(value: Value, format: &str) -> Result<Value> {
         .filter(|n| *n > 0)
         .unwrap_or_else(|| chrono::Utc::now().timestamp());
     let mut out = json!({"created":created,"data":items});
+    for key in [
+        "size",
+        "quality",
+        "background",
+        "output_format",
+        "resolution",
+        "aspect_ratio",
+    ] {
+        if let Some(value) = value.get(key).filter(|v| v.is_string()) {
+            out[key] = value.clone();
+        }
+    }
     if let Some(usage) = value.get("usage").filter(|v| v.is_object()) {
         out["usage"] = usage.clone();
     }

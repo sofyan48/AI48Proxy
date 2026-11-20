@@ -247,6 +247,17 @@ pub(crate) fn prepare(
         );
         native.provider = "openai-compatibility".into();
     }
+    // Go injects only in Off mode; compact never gets automatic image tools.
+    if provider == "codex" && path != "/v1/responses/compact" {
+        config.disable_image_generation.codex_tools(
+            &mut body,
+            &selection.model,
+            &selection.auth,
+            headers,
+        );
+    }
+    // Go filters hosted image tools before provider payload overrides.
+    config.disable_image_generation.filter(&mut body);
     // Provider normalization and credential headers precede its single final payload barrier.
     let prepared = providers::prepare_context(
         config,

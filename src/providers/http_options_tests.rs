@@ -253,13 +253,16 @@ fn go_compact_uses_json_and_preserves_native_fields() {
 }
 
 #[test]
-fn continuation_never_silently_loses_history() {
-    let mut body =
+fn continuation_follows_go_delete_and_send_contract() {
+    // Go codex_executor_execute.go deletes previous_response_id for HTTP Codex.
+    let original =
         json!({"input":[{"role":"user","content":"next"}],"previous_response_id":"resp_prior"});
-    let original = body.clone();
-    assert!(codex::normalize_request(&mut body, "upstream").is_err());
-    assert_eq!(body, original);
-    assert!(codex::normalize_compact(&mut body, "upstream").is_err());
+    let mut body = original.clone();
+    codex::normalize_request(&mut body, "upstream").unwrap();
+    assert!(body.get("previous_response_id").is_none());
+    assert!(body.pointer("/input/0").is_some());
+    let mut compact = original;
+    assert!(codex::normalize_compact(&mut compact, "upstream").is_err());
 }
 
 #[test]

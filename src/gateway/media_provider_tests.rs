@@ -48,14 +48,91 @@ fn config_image_gate_matches_go_boolean_and_nested_v8_forms() {
         "disable-image-generation: true",
         "multimedia:\n  disable-image-generation: yes",
     ] {
-        assert!(images_disabled(&serde_yaml::from_str(raw).unwrap()));
+        let yaml = format!("credential-concurrency:\n  lifecycle-config-revision: 1\n{raw}");
+        assert_eq!(
+            Config::parse(yaml.as_bytes())
+                .unwrap()
+                .disable_image_generation,
+            crate::config::multimedia::ImageGenerationMode::All
+        );
     }
     for raw in [
         "disable-image-generation: false",
         "disable-image-generation: chat",
         "disable-image-generation: passthrough",
     ] {
-        assert!(!images_disabled(&serde_yaml::from_str(raw).unwrap()));
+        let yaml = format!("credential-concurrency:\n  lifecycle-config-revision: 1\n{raw}");
+        assert_ne!(
+            Config::parse(yaml.as_bytes())
+                .unwrap()
+                .disable_image_generation,
+            crate::config::multimedia::ImageGenerationMode::All
+        );
+    }
+}
+
+#[test]
+fn codex_direct_and_bridge_payload_barriers() {
+    let config = Config::parse(b"credential-concurrency:\n  lifecycle-config-revision: 1\ngpt-image-2-base-model: gpt-5.5\npayload:\n  override:\n    - models:\n        - name: '*'\n      params:\n        model: final-model\n  filter:\n    - models:\n        - name: '*'\n      params: [prompt]\n").unwrap();
+    let mut selected = selection();
+    selected.provider = "codex".into();
+    selected.model = "gpt-image-2".into();
+    let raw = b"--test\r\nContent-Disposition: form-data; name=\"prompt\"\r\n\r\nedit\r\n--test\r\nContent-Disposition: form-data; name=\"image\"; filename=\"a.png\"\r\nContent-Type: image/png\r\n\r\n\0\xff\r\n--test\r\nContent-Disposition: form-data; name=\"mask\"; filename=\"mask.png\"\r\nContent-Type: image/png\r\n\r\nmask\r\n--test--\r\n";
+    let form = multipart::Form::parse("multipart/form-data; boundary=test", raw).unwrap();
+    for direct in [true, false] {
+        selected.model = if direct {
+            "gpt-image-2"
+        } else {
+            "custom-image"
+        }
+        .into();
+        let original = json!({"model":"alias","prompt":"edit","response_format":"url"});
+        let mut payload =
+            provider::codex::payload(&config, &selected, &original, Some(&form), true).unwrap();
+        if direct {
+            assert_eq!(
+                payload["images"][0]["image_url"],
+                "data:image/png;base64,AP8="
+            );
+            assert_eq!(
+                payload["mask"]["image_url"],
+                "data:image/png;base64,bWFzaw=="
+            );
+        } else {
+            assert_eq!(payload["model"], "gpt-5.5");
+            assert_eq!(
+                payload["tools"][0]["input_image_mask"]["image_url"],
+                "data:image/png;base64,bWFzaw=="
+            );
+            assert_eq!(
+                payload["input"][0]["content"][1]["image_url"],
+                "data:image/png;base64,AP8="
+            );
+        }
+        let request = provider::prepare(
+            &config,
+            &selected,
+            "/v1/images/edits",
+            &HeaderMap::new(),
+            &mut payload,
+            &original,
+            None,
+        )
+        .unwrap()
+        .build()
+        .unwrap();
+        assert_eq!(
+            request.url().path(),
+            if direct {
+                "/tenant/v1/images/edits"
+            } else {
+                "/tenant/v1/responses"
+            }
+        );
+        let final_body: Value =
+            serde_json::from_slice(request.body().unwrap().as_bytes().unwrap()).unwrap();
+        assert_eq!(final_body["model"], "final-model");
+        assert!(final_body.get("prompt").is_none());
     }
 }
 
@@ -79,6 +156,79 @@ fn multipart_filtered_files_are_not_restored() {
             .images()
             .is_empty()
     );
+}
+
+#[test]
+fn image_tool_policy_applies_to_http_and_native_ws_before_overrides() {
+    use crate::gateway::upstream;
+    let mut selected = selection();
+    selected.provider = "codex".into();
+    selected.model = "gpt-5.4".into();
+    for mode in ["false", "true", "chat", "passthrough"] {
+        let yaml = format!(
+            "credential-concurrency:\n  lifecycle-config-revision: 1\ndisable-image-generation: {mode}\n"
+        );
+        let config = Config::parse(yaml.as_bytes()).unwrap();
+        let body = json!({"model":"alias","input":"hello","tools":[{"type":"image_generation"}],"tool_choice":{"type":"image_generation"}});
+        let http = upstream::prepare(
+            &config,
+            &selected,
+            "/v1/responses",
+            &HeaderMap::new(),
+            body.clone(),
+            false,
+        )
+        .unwrap()
+        .request
+        .build()
+        .unwrap();
+        let ws = crate::providers::codex::websocket::prepare(
+            &config,
+            &selected,
+            &HeaderMap::new(),
+            body,
+        )
+        .unwrap();
+        for request in [http, ws] {
+            let payload: Value =
+                serde_json::from_slice(request.body().unwrap().as_bytes().unwrap()).unwrap();
+            let stripped = matches!(mode, "true" | "chat");
+            assert_eq!(payload["tools"].as_array().unwrap().is_empty(), stripped);
+            assert_eq!(payload.get("tool_choice").is_none(), stripped);
+        }
+        let body = json!({"model":"alias","input":"hello"});
+        let request = upstream::prepare(
+            &config,
+            &selected,
+            "/v1/responses",
+            &HeaderMap::new(),
+            body,
+            false,
+        )
+        .unwrap()
+        .request
+        .build()
+        .unwrap();
+        let payload: Value =
+            serde_json::from_slice(request.body().unwrap().as_bytes().unwrap()).unwrap();
+        assert_eq!(payload.get("tools").is_some(), mode == "false");
+    }
+    let config = Config::parse(b"credential-concurrency:\n  lifecycle-config-revision: 1\ndisable-image-generation: chat\npayload:\n  override:\n    - models:\n        - name: '*'\n      params:\n        tools: [{type: image_generation}]\n").unwrap();
+    let request = upstream::prepare(
+        &config,
+        &selected,
+        "/v1/chat/completions",
+        &HeaderMap::new(),
+        json!({"model":"alias","messages":[{"role":"user","content":"draw"}]}),
+        false,
+    )
+    .unwrap()
+    .request
+    .build()
+    .unwrap();
+    let payload: Value =
+        serde_json::from_slice(request.body().unwrap().as_bytes().unwrap()).unwrap();
+    assert_eq!(payload["tools"][0]["type"], "image_generation");
 }
 
 #[test]

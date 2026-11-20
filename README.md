@@ -233,6 +233,7 @@ Home configuration and upstream providers before production rollout.
 
 - [AI48Home integration](docs/home-compatibility.md)
 - [Upstream/provider synchronization](docs/upstream-provider-sync.md)
+- [Configuration synchronization matrix](docs/config-sync-matrix.md)
 - [Provider guide](docs/provider.md)
 - [Codex and OpenAI-compatible execution](docs/codex-openai-parity.md)
 - [Claude request and rate-limit handling](docs/claude_limits_wiring.md)

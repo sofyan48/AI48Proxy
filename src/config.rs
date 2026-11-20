@@ -40,6 +40,19 @@ pub struct Config {
     pub host: String,
     pub port: u16,
     pub request_retry: u32,
+    /// Home runtime metadata retained for worker observability and policy decisions.
+    pub home_scheduler_protocol: u32,
+    pub usage_statistics_enabled: bool,
+    pub disable_cooling: bool,
+    pub debug: bool,
+    pub logging_to_file: bool,
+    pub logs_max_total_size_mb: usize,
+    pub error_logs_max_files: usize,
+    pub auth_auto_refresh_workers: usize,
+    pub trusted_proxies: Vec<String>,
+    pub quota_exceeded_antigravity_credits: bool,
+    pub quota_exceeded_switch_preview_model: bool,
+    pub quota_exceeded_switch_project: bool,
     /// Opt-in Home request-log forwarding; raw bodies are never captured.
     pub request_log: bool,
     pub max_retry_credentials: usize,
@@ -109,6 +122,34 @@ impl Config {
         };
         let request_retry = u32::try_from(integer(&raw, "request-retry", 0)?)
             .context("request-retry exceeds u32")?;
+        let home_scheduler_protocol = u32::try_from(integer(&raw, "home-scheduler-protocol", 0)?)
+            .context("home-scheduler-protocol exceeds u32")?;
+        let usage_statistics_enabled = boolean(&raw, "usage-statistics-enabled")?;
+        let disable_cooling = boolean(&raw, "disable-cooling")?;
+        let debug = boolean(&raw, "debug")?;
+        let logging_to_file = boolean(&raw, "logging-to-file")?;
+        let logs_max_total_size_mb = integer(&raw, "logs-max-total-size-mb", 0)?;
+        let error_logs_max_files = integer(&raw, "error-logs-max-files", 0)?;
+        let auth_auto_refresh_workers = integer(&raw, "auth-auto-refresh-workers", 0)?;
+        let trusted_proxies = field(&raw, "trusted-proxies")
+            .map(|value| {
+                value
+                    .as_sequence()
+                    .context("trusted-proxies must be a sequence")?
+                    .iter()
+                    .map(|item| {
+                        item.as_str()
+                            .map(str::to_owned)
+                            .context("trusted-proxies entries must be strings")
+                    })
+                    .collect::<Result<Vec<_>>>()
+            })
+            .transpose()?
+            .unwrap_or_default();
+        let quota = section(&raw, "quota-exceeded")?;
+        let quota_exceeded_antigravity_credits = boolean(quota, "antigravity-credits")?;
+        let quota_exceeded_switch_preview_model = boolean(quota, "switch-preview-model")?;
+        let quota_exceeded_switch_project = boolean(quota, "switch-project")?;
         let max_retry_credentials = integer(&raw, "max-retry-credentials", 0)?;
         // Go's max-retry-interval is integer seconds, not a duration string.
         let max_retry_interval =
@@ -169,6 +210,18 @@ impl Config {
             host,
             port,
             request_retry,
+            home_scheduler_protocol,
+            usage_statistics_enabled,
+            disable_cooling,
+            debug,
+            logging_to_file,
+            logs_max_total_size_mb,
+            error_logs_max_files,
+            auth_auto_refresh_workers,
+            trusted_proxies,
+            quota_exceeded_antigravity_credits,
+            quota_exceeded_switch_preview_model,
+            quota_exceeded_switch_project,
             request_log,
             max_retry_credentials,
             max_retry_interval,

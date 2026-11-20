@@ -21,12 +21,14 @@ Home owns credential refresh and persistent credential identity. The generation 
 | `codex` | Responses HTTP/SSE, Chat bridge, compact, downstream Responses WebSocket, images | SIWC and local compaction are unsupported; native upstream WS requires opt-in |
 | `claude` | Messages JSON/SSE, Chat/Messages translation, API-key token counting | OAuth requires Home-prepared identity and supports only a focused CLI wire policy |
 | `gemini` | Native Gemini generation and streaming; focused Chat bridge | API key required; not a general translator for every Gemini API |
+| `gemini-interactions` | Home provider identity is recognized, but specialized Interactions execution is fail-closed | The full `/interactions` request/response/usage contract is not enabled yet |
 | `vertex`, `vertexai` | Native Gemini or OpenAPI Chat selected from Home routing metadata | Google OpenAPI endpoints require an access token; Imagen is unsupported |
 | `antigravity` | Native Gemini envelope and focused Chat bridge, JSON/SSE response unwrapping | Home access token and `metadata.project_id` required; restricted tools/replay |
 | `xai` | Native Responses HTTP/SSE, Chat-to-Responses bridge, images, speech and video | Text requires the restricted Responses subset; no xAI WebSockets or isolated composer conversations |
-| `kimi`, `kimi-ai` | Native Chat and Responses text JSON/SSE | No tools/tool history, Claude delegation or provider-specific thinking replay |
-| `meta` | Native Responses HTTP/SSE and Chat-to-Responses bridge | Requires a pre-minted usable key; no DCA-only key minting or subscription tool attestation |
-| `gemini-cli`, `qwen`, `iflow`, `kiro`, `github-copilot` | No native generation executor | Explicitly rejected by the generation gateway |
+| `kimi`, `kimi-ai` | Native Chat and Responses text JSON/SSE with basic function tools/tool history | Provider-specific thinking replay, Claude delegation and advanced continuation are unsupported |
+| `meta` | Native Responses HTTP/SSE, Chat-to-Responses bridge and Home-mediated DCA refresh | Subscription tool attestation and advanced reasoning replay are unsupported |
+
+| `gemini-cli`, `aistudio`, `qwen`, `iflow`, `kiro`, `github-copilot` | No native generation executor | Explicitly rejected; Gemini CLI/AI Studio require skipped plugin/relay subsystems |
 
 ### Caller routes and translation
 
@@ -44,7 +46,7 @@ Cross-format support is intentionally asymmetric. Chat-to-Gemini is implemented,
 ## xAI, Kimi and Meta text restrictions
 
 The active gateway accepts only `/v1/chat/completions` and `/v1/responses` for
-these providers. Claude Messages and Gemini sources fail closed rather than being
+xAI, Kimi and Meta. Claude Messages and Gemini sources fail closed rather than being
 delegated through unimplemented replay bridges. Compact and legacy Completions
 are unsupported. xAI and Meta translate Chat to Responses, force upstream SSE and
 collect a completed response for buffered callers; Kimi uses native Chat or Responses.
@@ -56,13 +58,14 @@ collect a completed response for buffered callers; Kimi uses native Chat or Resp
   caller-hosted/custom/namespace tools, legacy declarations, schema references/unions,
   or the `web_search` alias requiring name restoration. Meta adds its fixed Muse
   namespace for nonempty accepted tools; this is not general namespace support.
-- Kimi rejects tools, function declarations, tool-call/result history and Responses
-  function-item replay. Thinking suffixes requiring provider translation reject.
+- Kimi supports basic function declarations, tool calls/results and Responses
+  function items. Provider-specific thinking replay, Claude delegation and thinking
+  suffixes requiring provider translation still reject.
   Kimi normalizes coding-model aliases; `kimi-ai` selects the `api.kimi.ai/coding/v1`
   default rather than `api.kimi.com/coding/v1`.
-- Meta requires a usable non-`dca:` credential supplied by Home. The worker does not
-  pre-mint API keys from DCA-only material. Advanced reasoning replay and subscription
-  tool attestation remain unsupported.
+- Meta API-key credentials are supplied by Home. DCA-only credentials use Home's
+  refresh/mint flow before retry; the worker never calls Meta mint endpoints directly.
+  Advanced reasoning replay and subscription tool attestation remain unsupported.
 - Provider normalization precedes payload rules; post-rule validation rejects
   unsupported effective shapes instead of restoring removed fields.
 
@@ -116,10 +119,11 @@ Codex uses direct Images routes for recognized image models, otherwise a Respons
 xAI image `stream: true` returns one `image_generation.completed` or
 `image_edit.completed` SSE event per completed image, without a DONE sentinel;
 this is completed-output adaptation, not incremental upstream image streaming.
-Compatible and Codex image SSE remain explicitly rejected. The image-generation disable policy gates standalone image routes and hosted image tools; speech is separate. Media JSON responses are bounded to 64 MiB, and speech request bodies have a 1 MiB cap in addition to applicable configuration. An implemented transport does not guarantee an upstream supports a particular image model, voice, or option.
+Compatible and Codex image SSE are streamed when the upstream returns a validated
+  SSE response; incremental partial-image semantics remain provider-dependent. The image-generation disable policy gates standalone image routes and hosted image tools; speech is separate. Media JSON responses are bounded to 64 MiB, and speech request bodies have a 1 MiB cap in addition to applicable configuration. An implemented transport does not guarantee an upstream supports a particular image model, voice, or option.
 
-Video creation/editing/extension requires `application/json`; multipart/forms and
-video streaming are unsupported. The facade maps supported `sora-2` aliases to
+Video creation/editing/extension accepts JSON and multipart reference-media forms;
+video streaming remains unsupported. The facade maps supported `sora-2` aliases to
 xAI video, not an OpenAI video executor. Native video models are the supported
 `grok-imagine-video` and 1.5 variants in `src/providers/media_video.rs`.
 
@@ -158,4 +162,4 @@ cargo test --locked --all-targets
 
 Automated fixtures and loopback servers do not validate real credentials, current provider entitlement, production Home enrollment, or live-provider behavior. No live-provider validation was performed for this documentation update.
 
-See [Codex and OpenAI-compatible execution](codex-openai-parity.md) and [Claude execution and rate limits](claude_limits_wiring.md) for detailed boundaries.
+See [Codex and OpenAI-compatible execution](codex-openai-parity.md), [Claude execution and rate limits](claude_limits_wiring.md), and [Home upstream synchronization](upstream-provider-sync.md) for detailed boundaries.

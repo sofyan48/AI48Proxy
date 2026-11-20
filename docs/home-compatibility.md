@@ -230,7 +230,8 @@ These are custom RESP arguments, not generic Redis queue semantics.
 | Shared KV | Typed operations in `src/home/kv.rs` | Home-backed state for supported consumers, no local fallback |
 
 Application logs have bounded forwarding. Home plugin synchronization contracts
-do not imply native plugin execution in this worker. Workers do not perform
+do not imply native plugin execution in this worker. `gemini-cli` and `aistudio`
+are intentionally skipped. Workers do not perform
 Home-to-Home control operations or request Home node secrets.
 
 Dispatch includes requested model, downstream authorization, concurrency protocol,

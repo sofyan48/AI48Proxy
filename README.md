@@ -30,10 +30,13 @@ usage outbox.
 - OpenAI-compatible custom upstreams, Codex, Claude, Gemini, Vertex,
   Antigravity, xAI, Kimi (including `kimi-ai`) and Meta text execution using
   Home-selected credentials, within provider-specific format/tool restrictions.
+  `gemini-cli` and `aistudio` are intentionally skipped because they require
+  CLIProxyAPI's plugin host or AI Studio relay.
 - Incremental SSE translation, bounded WebSocket sessions and cancellation-aware
   execution accounting.
 - Image generation/editing for supported providers, xAI image completion SSE,
-  xAI speech, and JSON-based xAI video jobs with an OpenAI-style video facade
+  Codex/compatible image SSE when the upstream emits a validated SSE stream,
+  xAI speech, and JSON/multipart xAI video jobs with an OpenAI-style video facade
   and Home-KV credential-bound retrieval.
 - Home configuration subscriptions, immutable configuration snapshots, payload
   rules, request-scoped error actions, supported reasoning controls, pre-header
@@ -206,12 +209,12 @@ Upstream errors are sanitized because provider messages can contain sensitive in
 
 - Native plugin execution and Gemini CLI are unavailable; Home snapshots with `plugins.enabled: true` are rejected during worker registration.
   Devin is intentionally out of scope and is not supported.
-- Native WebSocket proxy transport, overlapping turns, advanced steering, xAI
+- Native upstream WebSocket proxy transport, full duplex steering/recovery, xAI
   WebSockets, advanced Claude/Antigravity signed replay and complete provider-specific
   schema behavior remain unimplemented or limited.
 - xAI, Kimi and Meta still reject unsupported source formats, advanced replay and
-  continuation/compaction. Meta DCA credentials are refreshed through Home before use.
-  Native plugin execution remains unavailable. See the provider guide for exact subsets.
+  continuation/compaction. Kimi basic tool history is supported. Meta DCA credentials
+  are refreshed through Home before use. See the provider guide for exact subsets.
 - Video is xAI-only; compatible/Codex image SSE is available only when the upstream returns a validated SSE stream.
 - Planned rebalance moves only the replacement connection, not active execution
   ownership. Releases and usage remain origin-bound during the process lifetime;
@@ -229,6 +232,7 @@ Home configuration and upstream providers before production rollout.
 ## Documentation
 
 - [AI48Home integration](docs/home-compatibility.md)
+- [Upstream/provider synchronization](docs/upstream-provider-sync.md)
 - [Provider guide](docs/provider.md)
 - [Codex and OpenAI-compatible execution](docs/codex-openai-parity.md)
 - [Claude request and rate-limit handling](docs/claude_limits_wiring.md)

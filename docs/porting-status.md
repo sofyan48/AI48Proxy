@@ -18,8 +18,8 @@ configuration is production-ready.
 | OpenAI-compatible upstreams | Home-selected custom bases and credentials, Chat execution and Responses bridges |
 | Codex | HTTP Responses, constrained WebSocket sessions, HTTP scoped cache identity before payload rules and supported image execution |
 | Claude | Messages, Chat translation, focused OAuth wire preparation, final-body attribution signing and HTTP failure classification |
-| Google-format upstreams | Gemini, Vertex native/OpenAPI routing, Antigravity envelopes and supported function-tool translation |
-| New text providers | xAI and Meta native Responses/Chat bridges; Kimi and `kimi-ai` native Chat/Responses; unsupported sources/tools/replay fail closed |
+| Google-format upstreams | Gemini, recognized Gemini Interactions identity, Vertex native/OpenAPI routing, Antigravity envelopes and supported function-tool translation |
+| New text providers | xAI and Meta native Responses/Chat bridges; Kimi and `kimi-ai` native Chat/Responses with basic tools/history; unsupported sources/replay fail closed |
 | Media | Supported images, xAI image completion SSE, xAI speech and JSON/multipart xAI video generation/edit/extension/retrieval with OpenAI-style facade and Home-KV credential binding |
 | Media lifecycle | Shared Home-owned refresh, eligible retry, request-scoped actions, cancellation and release-before-redispatch; video retrieval stays credential-pinned |
 | Runtime controls | Payload rules, bounded original-byte request-scoped error matching, reasoning controls, response filtering, pre-header SSE keepalives, shutdown bounds and image-generation modes |
@@ -42,18 +42,19 @@ account details do not belong in public documentation.
 ## Remaining work
 
 - Native plugin execution and Gemini CLI execution. Home snapshots with
-  `plugins.enabled: true` are rejected because this worker does not yet have the
-  plugin ABI/runtime host.
+  `plugins.enabled: true` are rejected; `gemini-cli` and `aistudio` remain skipped
+  because their plugin/relay subsystems are not enabled in this worker.
 - General realtime workflows, xAI WebSockets, video streaming and non-xAI video
-  execution.
-- WebSocket proxy transport, overlapping turns, advanced steering and recovery.
+  execution; `gemini-interactions` is recognized but its specialized executor is
+  still fail-closed.
+- WebSocket proxy transport, full duplex steering and automatic recovery.
 - Advanced Claude helper/workload profiles, tool alias reversal, continuity/date
   pinning and signed reasoning replay.
 - Advanced Antigravity signed replay, complex schemas, incremental tool arguments
   and multimedia behavior.
 - Remaining provider-specific controls, specialized Vertex operations and
   cross-format conversions.
-- Broader xAI/Kimi/Meta source bridges, advanced tools/reasoning replay and stateful
+- Broader xAI/Kimi/Meta source bridges, advanced reasoning replay and stateful
   continuation/compaction; Meta subscription attestation.
 - Deployment qualification of live handoff/rollback, negotiated latency telemetry,
   keepalive/error/disconnect behavior, media binding expiry and billing dimensions.

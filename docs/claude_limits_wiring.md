@@ -1,78 +1,119 @@
-# Claude rate-limit compatibility and integration status
+# Claude execution and rate-limit reference
 
-## Current integration (2026-11-20)
+AI48Proxy executes Claude Messages requests using Home-selected credentials. This guide covers active request preparation, HTTP rejection classification, caller-visible retry metadata, and the boundaries of Home scheduling feedback. The filename is retained for existing links; the classifier is wired, not a pending integration step.
 
-The provider module is now active through `providers.rs`. HTTP rejections in
-`gateway/routes.rs::observe_result` classify bounded errors, select the applicable
-reset, and expose a validated, rounded-up `Retry-After` to downstream callers.
-Fast-mode entitlement refusals use existing Home `request_scoped` feedback and do
-not rotate credentials. Ordinary 429 responses are returned as `rate_limit_error`;
-raw upstream messages and arbitrary headers remain withheld.
+Claude compatibility includes implementation adapted from CLIProxyAPI, including rate-limit selection and focused CLI wire behavior. AI48Proxy supports the subsets described here, not every Claude executor feature.
 
-The initial HTTP rejection path is shared by streaming and buffered requests.
-Terminal SSE classification still uses the existing effective-status parser, not
-this reset-header classifier. Home does not consume generic Claude reset/scope
-fields; model/credential scope is diagnostic only and does not establish a new
-cross-repository scheduling contract. No cooldown or account state is reset.
+## Messages and credential requirements
 
-Validation: full Cargo tests and strict Clippy pass, including a real loopback
-HTTP/mTLS-Home feedback test for fractional Retry-After and sanitized attribution.
-Live Haiku 5.5 cannot currently reach upstream: Home returns `auth_not_found` and
-read-only database inspection shows both Claude credentials are soft-deleted.
-Codex `gpt-6-luna` still completes live SSE with usage and `[DONE]`.
+`POST /v1/messages` supports native Messages JSON/SSE. Supported Chat callers are translated through the gateway; this does not imply complete fidelity for all Claude content blocks or advanced tools.
 
-The sections below preserve the original helper audit; references to pending
-HTTP wiring describe the pre-integration state.
+Authentication prefers `attributes.api_key` over Home access-token metadata. OAuth tokens are identified by the Claude OAuth token marker. First-party API keys use `x-api-key`; OAuth, token-only, and custom-base paths use Bearer as determined by credential resolution. The default endpoint is `https://api.anthropic.com`, with trusted `attributes.base_url` override support.
 
-## Delivery boundary
+OAuth additionally requires persistent identity prepared by Home:
 
-`claude_limits.rs` and `claude_limits_tests.rs` are new, intentionally unwired provider-scoped files. No gateway, existing provider, Go source, dependency manifest, or scheduler changes are part of this delivery. The helper performs no I/O, retries, rotation, quota modification, sleeping, or logging. Its output retains no upstream text or headers.
+- `metadata.account_uuid` or `metadata.accountUuid`;
+- exactly one canonical `metadata.claude_device_ids` entry: 64 lowercase hexadecimal characters.
 
-## Verified source findings
+The worker does not generate persistent account/device identity. It constructs request metadata from that Home identity and a validated caller/existing session UUID or a new session UUID. Caller identity cannot replace the selected credential identity during built-in preparation.
 
-- Go `internal/runtime/executor/claude_executor_request.go:889–918` classifies HTTP 429 as credential-scoped only when unified/shared quota headers explicitly reject and model-level cooling is not enabled. Otherwise it distinguishes fast-mode credit entitlement (request-scoped) from ordinary model-scoped rate limiting. A bare 429 or `rate_limit_error` does **not** establish account-wide exhaustion.
-- Go `claude_executor_execute.go`, `claude_executor_stream.go`, and `claude_executor_tokens.go` invoke the same classifier on non-success responses, including error-body decode failures. Fast requests also have specialized direct-response/wrapper handling in `claude_executor_fast_error.go`; this Rust helper does not implement those wrappers or their control flow.
-- Go `helps/claude_ratelimit.go` chooses the latest applicable future reset across Retry-After and rejected 5h/7d/7d_oi/unified windows. Allowed shared windows do not contribute their resets. It accepts positive fractional seconds, Unix reset timestamps, RFC3339 and HTTP dates; discards expired/nonfinite/over-seven-days-plus-one-hour candidates; excludes matching overage billing boundaries.
-- Overage/Fable-only rejection with healthy/unevaluated shared windows must not become an account-wide seven-day cooldown. The helper ports Go's narrow omitted-status/utilization exceptions rather than treating all overage signals as an exemption.
-- The exact three per-minute messages can suppress an otherwise unclassified unified reset only with no nonempty quota-status entry and exactly one usable Retry-After value. Substrings, combined messages, repeated Retry-After, or any declared quota status retain conservative reset selection.
-- Rust `src/gateway/routes.rs::observe_result` currently parses only integer Retry-After for Claude diagnostic output and allowlists `error.type`; it does not implement the shared/model/entitlement classification or reset-header selection above.
-- Rust `src/gateway/diagnostics.rs::event_failure` already maps SSE `rate_limit_error` to effective 429. This is existing compatibility, not a missing feature.
-- Rust `src/reporting/usage.rs::upstream_failure` currently serializes provider-specific retry hints for Codex and Antigravity, not Claude. Returning a parsed duration alone does not propagate it into Home's cooldown policy.
+## Active wire policy
 
-These observations do not diagnose the reported live Haiku 5.5 rejection. An upstream 429 `rate_limit_error` is real upstream refusal; without applicable response headers there is no evidence identifying its quota window or scope, or proving that client identity/beta changes would resolve it. No live request or raw upstream log inspection was performed.
+The provider validates Messages input, normalizes incompatible sampling/thinking combinations for non-confirmed-native requests, handles beta headers/body betas, and prepares focused OAuth CLI headers and body policy. OAuth supports `cloak_mode` values `auto`, `always`, and `never`, plus the focused strict-mode behavior. Confirmed native CLI requests have a separate preservation path; a user-agent alone is not a general native-feature capability guarantee.
 
-## API
+For transformed OAuth requests, implemented behavior includes CLI identity/billing system blocks, model-dependent system relocation, date reminder placement, cache-control normalization, and the supported thinking context-management edit. Custom function tool declarations retain names rather than using reversible aliases. Foreign tool-use signature metadata is removed during non-native normalization rather than inventing valid Anthropic provenance.
+
+Configured payload rules run after built-in preparation. OAuth CCH signing operates over final serialized bytes and does not perform another business-payload normalization pass.
+
+Known boundaries:
+
+- OAuth extended `thread`, `fallbacks`, `safeguards`, and `diagnostics` handling, server/advanced tool declarations, and reversible tool aliasing are unsupported.
+- Focused cloaking does not implement helper/subagent/probe profiles, advisor history, Fable/Mythos profiles, arbitrary fingerprint profiles, sensitive-word/pattern replacement, or cached user-ID transformations. Nonempty unsupported settings and recognized unsupported request shapes reject in their applicable paths.
+- Arbitrary context-management edits and general thinking-signature/replay repair are not implemented.
+- `cloak_mode: never` and confirmed-native preservation are not substitutes for implementing unsupported provider features or obtaining provider entitlement.
+- `POST /v1/messages/count_tokens` requires a non-OAuth Claude API key and native Messages input. It removes generation-only fields before payload rules, calls the upstream count route, and does not provide a local token estimate or OAuth count normalization.
+
+## HTTP failure handling
+
+The generation gateway's shared non-success HTTP observation path is used for both buffered requests and initial streaming rejections. It captures upstream status, reads bounded error content, classifies Claude reset/scope information, and preserves sanitized execution attribution before retry or refresh can discard a response.
+
+`src/providers/claude_limits.rs` exports:
 
 ```rust
-classify(status, &headers, &body_bytes, chrono::Utc::now(), model_level_cooling)
+classify(status, &headers, &body_bytes, now, model_level_cooling)
     -> ClaudeLimit { status, scope, retry_after }
 ```
 
-Call only after selecting Claude as the upstream provider. For a decoded SSE error, pass its effective error status (429 for `rate_limit_error`), not the HTTP 200 stream status. HTTP 4xx/5xx can carry retry hints without being classified as rate limited. Non-error statuses never acquire retry hints.
+The helper performs no I/O, sleeping, rotation, retries, quota changes, or logging. Its result retains no raw provider message or headers. The active gateway wrapper currently passes `model_level_cooling = false`; the helper parameter is not an exposed guarantee that Home scheduling policy has changed.
 
-`LimitScope::{Model, Credential, Request}` describes observed failure scope, **not permission to retry**. `None` means no rate-limit scope inferred. Missing/invalid reset information returns `None`; do not convert that into an immediate retry.
+### Scope classification
 
-### Explicit difference from Go
+| Observation | Classifier scope |
+| --- | --- |
+| Non-429 status | `None`; an HTTP error may still have a retry hint |
+| 429 with explicit shared/unified quota rejection, unless model-level cooling is requested | `Credential` |
+| 429 fast-mode credit/entitlement refusal without an overriding shared rejection | `Request` |
+| Other 429, including a bare `rate_limit_error` | `Model` |
 
-Go adds a one-time random positive 1–30 second scheduling grace to its selected duration. This helper returns the deterministic base duration without jitter. The future scheduling owner should add nonnegative bounded jitter once per failure if Go timing parity is required, cache that result, and never shorten the applicable deadline. There is no scheduler or randomness dependency here.
+A bare 429 does not prove account-wide exhaustion. Shared rejection outranks a body mentioning fast mode. Narrow overage/Fable exceptions prevent an overage-only rejection with healthy or qualifying unevaluated shared windows from being mistaken for exhausted shared quota.
 
-## Wiring instructions (not applied)
+These scopes describe evidence about a failure, not permission to retry. Fast-mode refusal is not silently downgraded, rewritten into a slower request, or made successful.
 
-1. Declare the module next to the other providers in `src/providers.rs`:
+### Reset selection
 
-   ```rust
-   #[path = "providers/claude_limits.rs"]
-   pub mod claude_limits;
-   ```
+For HTTP 4xx/5xx, the helper selects the latest applicable future reset from:
 
-   This also includes `claude_limits_tests.rs` in normal Cargo unit-test discovery.
+- positive numeric `Retry-After`, including fractional seconds, or a supported date form;
+- rejected 5-hour, 7-day, and 7-day-overage reset windows;
+- the unified reset when applicable.
 
-2. In the shared Claude non-success response observation path, preserve response headers before consuming the body. Classify the original bounded error bytes using the upstream HTTP status and a single captured clock value. Apply this before any refresh/retry path discards the response. Do not classify downstream translation/transport errors as upstream quota failures.
-3. Use the same helper for buffered and streaming HTTP rejection. For a terminal SSE error, retain the initial response headers and classify its decoded error envelope with the effective status. Never replay a request after stream/response commitment, or turn an upstream error into success.
-4. Preserve the original status, body, and caller-visible retry headers. Do not rewrite `speed`, downgrade the model, remove entitlement requirements, manufacture credits, or enable retries on the strength of this helper. Request scope must prevent unrelated credentials from being penalized; it must not silently bypass the refused request.
-5. Keep model vs. credential cooldown ownership in Home. Verify a supported CPA/Home reporting contract before propagating Claude duration/scope: the existing Rust usage serializer does not have that contract. Do not invent `fail.body` JSON fields or assume Home consumes generic `retry_after`. Carry metadata through the existing lifecycle without leaking raw bodies/headers. Respect configured request-retry/max-wait policy and cancellation.
-6. Add integration tests at that wiring boundary: buffered rejection, initial streaming rejection, terminal SSE error, no replay after commitment, no cross-provider classification, and correct sanitized lifecycle attribution. Unit tests in this delivery validate the helper only, not gateway/scheduler integration.
+Reset timestamps accept Unix seconds, RFC3339, and supported HTTP-date forms. Expired, nonfinite, nonpositive, and greater-than-seven-days-plus-one-hour delays are discarded. Allowed shared windows do not contribute their reset timestamps. Matching overage billing boundaries and qualifying overage-only signals are excluded according to the classifier's narrow conditions.
 
-## Validation
+The three exact recognized per-minute rate-limit messages can suppress an otherwise unclassified unified reset only when no nonempty quota-status entry exists and exactly one usable `Retry-After` is present. Substring matches, combined messages, repeated retry headers, or declared quota status do not qualify.
 
-Formatted both new Rust files with Rustfmt. Compiled the deliberately unwired helper directly using `rustc --test` and the project's already-built `chrono`, `http`, and `serde_json` libraries; all 11 synthetic unit tests passed. No Go code was changed or Go tests run. No live upstream requests were made.
+Missing or invalid reset evidence returns `None`, not an immediate-retry instruction. The helper returns a deterministic base duration without CLIProxyAPI's randomized scheduling grace; it does not add or own scheduler jitter.
+
+## Downstream response and Home feedback
+
+For an initial Claude HTTP rejection, a selected duration is rounded up to whole seconds and placed in `Retry-After`. The rejection response preserves the HTTP failure status but returns sanitized messages:
+
+- 429: `rate_limit_error`;
+- Claude 529: `overloaded_error`;
+- other upstream rejection: `upstream_error`.
+
+Only validated retry metadata is forwarded; arbitrary upstream headers and raw provider text are withheld. Diagnostic logging uses bounded categories/scope, not secrets or raw error bodies.
+
+Fast-entitlement request scope uses the existing Home `request_scoped` failure code when a configured execution-error rule has not supplied another action. Such request-scoped failures do not trigger the ordinary credential-rotation retry path. Configured execution rules still have their own precedence and behavior.
+
+Model and credential scopes are diagnostic here: the worker does not serialize a generic Claude scope/reset contract into Home feedback or directly set/reset account cooldowns. Home remains the scheduling owner. A caller-visible `Retry-After` therefore does not prove Home adopted that exact deadline. Provider-specific retry hints serialized for other providers must not be assumed to apply to Claude.
+
+## Streaming boundary
+
+Initial HTTP rejection is classified before downstream SSE commitment, just like buffered rejection. Once a successful HTTP stream starts, terminal SSE errors use the existing event/effective-status parser: `rate_limit_error` is recognized as effective 429 for failure accounting.
+
+Terminal SSE errors do **not** currently run through the full reset-header classifier with retained initial headers. They must not be described as having the same reset/scope handling as an initial HTTP 429. An interrupted or terminal-error stream is not successful, and no committed response can be replayed safely merely because a reset was parsed.
+
+## Diagnosing a refusal
+
+Distinguish Home dispatch failure from provider rejection. For example, `auth_not_found` means Home could not select an eligible credential; it is not evidence that Anthropic rejected a request. An actual upstream 429 without applicable headers does not identify a quota window, establish account-wide exhaustion, or prove that changing client identity/betas would fix the refusal.
+
+Check Home credential availability, selected model access, OAuth identity requirements, and sanitized failure categories separately. Do not place tokens, raw headers, account identifiers, or provider bodies in diagnostic reports. Historical credential availability and previous live results are not current support guarantees.
+
+## Automated coverage and validation boundary
+
+Relevant source and test areas:
+
+- `src/providers/claude.rs`, `claude_wire*.rs`, `claude_betas.rs`, and `claude_signing*.rs`: request preparation, identity/cache policy, betas, signing, and unsupported shapes.
+- `src/providers/claude_limits_tests.rs`: deterministic synthetic classification/reset cases, including overage, per-minute exceptions, invalid dates, and fractional retry delays.
+- `src/gateway/routes.rs` and `rejection.rs`: active HTTP classification, sanitized rejection, and retry-header validation.
+- `src/gateway/feedback_tests.rs`: loopback HTTP and simulated mTLS Home feedback, including fractional reset handling and sanitized attribution.
+- `src/gateway/diagnostics.rs` and usage tests: SSE effective-status and accounting behavior.
+
+Run from the repository root:
+
+```sh
+cargo test --locked claude
+cargo test --locked --all-targets
+```
+
+Unit fixtures establish helper behavior; local integration tests exercise wiring without contacting Anthropic. Neither establishes live credential validity, model entitlement, production Home behavior, or exhaustive provider compatibility. No live Claude requests or database inspection were performed for this documentation update.

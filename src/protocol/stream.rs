@@ -133,6 +133,13 @@ impl StreamTranslator {
                             self.chunk(out, json!({"content":text}), Value::Null);
                         }
                     }
+                    "thinking" => {
+                        if let Some(text) = block["thinking"].as_str().filter(|s| !s.is_empty()) {
+                            self.chunk(out, json!({"reasoning_content":text}), Value::Null);
+                        }
+                    }
+                    // Redacted thinking is opaque and never exposed as reasoning text.
+                    "redacted_thinking" => (),
                     "tool_use" => {
                         let tool = self.blocks.len() as u64;
                         self.blocks.insert(index, tool);
@@ -147,6 +154,14 @@ impl StreamTranslator {
                     "text_delta" => {
                         self.chunk(out, json!({"content":string(&delta["text"])?}), Value::Null)
                     }
+                    "thinking_delta" => {
+                        let text = string(&delta["thinking"])?;
+                        if !text.is_empty() {
+                            self.chunk(out, json!({"reasoning_content":text}), Value::Null);
+                        }
+                    }
+                    // Thinking signatures only matter for Claude-native replay.
+                    "signature_delta" => (),
                     "input_json_delta" => {
                         let index = self
                             .blocks
@@ -169,8 +184,9 @@ impl StreamTranslator {
                 if let Some(reason) = v.pointer("/delta/stop_reason").and_then(Value::as_str) {
                     let reason = match reason {
                         "end_turn" | "stop_sequence" => "stop",
-                        "max_tokens" => "length",
+                        "max_tokens" | "model_context_window_exceeded" => "length",
                         "tool_use" => "tool_calls",
+                        "refusal" | "sensitive" => "content_filter",
                         _ => return Err(unsupported("Claude stream stop reason")),
                     };
                     self.finished_reason = true;

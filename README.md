@@ -1,106 +1,177 @@
 # AI48Proxy
 
-Rust/Tokio AI gateway operating as an AI48Home-managed data-plane worker.
+An asynchronous AI gateway written in Rust and Tokio, designed to run as an
+**AI48Home-managed worker**. AI48Home controls credentials, model access, routing
+and cluster policy; AI48Proxy executes selected upstream requests and reports
+usage and execution state back to the control plane.
 
-## Status
+## Architecture
 
-An initial executable implementation, **not a full CLIProxyAPI replacement**. Local tests exercise mock Home over real mTLS and a mock HTTP upstream. Live Home/deployment interoperability and provider OAuth parity have not been validated. Do not replace production CPA nodes with this release yet.
+```mermaid
+flowchart TD
+    Client[API clients] --> Ingress[HTTP ingress]
+    Ingress --> Worker[AI48Proxy worker]
+    Worker --> Providers[Upstream AI providers]
+    Worker <-->|RESP over mTLS| Home[AI48Home control plane]
+    Home --> Database[Persistent management database]
+```
 
-### Implemented
+AI48Proxy does not maintain a separate credential catalog or provide a standalone
+management service. Provider selection and authorization remain with AI48Home.
+Each worker has a private identity, an isolated membership lifetime and a durable
+usage outbox.
 
-- Bounded RESP2 codec, certificate enrollment and private identity storage, mTLS command connections without Redis initialization or HTTP ALPN.
-- Dedicated configuration subscription, lifecycle revision registration, fresh worker connections, heartbeat-based readiness/fencing and active-request cancellation.
-- Typed flattened/v8 configuration normalization, duplicate-key/value validation, supported-setting diagnostics and immutable hot-reload snapshots.
-- Home-authenticated dispatch and model listing; accounted execution scopes, cumulative releases, ACK-before-redispatch and in-flight snapshots.
-- Durable bounded usage outbox under the identity directory, with stable execution IDs, checksummed records, atomic publication, fsync, exclusive locking, replay after restart and persistent ACK deletion. Queue exhaustion fences admission instead of silently evicting records.
-- Same-format API-key JSON/SSE forwarding for OpenAI-compatible, Claude native and Gemini native upstreams. Credential-specific HTTP(S) proxies, final payload rules and capability-validated thinking configuration.
-- Typed Home KV and cluster command helpers, exposed as library modules. Rebalance is not automatically enabled.
-- Integrated OpenAI Chat ↔ Claude Messages request/response translation, including incremental SSE text/tool/usage conversion.
-- Codex HTTP Responses and Chat-to-Responses conversion with OAuth bearer/account headers, terminal JSON extraction, text/reasoning/tool SSE conversion, and source usage accounting. Claude OAuth fingerprint/identity handling and Home-only refresh after 401.
-- Native upstream Responses WebSocket with a retained Home concurrency lease, per-turn usage, bounded session-history hydration and cancellation. Proxy transport, model changes within a session, overlapping creates and advanced steering remain unsupported.
-- OpenAI-compatible Responses-to-Chat upstream conversion with JSON/SSE conversion back to Responses; direct compact endpoint preparation; Home-selected token-field/model options and prompt-cache session-header precedence.
-- Automatic normal-registration recovery with exponential jitter, discovered alternate Home targets, fresh lifetime registries and a persistent HTTP listener returning 503 while disconnected. No unsafe takeover is attempted.
-- Token v2 source accounting for supported OpenAI, Claude and Gemini usage fields; partial or inconsistent counts remain explicit.
-- Context-aware payload rules: source protocol/header/body gates, original requested model, ordered literal/regex replacements and final filters.
-- Vertex native Gemini and OpenAPI Chat routing with Home-supplied token/API-key credentials. Antigravity native Gemini envelope execution and JSON/SSE response/usage extraction, subject to the limitations below.
-- Native Claude API-key `/v1/messages/count_tokens`, without treating token estimates as inference usage.
-- Configured inbound body-size enforcement before dispatch, including chunked requests.
-- CI verification, non-root container packaging and opt-in worker acceptance probes; see [worker acceptance](docs/worker-acceptance.md). Container execution still requires validation in your deployment.
+## Capabilities
 
-### Not implemented / limitations
+- OpenAI-style Chat Completions and Responses, Claude Messages, and Gemini
+  generation APIs, with supported cross-format request and response translation.
+- OpenAI-compatible custom upstreams, Codex, Claude, Gemini, Vertex and
+  Antigravity execution using Home-selected credentials.
+- Incremental SSE translation, bounded WebSocket sessions and cancellation-aware
+  execution accounting.
+- Image generation/editing for supported providers and xAI speech endpoints.
+- Home configuration subscriptions, immutable configuration snapshots, payload
+  rules, supported reasoning controls, keepalives and response-header filtering.
+- Certificate enrollment, verified mTLS, heartbeat fencing, cluster discovery,
+  reconnect recovery, conditional membership takeover and drained-worker rebalance.
+- Cumulative concurrency releases, in-flight snapshots and durable accepted usage
+  reporting, including supported image dimensions.
+- Bounded Home application-log forwarding and opt-in sanitized request metadata
+  logs. Request/response bodies and credential headers are omitted.
 
-- Full Codex WebSocket/continuation parity (including proxy transport, overlapping turns and advanced steering), Gemini CLI, plugin runtime, multimedia/realtime and full cross-format translation remain unavailable. Antigravity signature replay/advanced tools/images are not implemented. Vertex requires Home-prepared credentials; no local service-account exchange is performed. Provider implementations are subsets, not full CPA parity.
-- Membership takeover and planned rebalance migration are not implemented. Recovery waits for normal Home admission; targets are not persisted across process restarts. The HTTP listener starts after the first valid Home configuration.
-- Durable reporting covers events accepted by the outbox, not usage never observed before a crash or events rejected for capacity/persistence errors. Full provider billing parity remains unvalidated.
-- Complete configuration parity: active unsupported execution settings reject startup/update explicitly. Advanced provider knobs and streaming keepalive controls are examples. Unknown metadata is not a promise of execution support.
-- Connection pooling: controlled commands currently open fresh mTLS connections, prioritizing lifetime isolation over throughput.
-- Graceful drain is bounded; unresolved admission/usage/release causes a nonzero exit. External supervision must not assume restart is a safe membership takeover.
+Support depends on the selected provider, credential type, request format and
+configuration. A registered route is not a promise that every combination works.
+See the [provider guide](docs/provider.md) and
+[implementation status](docs/porting-status.md) for boundaries.
+
+## Deployment
+
+The included stack consists of PostgreSQL, AI48Home, three AI48Proxy workers and
+nginx. The installer generates private configuration, initializes a fresh database
+once, provisions distinct worker tokens and starts services in readiness order.
+
+```sh
+./install.sh init
+./install.sh deploy
+./install.sh status
+./install.sh logs ai48proxy-1
+```
+
+- AI48Home management: port `8327`.
+- Client API ingress: port `8317`.
+- Service network: `ai48proxy-network`.
+
+Keep `.env`, generated deployment YAML, enrollment tokens and identity volumes
+private. Do not run another stack on the same published ports. Existing databases
+and worker identities require an explicit migration, not reinitialization.
+
+See the [Docker deployment guide](docs/docker.md) for configuration, persistence,
+service naming changes and operational precautions.
 
 ## Build and verify
 
 ```sh
 cargo build --locked
-cargo test --all-targets
-cargo clippy --all-targets -- -D warnings
+cargo test --locked --all-targets
+cargo clippy --locked --all-targets -- -D warnings
 cargo fmt --all --check
 ```
 
-`Cargo.lock` pins dependency resolution. No Go repositories are modified by this application.
+`Cargo.lock` pins dependency resolution. Automated fixtures use synthetic
+credentials and loopback upstreams; they do not establish live-provider acceptance.
 
-## Full Docker stack (same topology as Home installer)
+## Run a worker
 
-The repository includes `docker-compose.yml` for PostgreSQL + Home + three Rust workers + nginx. Local `.env`, bootstrap configuration, and independent worker JWTs are managed by:
-
-```sh
-./install.sh init      # Generate private .env/config files; preserve existing files
-./install.sh deploy    # Build, import a fresh Home, issue JWTs, start the stack
-./install.sh status
-./install.sh logs ai48proxy-1
-```
-
-Home publishes `8327`; nginx publishes gateway port `8317`. The stack uses AI48Home/AI48Proxy container names and `ai48proxy-network`. Stop an older installer stack before deployment because the published ports overlap. This does not automatically migrate an existing database. See [Docker deployment](docs/docker.md).
-
-## Run
-
-Provision a client certificate token in AI48Home through `POST /v8/management/certificates/clients`. Supply it through the `HOME_JWT` environment variable using your secret manager, then:
+Provision an enrollment token in AI48Home using
+`POST /v8/management/certificates/clients`. Prefer a protected token file rather
+than placing a token in command arguments:
 
 ```sh
-cargo run --locked -- --identity-dir .ai48proxy
+cargo run --locked -- \
+  --identity-dir .ai48proxy \
+  --home-jwt-file /secure/path/worker.jwt
 ```
 
-**Enrollment warning:** current CPA-compatible enrollment sends the one-time enrollment secret over plaintext RESP. The returned CA fingerprint is checked, but that does not encrypt the secret or prevent interception/consumption races. Use only an operator-protected network path or tunnel for enrollment. Subsequent gateway/Home communication uses verified mTLS. The JWT is treated as a trusted provisioning capability; its signature is not locally verified.
+`HOME_JWT_FILE` and `HOME_JWT` are also supported. Never share one worker identity
+between concurrently running processes.
 
-Identity files are separate from CPA's default identity directory. On Unix, the directory and files use `0700` and `0600`. Never commit the identity or reuse one certificate concurrently across processes. An uncertain enrollment result blocks automatic reenrollment; operator recovery is required.
+**Enrollment security:** the initial enrollment exchange sends its one-time
+secret over plaintext RESP. CA fingerprint verification does not encrypt that
+exchange. Use an operator-protected network path or tunnel. Subsequent Home
+connections use verified mTLS. The provisioning token is treated as a trusted
+capability; its signature is not locally verified.
 
-For an existing identity, without setting `HOME_JWT`:
+For an already enrolled identity:
 
 ```sh
-cargo run --locked -- --identity-dir .ai48proxy --home-host 127.0.0.1 --home-port 8327
+cargo run --locked -- \
+  --identity-dir .ai48proxy \
+  --home-host 127.0.0.1 \
+  --home-port 8327
 ```
 
-Listener host/port come from Home (`8317` when port is absent); later config updates retain the running listener. No standalone credential/config fallback is available.
-
-Validate a saved downstream Home snapshot without starting:
+Listener settings come from Home; port `8317` is used when absent. Validate a
+saved downstream configuration without starting the worker:
 
 ```sh
 cargo run --locked -- --check-config home-snapshot.yaml
 ```
 
-### HTTP routes
+## API surface
 
-| Route | Support |
+| Route | Purpose |
 | --- | --- |
-| `GET /healthz` | 200 only when Home membership is ready; otherwise 503 |
-| `GET /v1/models` | Home-authenticated catalog, normalized to OpenAI list |
-| `POST /v1/chat/completions` | OpenAI-compatible forwarding, Claude translation or Codex Responses bridge |
-| `POST /v1/completions` | Same-format OpenAI-compatible API-key forwarding |
-| `POST /v1/responses` | Compatibility Chat bridge or Codex HTTP, JSON/SSE |
-| `GET /v1/responses` | Responses WebSocket; constrained continuation support |
-| `POST /v1/responses/compact` | Native compact endpoint; specialized capsule parity not established |
-| `POST /v1/messages` | Claude API-key/OAuth or translation to OpenAI Chat |
-| `POST /v1beta/models/{model}:generateContent` | Gemini-native API-key forwarding |
-| `POST /v1beta/models/{model}:streamGenerateContent` | Gemini-native SSE forwarding |
+| `GET /healthz` | Membership readiness; returns 503 when unavailable |
+| `GET /v1/models` | Home-authorized model catalog |
+| `POST /v1/chat/completions` | Chat execution and supported provider bridges |
+| `POST /v1/completions` | Compatible text completions |
+| `POST /v1/responses` | Responses execution or compatible Chat bridge |
+| `GET /v1/responses` | Responses WebSocket sessions |
+| `POST /v1/responses/compact` | Supported compact execution |
+| `POST /v1/messages` | Claude Messages and supported Chat translation |
+| `POST /v1/messages/count_tokens` | Supported native Claude token estimates |
+| `POST /v1beta/models/{model}:generateContent` | Google-format generation |
+| `POST /v1beta/models/{model}:streamGenerateContent` | Google-format SSE generation |
+| `POST /v1/images/generations` | Supported image generation |
+| `POST /v1/images/edits` | Supported image editing, including multipart input |
+| `POST /v1/audio/speech`, `POST /v1/tts` | Supported xAI speech execution |
 
-The provider and execution model are selected by Home. Routes do not imply that every credential/provider/format combination is supported. Unsupported combinations return explicit capability errors. Upstream error bodies are not exposed because they may echo credentials.
+Video routes currently return explicit unsupported-capability errors. Upstream
+errors are sanitized because provider messages can contain sensitive information.
 
-See [Home compatibility baseline](docs/home-compatibility.md) for the audited source contract and remaining acceptance milestones.
+## Operational limits
+
+- Native plugin execution, Gemini CLI, realtime/video workflows and some advanced
+  provider options are not available.
+- WebSocket proxying, overlapping turns, steering, advanced signed replay and
+  complete provider-specific schema behavior remain limited.
+- Rebalance requires a drained worker; active executions are not transferred.
+- Unsupported active execution settings are rejected rather than silently ignored.
+- Durable reporting protects accepted events, not usage never observed before a
+  crash. Capacity or persistence failures can fence admission.
+- Shutdown is bounded. Outstanding execution/accounting ownership must be
+  reconciled before reusing an identity or promoting a deployment.
+
+Complete the [worker acceptance runbook](docs/worker-acceptance.md) for your actual
+Home configuration and upstream providers before production rollout.
+
+## Documentation
+
+- [AI48Home integration](docs/home-compatibility.md)
+- [Provider guide](docs/provider.md)
+- [Codex and OpenAI-compatible execution](docs/codex-openai-parity.md)
+- [Claude request and rate-limit handling](docs/claude_limits_wiring.md)
+- [Docker deployment](docs/docker.md)
+- [Implementation status](docs/porting-status.md)
+- [Worker acceptance](docs/worker-acceptance.md)
+
+## Compatibility references and attribution
+
+AI48Proxy integrates with [AI48Home](https://github.com/sofyan48/AI48Home).
+[CLIProxyAPI](https://github.com/router-for-me/CLIProxyAPI) has been used as an
+interoperability reference, and portions of the provider behavior and algorithms
+were adapted from its implementation. This acknowledgment does not imply
+endorsement, affiliation, a clean-room implementation, or complete compatibility.
+Applicable third-party copyright notices and license obligations must be preserved
+when distributing derived material. Provider and protocol names identify the
+services and interfaces supported by the gateway.

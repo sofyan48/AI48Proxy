@@ -57,6 +57,34 @@ fn fragmented_claude_text_tools_and_partial_usage_to_chat() {
     assert!(out.ends_with("data: [DONE]\n\n"));
 }
 #[test]
+fn claude_thinking_blocks_stream_as_reasoning_content() {
+    let (t, out) = fixture(
+        Format::ClaudeMessages,
+        &[
+            json!({"type":"message_start","message":{"id":"r","usage":{"input_tokens":7,"output_tokens":2}}}),
+            json!({"type":"content_block_start","index":0,"content_block":{"type":"thinking","thinking":"","signature":""}}),
+            json!({"type":"ping"}),
+            json!({"type":"content_block_delta","index":0,"delta":{"type":"thinking_delta","thinking":"","estimated_tokens":null}}),
+            json!({"type":"content_block_delta","index":0,"delta":{"type":"thinking_delta","thinking":"ponder"}}),
+            json!({"type":"content_block_delta","index":0,"delta":{"type":"signature_delta","signature":"opaque-sig"}}),
+            json!({"type":"content_block_stop","index":0}),
+            json!({"type":"content_block_start","index":1,"content_block":{"type":"redacted_thinking","data":"opaque"}}),
+            json!({"type":"content_block_stop","index":1}),
+            json!({"type":"content_block_start","index":2,"content_block":{"type":"text","text":""}}),
+            json!({"type":"content_block_delta","index":2,"delta":{"type":"text_delta","text":"hey"}}),
+            json!({"type":"content_block_stop","index":2}),
+            json!({"type":"message_delta","delta":{"stop_reason":"end_turn"},"usage":{"output_tokens":4}}),
+            json!({"type":"message_stop"}),
+        ],
+        false,
+    );
+    t.finish().unwrap();
+    assert!(out.contains("\"reasoning_content\":\"ponder\""));
+    assert!(out.contains("\"content\":\"hey\""));
+    assert!(!out.contains("opaque"));
+    assert!(out.ends_with("data: [DONE]\n\n"));
+}
+#[test]
 fn truncated_unsupported_and_oversized_streams_fail() {
     let (t, _) = fixture(
         Format::OpenAiChat,

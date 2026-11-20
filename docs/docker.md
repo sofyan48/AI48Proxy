@@ -1,8 +1,8 @@
 # Docker deployment
 
-This is the full `AI48Home/install.sh` topology, with Rust AI48Proxy workers built
-from this repository's Dockerfile. It is not a canary or an external-Home overlay.
-Use Docker Engine with the Compose plugin.
+Deploy AI48Home and AI48Proxy together using Docker Engine and the Compose
+plugin. This repository's Dockerfile builds the Rust worker; Compose supplies the
+control plane, database and API ingress.
 
 | Service | Image / role | Published port |
 | --- | --- | --- |
@@ -14,8 +14,8 @@ Use Docker Engine with the Compose plugin.
 | `nginx` | `nginx:alpine`, least-connections worker ingress | `8317:8317` |
 
 All services join the explicitly named `ai48proxy-network`. nginx uses
-`ai48proxy-1:8317`, `ai48proxy-2:8317`, and `ai48proxy-3:8317`. Its configuration is
-copied from Home's installer, including streaming and WebSocket forwarding.
+`ai48proxy-1:8317`, `ai48proxy-2:8317`, and `ai48proxy-3:8317`, with streaming and
+WebSocket forwarding enabled.
 Every service uses `restart: unless-stopped`.
 
 ## Deploy
@@ -41,8 +41,8 @@ From the AI48Proxy root:
 
 The installer generates the root `.env`, `deploy/cluster.yaml`, and
 `deploy/config.yaml`, starts PostgreSQL, imports the initial Home configuration,
-starts Home, issues three distinct worker JWTs into `.env`, and then builds and
-starts the workers and nginx. No manually provisioned secret files are required.
+builds the worker image, starts Home, issues three distinct worker JWTs into
+`.env`, and starts the workers and nginx. No manually provisioned secret files are required.
 Do not start the entire stack before this bootstrap sequence completes.
 
 ### Installer environment and artifact contract
@@ -66,26 +66,27 @@ configuration: it includes passwords and JWTs. Docker administrators can inspect
 container environment values.
 
 `deploy/cluster.yaml` must point PostgreSQL at `postgres:5432`, with credentials
-matching `.env`. Its node address is `home:8327`, with listener port `8327`, as in
-Home's installer. `deploy/config.yaml` sets worker `host: ""` and `port: 8317`,
+matching `.env`. New configuration advertises node address `ai48home:8327`, with
+listener port `8327`; the `home` alias remains available to existing deployments. `deploy/config.yaml` sets worker `host: ""` and `port: 8317`,
 `remote-management.secret-key` from `MANAGEMENT_KEY`, and `api-keys` from
 `GATEWAY_API_KEY`.
 
 Home mounts `deploy/cluster.yaml` read-only at `/AI48Home/cluster.yaml`. The
-initial import uses the same command and container path as Home's installer,
-with the source adjusted to this repository's generated config location:
+initial import loads generated configuration into Home's database. For reference,
+the operation uses the following container command; normally let the installer
+perform it once rather than invoking it manually:
 
 ```sh
 docker compose --env-file .env up -d postgres
 docker compose --env-file .env run --rm --no-deps \
   -v "$PWD/deploy/config.yaml:/AI48Home/config.yaml:ro" \
-  home ./AI48Home -import
+  ai48home ./AI48Home -import
 ```
 
 The installer owns import-once tracking and token issuance. It refuses initial import when PostgreSQL or Home data already exists without its bootstrap marker. Deployment and `start` wait for PostgreSQL, Home, then all three worker healthchecks before starting nginx. Do not repeat imports
 on an existing database as a routine restart operation. JWT fields may be empty
 while the installer starts/imports Home; all three must be populated and distinct
-start workers. Missing PostgreSQL variables fail Compose interpolation.
+before workers start. Missing PostgreSQL variables fail Compose interpolation.
 
 ## Operate an initialized stack
 
@@ -105,13 +106,13 @@ network path; subsequent Home communication uses mTLS.
 
 Worker healthchecks call `/usr/local/bin/ai48proxy --healthcheck
 http://127.0.0.1:8317/healthz`. The binary must support that CLI mode. Health status
-is readiness feedback; nginx retains the installer's passive upstream failure
-handling rather than reading Docker health status. A successful Compose config
+is readiness feedback; nginx uses passive upstream failure handling rather than
+reading Docker health status. A successful Compose config
 check does not validate enrollment, provider behavior, or billing.
 
 ## Persistent state
 
-Home retains the installer's host paths `postgres-data/`, `home-data/`,
+Persistent host paths are `postgres-data/`, `home-data/`,
 `home-logs/`, and `home-plugins/`. Each Rust worker instead has its own named
 volume (`worker-1-state`, `worker-2-state`, `worker-3-state`, project-prefixed by
 Compose) mounted at `/var/lib/ai48proxy`, with identity below `identity/`.

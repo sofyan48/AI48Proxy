@@ -1,58 +1,77 @@
-# Home worker porting status
+# Implementation status
 
-Updated: 2026-11-20. This is an implementation and validation checkpoint, not a
-claim of complete CLIProxyAPI parity. Earlier handoff documents describe older
-snapshots; check the current source and this checkpoint before redoing their work.
+This document tracks AI48Proxy capabilities and acceptance boundaries. The filename
+is retained for existing links. It is not a declaration that every provider or
+configuration is production-ready.
 
-## Completed in this increment
+## Implemented areas
 
-- Activated the Antigravity-specific Chat translation entry point. Function
-  declarations, supported schema cleanup, choices, call/result pairing, and JSON /
-  SSE tool outputs now use the implemented Gemini bridge. See `provider.md` for
-  exact schema/signature restrictions. Unsupported replay still fails explicitly.
-- Added focused Claude OAuth CLI wire preparation: caller-system preservation and
-  relocation, billing fingerprint, cache marker placement/limits/TTL ordering,
-  native-client detection and thinking-gated context management. Final serialized
-  OAuth bodies run through CCH signing after payload rules. Signing changes only
-  existing five-digit attribution signatures; it does not restore filtered fields.
-- Activated Claude HTTP failure classification and safe Retry-After propagation.
-  Request-scoped fast entitlement refusals stop credential retry and use Home's
-  existing request-scoped reporting code. Shared/model scope remains diagnostic;
-  Home has no generic Claude deadline/scope reporting contract.
-- Preserved Home-compatible canonical error hints for unsupported-model 400/422,
-  request-scoped store=false 404, and Antigravity TOS 403. No raw provider messages,
-  credentials or arbitrary headers are forwarded or logged. Bounded plaintext
-  errors also reach canonical scheduler matching.
+| Area | Current implementation |
+| --- | --- |
+| Home transport | RESP2 command connections, certificate enrollment and verified mTLS |
+| Configuration | Subscription updates, typed normalization, immutable snapshots and explicit unsupported-setting validation |
+| Membership | Heartbeat fencing, reconnect recovery, discovery, conditional takeover and drained-worker rebalance |
+| Execution ownership | Home admission, cumulative releases, in-flight snapshots, cancellation and ambiguous-dispatch fencing |
+| Usage | Durable accepted-event outbox, replay, bounded admission and supported token/image accounting fields |
+| Logs | Bounded application-log forwarding and opt-in sanitized request metadata forwarding |
+| OpenAI-compatible upstreams | Home-selected custom bases and credentials, Chat execution and Responses bridges |
+| Codex | HTTP Responses, constrained WebSocket sessions, cache identity helpers and supported image execution |
+| Claude | Messages, Chat translation, focused OAuth wire preparation, final-body attribution signing and HTTP failure classification |
+| Google-format upstreams | Gemini, Vertex native/OpenAPI routing, Antigravity envelopes and supported function-tool translation |
+| Media | Supported image generation/editing and xAI speech; unsupported combinations fail explicitly |
+| Runtime controls | Payload rules, supported reasoning settings, response filtering, keepalives, shutdown bounds and image-generation modes |
 
-## Verification
+See the [provider guide](provider.md) for request-level restrictions and the
+[Home integration guide](home-compatibility.md) for lifecycle ownership.
 
-- `cargo fmt --all`: passed.
-- `cargo test --all-targets --quiet`: 298 library tests passed, one ignored;
-  other targets passed (6, 6, 12 and 10 tests).
-- `cargo clippy --all-targets -- -D warnings`: passed.
-- Docker image rebuilt; all three workers recreated and healthy.
-- Live Codex `gpt-6-luna`: HTTP 200, completed SSE, usage and `[DONE]`.
-- Live Claude `claude-haiku-5-5`: HTTP 503 from Home selection (`auth_not_found`),
-  before upstream execution. Read-only database inspection found no nondeleted
-  Claude credential. No credential was restored and no cooldown cleared.
-- Antigravity tools: deterministic fixtures only; no live upstream success claim.
+## Acceptance boundaries
 
-## Outstanding before full replacement acceptance
+Automated tests cover synthetic credentials, real loopback mTLS/RESP connections,
+local upstream HTTP/WebSocket fixtures, payload ordering and lifecycle ownership.
+These checks do not demonstrate that a live provider accepts a particular account,
+model, tool schema or billing configuration.
 
-- Restore or add an authorized Claude credential through Home, then validate live
-  JSON, SSE, tool round trips and failure/reset behavior. Signing/wire changes do
-  not prove that a genuine upstream quota rejection has been resolved.
-- Claude advanced tools/alias reversal, helper/subagent profiles, continuity and
-  session date pinning, thinking replay and advanced replacement policies.
-- Antigravity signed reasoning replay/cache fidelity, complex schema compositions,
-  incremental argument streams, advanced/server tools and multimedia paths.
-- Full Codex SIWC, continuation/steering/overlap and remaining WebSocket semantics.
-- Gemini CLI/plugin execution, Vertex specialized operations, complete
-  cross-format conversions, and remaining unsupported configuration controls.
-- Generic Claude cooldown scope/reset propagation to Home, terminal SSE reset
-  classification, configurable request-scoped error matching and corresponding
-  cross-repository contract tests.
+Previous development sessions exercised live Codex SSE successfully. That is a
+point-in-time observation, not an availability guarantee. Claude testing was
+blocked by Home credential availability at the last recorded live check. Provider
+account state, balances and credentials must be verified in the deployment itself;
+private account details do not belong in public documentation.
 
-Keep unsupported functionality fail-closed until its request, response, lifecycle,
-and accounting contracts are implemented and tested. A successful image build or
-provider request construction alone is not end-to-end provider acceptance.
+The latest attempted Docker rebuild/start was interrupted by the operator. Do not
+assume that the newest source has been deployed. Check the running image and worker
+health before testing changes.
+
+## Remaining work
+
+- Native plugin execution and Gemini CLI execution.
+- Full realtime/video workflows and credential-bound video retrieval.
+- WebSocket proxy transport, overlapping turns, advanced steering and recovery.
+- Advanced Claude helper/subagent profiles, tool alias reversal, continuity/date
+  pinning and signed reasoning replay.
+- Advanced Antigravity signed replay, complex schemas, incremental tool arguments
+  and multimedia behavior.
+- Remaining provider-specific controls, specialized Vertex operations and
+  cross-format conversions.
+- Active-execution migration during rebalance and latency-based Home selection
+  optimizations.
+- Complete configured end-to-end validation for new runtime controls, request-log
+  completion/cancellation semantics and all media billing dimensions.
+
+Only remove a capability restriction when request preparation, response handling,
+configuration, execution lifecycle and accounting are implemented and tested.
+Never infer readiness solely from a registered route, successful compilation or a
+healthy container.
+
+## Release checklist
+
+1. Run locked Cargo tests, strict Clippy and formatting checks.
+2. Build the deployment image and record the deployed revision.
+3. Verify enrollment and membership on a protected network.
+4. Test selected providers with authorized models and synthetic prompts.
+5. Confirm usage, concurrency releases, logs and billing in Home.
+6. Exercise cancellation, disconnection, restart and bounded shutdown.
+7. Record untested and unsupported features explicitly using the
+   [acceptance runbook](worker-acceptance.md).
+
+Compatibility references and attribution are documented in the
+[project README](../README.md#compatibility-references-and-attribution).

@@ -1,291 +1,260 @@
-# Home-managed Rust gateway: compatibility baseline
+# AI48Home integration architecture
 
-Status: audited compatibility target. An initial Rust executable now implements a subset; see `../README.md` for the authoritative implemented/unsupported feature inventory. The requirements below are not a claim of complete parity.
+AI48Proxy is the AI48Home-managed gateway data plane. Home owns persistent policy,
+credential selection and accounting storage; workers execute authorized requests
+and report their outcomes. This document describes the current integration
+contract, not a claim of complete provider coverage or deployment acceptance.
+Use [worker acceptance](worker-acceptance.md) to validate a particular deployment.
 
-This document describes the current sibling `AI48Home` and `CLIProxyAPI` implementations inspected on 2026-11-18. Source paths are relative to the parent workspace. Revalidate them when either repository changes. Proposed Rust modules and acceptance criteria below are design recommendations, not existing functionality.
-
-## 1. Scope and ownership
-
-Rewrite the gateway data plane using Rust and Tokio, prioritizing compatibility with AI48Home. Do not port standalone CPA administration first.
+## Ownership and request flow
 
 | Responsibility | Owner |
 | --- | --- |
-| Persistent configuration, credentials, credential refresh, scheduling, cooldown, downstream access policy | Home |
-| Config subscription, membership health, upstream execution, protocol translation, streaming/cancellation | Rust gateway |
-| Credential admission/reclamation policy | Home, with mandatory gateway release and lifetime cooperation |
-| Usage/billing persistence and scheduler feedback | Home, with gateway execution reports |
-| In-flight observation | Gateway publishes; Home aggregates |
-
-A gateway must not fall back to local credentials, local rotation, local refresh, or local KV when its Home operation fails.
-
-Source: `CLIProxyAPI/sdk/cliproxy/service_lifecycle.go`, `service_config.go`, `auth/conductor_home.go`, `internal/runtime/executor/helps/home_refresh.go`.
-
-## 2. Bootstrap and transport
-
-Current CPA precedence is nonempty `-home-jwt`, then `HOME_JWT`, then `home_jwt`. Home mode takes precedence over local config and PostgreSQL/Git/object-store credential sources. A local plugin bootstrap read is a separate pre-flag exception, not general runtime configuration precedence.
-
-The bootstrap JWT carries `certificate_id`, `cluster_id`, `ca_fingerprint`, `enrollment_secret`, `ip`, `port`, and `iat`. CPA currently decodes claims without verifying the JWT signature locally; do not describe that as signature verification. CA fingerprint pinning is a distinct security check. Never log the token or enrollment secret.
-
-Enrollment uses a locally generated private key and CSR:
+| Configuration, credentials, refresh, scheduling, cooldowns and downstream access policy | AI48Home |
+| HTTP ingress, protocol translation, upstream execution, streaming and cancellation | AI48Proxy |
+| Concurrency admission and reclamation policy | Home, with worker completion and release cooperation |
+| Usage persistence, billing aggregation and scheduler feedback | Home, using worker execution reports |
+| In-flight observations | Worker publishes bounded snapshots; Home aggregates |
 
 ```text
-CERTIFICATE REQUEST <certificate-id> <enrollment-secret> <CSR-PEM>
+Downstream request and requested model
+  -> ready Home membership and tracked pending admission
+  -> Home authorization, model resolution and credential selection
+  -> lifetime-owned execution scope
+  -> translation, provider normalization and thinking configuration
+  -> configured payload rules, once at the final semantic boundary
+  -> transport framing, signing and upstream execution
+  -> response translation or streaming
+  -> completion, usage report and acknowledged concurrency release
 ```
 
-The reply is bulk JSON with `ok`, `certificate`, and `ca`. Enrollment is one-shot, including when the successful reply is lost. Persist the private key securely before enrollment and treat an uncertain enrollment result as requiring operator recovery, not unlimited automatic reissuance. Home assigns the certificate CN from the certificate ID.
+A Home failure does not enable local credentials, local scheduling, local OAuth
+refresh or a local KV fallback. Provider/format combinations are explicit;
+unsupported combinations must not silently select another executor. Route
+registration alone is not evidence of complete provider support.
 
-Normal traffic is custom RESP2 over mTLS. Home validates both the client certificate chain and the database certificate record. Password `AUTH` is disabled. Do not negotiate HTTP ALPN on RESP connections: HTTP and RESP share the listener, and HTTP ALPN selects the HTTP branch.
+## Enrollment, identity and transport
 
-Implement RESP simple strings, errors, integers, bulk/null strings, and arrays. JSON business errors can arrive inside successful bulk replies. Avoid Redis client initialization commands such as `HELLO`/`SELECT` that Home does not implement. Codec limits must prevent unbounded allocations.
+Provision a pending client certificate through authenticated, verified HTTPS
+access to `POST /v8/management/certificates/clients`. The resulting Home JWT is a
+trusted provisioning capability containing the certificate/cluster identity,
+CA fingerprint, one-time enrollment secret and destination `ip`/`port`.
 
-Sources:
-- `CLIProxyAPI/cmd/server/main.go`
-- `CLIProxyAPI/internal/home/certificate.go`
-- `AI48Home/internal/cluster/certificate.go`
-- `AI48Home/internal/protocolmux/mux.go`
-- `AI48Home/internal/respserver/server.go`
+**Initial enrollment is plaintext RESP.** AI48Proxy sends the one-time secret
+and CSR in `CERTIFICATE REQUEST <certificate-id> <enrollment-secret> <CSR-PEM>`
+to the JWT destination. Protect the entire route with an operator-controlled
+encrypted network or transparent tunnel. A tunnel at another destination does
+not redirect the JWT; `--home-host` cannot override enrollment routing. The
+HTTPS-only non-cluster listener is not a substitute for this enrollment path.
 
-## 3. Membership lifecycle: prerequisite for dispatch
+The JWT signature is **not locally verified**. Structural/time checks and checking
+the returned CA fingerprint do not encrypt enrollment or prevent interception and
+one-time-secret consumption races. Obtain tokens only through trusted provisioning;
+never use an unprotected public enrollment route.
 
-Startup ordering:
+Prefer a private secret file through `HOME_JWT_FILE` or `--home-jwt-file`; `HOME_JWT`
+is also supported. Do not put tokens in command arguments, logs, Git or image
+layers. File and environment token inputs conflict. For an already enrolled
+identity, remove bootstrap inputs and use `--home-host` with `--home-port`.
 
-1. Enroll or load the pinned mTLS identity.
-2. Open a bootstrap connection and `GET config`.
-3. Parse and validate lifecycle configuration and supported runtime settings.
-4. Open a dedicated subscription: `SUBSCRIBE config <lifecycle-revision> <instance-uuid>`.
-5. Read its acknowledgement and initial full config snapshot.
-6. Apply the configuration and initialize required executors.
-7. Open **new worker connections to that same Home** after membership acknowledgement.
-8. Publish readiness only when config, membership, dispatch pool, execution registry, and release machinery are usable.
+The worker persists its private key before enrollment and records that enrollment
+was sent. A lost reply can mean the capability was consumed: preserve the identity
+and `enrollment-sent` marker, reconcile/revoke through Home, and obtain operator
+approval before reprovisioning. Deleting the marker and blindly retrying is unsafe.
+On Unix, identity directories/files use 0700/0600. One identity and reporting
+volume must have exactly one process owner; never clone it across replicas.
 
-Home assigns connection lifetime at accept time. A bootstrap socket is not upgraded into a controlled dispatch socket after membership starts. The subscription itself is not the dispatch worker.
+Normal Home commands use bounded RESP2 over verified mTLS with the pinned CA and
+client certificate. Home checks both the certificate chain and its database record.
+There is no password `AUTH`, Redis `HELLO`/`SELECT` initialization or HTTP ALPN on
+these connections. Home's shared listener distinguishes RESP from HTTP. Business
+errors may be encoded inside a successful bulk JSON reply and must be checked.
 
-Subscription frames:
+Implementation: `src/cli.rs`, `src/home/bootstrap.rs`, `src/home/transport.rs` and
+`src/home/resp.rs`.
 
-```text
-["subscribe", "config", 1]
-["message", "config", "<YAML>"]
-["pong", ""]
-["message", "cluster", "<JSON>"]
-["message", "rebalance", "<JSON>"]
-```
+## Membership, readiness and recovery
 
-The `cluster` and `rebalance` messages arrive on the config subscription without separate subscriptions. Close the socket to unsubscribe; the current registry does not register `UNSUBSCRIBE`.
+Startup loads/enrolls the identity, opens the durable reporting store, and discovers
+Home targets when available. For registration the worker:
 
-Heartbeat health is not equivalent to receiving arbitrary subscription traffic. Ordinary persisted-liveness heartbeats renew the lease; `home-rtt/...` telemetry pongs do not. Honor `cpa-heartbeat-timeout` and `cpa-cancel-bound`: fence new admissions and cancel old-lifetime executions on health loss. Cancellation must close underlying streams/sockets, not merely abandon a Tokio task handle.
+1. Fetches `GET config` over a bootstrap connection and validates support.
+2. Opens a dedicated config subscription with the lifecycle revision and process
+   instance UUID: `SUBSCRIBE config <revision> <instance-uuid>`.
+3. Requires the subscription acknowledgement and initial full config snapshot,
+   with the same lifecycle revision.
+4. Opens a fresh command connection after acknowledgement and verifies `PING`.
+5. Installs a new lifetime-owned execution registry and publishes readiness.
 
-Recovering a lifetime requires explicit state handling: pending-dispatch settlement, fencing, cancellation/drain or validated takeover, fresh connection ownership, then readiness. Takeover uses `SUBSCRIBE config <revision> takeover <instance-uuid>`. Do not carry release counters into an unrelated membership. Current CPA has conditional safe-takeover preservation; reproduce that only after matching its ownership guarantees.
+Home assigns command ownership at connection acceptance; the bootstrap connection
+is not reused as a controlled dispatch connection. Commands currently open fresh
+mTLS connections rather than using a dispatch pool.
 
-An ambiguous post-send dispatch failure may have consumed concurrency. Do not blindly repeat it. Fence/abort the unsafe lifetime and reconcile through the lifecycle protocol.
+The HTTP listener starts only after initial registration. Before that, probes may
+see connection refusal. Once started, the listener survives recovery and returns
+503 while no ready membership is installed. `GET /healthz` is readiness, not a
+process-only liveness check.
 
-Sources:
-- `AI48Home/internal/respserver/subscribe/config.go`
-- `AI48Home/internal/respserver/subscription_liveness.go`
-- `AI48Home/internal/cluster/membership.go`
-- `CLIProxyAPI/internal/home/client.go`
-- `CLIProxyAPI/sdk/cliproxy/service_home.go`
-- `CLIProxyAPI/sdk/cliproxy/service_home_retry.go`
+Config, cluster discovery and rebalance messages share the config subscription.
+Only the ordinary `["pong", ""]` heartbeat renews health; config traffic and
+`home-rtt/...` telemetry do not. Subscription failure, heartbeat timeout, invalid
+config, unsafe dispatch ambiguity or failed control acknowledgements can fence
+admission and cancel active execution. Underlying streams/sockets must close;
+merely abandoning a task is not completion.
 
-## 4. Configuration must control real behavior
+Recovery drains the old lifetime within configured bounds, retires its tasks and
+connections, and registers with exponential jitter and discovered alternate
+Home targets. Each accepted registration gets a fresh registry. Old release
+counters are never replayed into a replacement registry. Discovered targets are
+not persisted: startup still needs a reachable configured/enrollment target.
 
-Home stores canonical v8 config but sends a **sanitized flattened compatibility projection** through `GET config` and the subscription. Do not deserialize only the nested management API document and assume the wire is identical.
+### Conditional takeover and planned rebalance
 
-Home removes local management, access keys, auth-directory, TLS, credential groups, and local alias tables from the downstream projection. Credentials and resolved model identity arrive through dispatch. The gateway must preserve provider-specific auth attributes/metadata rather than infer credentials from config.
+Takeover is implemented, but is not permission to preserve live counters across
+registries. After acknowledged revision-aware registration, recovery may send
+`SUBSCRIBE config <revision> takeover <instance-uuid>`. It suppresses takeover
+when the old registry is not drained. Home rejection
+`membership_takeover_unavailable` suppresses it; a known subscription argument
+rejection selects the legacy form without UUID/takeover. Legacy negotiation does
+not waive the requirement for valid lifecycle configuration. Process restart
+creates a new instance identity, not automatic safe takeover of its predecessor.
 
-Current CPA hot reload replaces the remote configuration while retaining running `Host`, `Port`, `TLS`, and `Home`. Initial startup chooses listener settings; later snapshots do not rebind the listener. CPA forces usage enabled, local cooling disabled, cooldown persistence disabled, remote management disabled, control panel disabled, and local KV disabled.
+The subscription control path can enable rebalance and process a Home plan.
+Migration is **drain-only**: it stops admission and declines to claim while active
+executions, pending admissions or unacknowledged releases remain. Once drained,
+it claims the plan/term/target, preflights the target, retires the old lifetime and
+registers at the destination. The supervisor requires acknowledged rebalance result
+reporting before publishing the replacement. Failure paths may report failure,
+return to the origin or fence; they do not transfer a live registry. Typed latency
+helpers alone do not establish a complete latency-driven migration implementation.
 
-Proposed configuration processing:
+Implementation: `src/home/client.rs`, `src/home/client_lifecycle.rs`,
+`src/home/membership.rs`, `src/home/supervisor.rs`, `src/home/rebalance.rs` and
+`src/home/cluster.rs`. Exercise takeover, rejection, stale plans and destination
+failure against the deployed Home before relying on them operationally.
 
-```text
-wire YAML
-  -> normalization (legacy projection; canonical v8 if supported)
-  -> typed decoding with absent/false/zero distinction
-  -> validation + supported-feature evaluation
-  -> staged transports/executors/catalog/policy
-  -> immutable generation commit
-  -> readiness / dispatch publication
-```
+## Configuration contract
 
-Reject duplicate YAML keys. Keep Home lifecycle revision separate from local config generation. Obsolete subscription/reload tasks must not overwrite a newer owner. An invalid update must not partially mutate active settings; retain the prior valid snapshot only while its membership/lifecycle remains safe, otherwise fence readiness.
+Home's RESP configuration is a sanitized downstream YAML projection, not simply
+the Management API document. Credentials and resolved model identity arrive through
+dispatch, not local credential tables. AI48Proxy normalizes supported flattened
+and canonical v8 paths, rejects duplicate/conflicting values, decodes typed values
+and checks known unsupported execution settings before publishing an immutable
+snapshot. Unknown metadata retention is not execution support.
 
-| Configuration family | Wire/legacy examples | Required runtime consumer |
-| --- | --- | --- |
-| Retry | `request-retry`, `max-retry-credentials`, `max-retry-interval` | Retry coordinator; exclusion set; release-before-redispatch |
-| Transport | `proxy-url`, provider proxy overrides, connection pool settings | Per-selected-credential upstream transport |
-| Streaming | `streaming`, nonstream keepalive | SSE/stream lifecycle and pre-output retry handling |
-| Payload | `payload` | Final semantic payload barrier |
-| Concurrency | `credential-concurrency` | Subscription revision, cancellation, release ledger/backoff |
-| Observation | `credential-in-flight` | Snapshot interval, size limits, multipart/overflow |
-| Provider/OAuth options | Provider settings and retained OAuth scopes | Selected executor, preserving API-key vs OAuth scope |
-| Model capabilities | Catalog settings plus dispatch `model_info` | Thinking, limits, translation and feature validation |
-| Logs/usage | Downstream observability settings | Forwarders and execution accounting |
-| Plugins | Plugin settings/sync plan | Explicit supported ABI, or a clear unsupported-feature failure |
+A positive `credential-concurrency.lifecycle-config-revision` is required. A
+revision change on an existing subscription fences that lifetime and requires
+registration; ordinary supported updates replace the snapshot atomically.
+Invalid or unsupported updates fence rather than partially apply. Running host/port
+are retained on reload; listener changes require a drained process restart.
+In-flight work retains its captured configuration.
 
-Each supported setting needs a test proving changed runtime behavior. Parsing and storing a field is not support. Maintain a supported/unsupported configuration inventory; do not silently ignore a setting that changes execution, security, admission, or billing. Broad provider/feature support remains to be selected, not assumed.
-
-Sources:
-- `AI48Home/internal/home/config_yaml.go`
-- `CLIProxyAPI/internal/config/config_v8.go`
-- `CLIProxyAPI/internal/config/parse.go`
-- `CLIProxyAPI/internal/config/credential_concurrency.go`
-- `CLIProxyAPI/internal/config/credential_in_flight.go`
-- `CLIProxyAPI/sdk/cliproxy/service_config.go`
-- `CLIProxyAPI/sdk/cliproxy/service_home.go:164-222`
-
-## 5. Command contract inventory
-
-All examples below are RESP argument arrays, not Redis queue semantics.
-
-| Operation | Arguments | Important response/semantics |
-| --- | --- | --- |
-| Config | `GET config` | YAML bulk string |
-| Dispatch | `RPOP <JSON type=auth>` | JSON auth selection or structured JSON error |
-| Auth validation | `RPOP <JSON type=auth-validate>` | `authenticated`, principal/provider or error |
-| Models | `GET <JSON type=models>` | Auth-scoped provider buckets; **not** literal `GET models` |
-| Refresh | `GET <JSON type=refresh>` | Home-owned refreshed/sanitized credential |
-| Release | `LPUSH concurrency-release <JSON>` | Integer acknowledgement; cumulative sequence |
-| Observation | `LPUSH in-flight-snapshot <JSON>` | Integer ingestion acknowledgement |
-| Usage | `LPUSH usage <JSON>` | Persistence/feedback acknowledgement |
-| Request log | `RPUSH request-log <JSON>` | Separate from usage and billing |
-| App log | `RPUSH app-log <JSON>` | Optional forwarding |
-| Discovery | `CLUSTER NODES` | Live Home nodes |
-| Rebalance | `CLUSTER BALANCE ENABLE/CLAIM/RESULT/LATENCY ...` | Plan/term/lifetime-bound migration |
-| Shared KV | `GET`, `SET`, `SETNX`, `CAS`, `DEL`, `MGET`, `MSET`, `INCRBY`, `EXPIRE`, `TTL` | Needed by selected replay/cache features; no local fallback on Home error |
-| Plugin synchronization | `GET plugin-tasks`, `GET plugin-sync <JSON>`, `RPUSH plugin-status <JSON>` | Optional, requires separate ABI compatibility audit |
-
-Do not implement Home-to-Home `CLUSTER PING/NODE/REFRESH` as proxy operations or request Home node secrets.
-
-### Dispatch
-
-```json
-{
-  "type": "auth",
-  "model": "requested-model",
-  "headers": {"Authorization": "Bearer <downstream-key>"},
-  "concurrency_protocol": 1,
-  "retry_round": 0,
-  "excluded_auth_ids": [],
-  "count": 1
-}
-```
-
-Optional context includes `pinned_auth_id`, `credential_policy`, `session_id`, `parent_session_id`, and `node_kind`. Presence of `excluded_auth_ids`, even empty, selects newer retry semantics. Preserve omission versus empty. Never log forwarded authorization material.
-
-Selection contains resolved `model`, `provider`, `request_retry`, `auth_index`, `user_api_key`, `auth`, and optionally `model_info`, `force_mapping`, `original_alias`, and `concurrency`. Use the outer `auth_index` for normal dispatch. Do not confuse an alias with the canonical concurrency counter model.
-
-An accounted selection supplies:
-
-```json
-{"accounted":true,"credential_id":"counter-id","model":"counter-model"}
-```
-
-Validate the selection before executing. Unknown required providers/features must produce explicit errors, not an unrelated executor fallback.
-
-### Release and observation
-
-```json
-{"credential_id":"counter-id","model":"counter-model","release_seq":1}
-```
-
-`release_seq` is cumulative per counter and owning lifetime, not a delta. Duplicate delivery is safe. Complete each execution exactly once; retain release ownership through delivery failures. Await the prior accounted attempt's release acknowledgement before redispatch. Usage and observation do not release concurrency.
-
-In-flight frames use `kind=part` or `kind=overflow`, monotonically ordered revisions, UTC timestamps, observation barrier, accounted/unaccounted aggregates, and bounded optional details. Multipart frames must agree on shared metadata. Retain encoded frames for consistent retries. Apply limits from config rather than hardcoded defaults.
-
-### Usage
-
-Retain stable `execution_id` across report redelivery, RFC3339Nano-compatible timestamp, requested alias vs execution model, credential index, downstream principal, request/session lineage, failure status, latency/TTFT, and accurate token accounting. Current CPA also supports canonical token accounting schema v2, including nonoverlapping input buckets and separate reasoning output. Preserve unknown/absent values instead of guessing zero.
-
-Usage is scheduler feedback as well as billing data. Current CPA uses an in-memory retention-limited queue; it is not durable exactly-once delivery. A durable Rust outbox is a possible improvement, not existing parity, and would require explicit sensitive-data/storage policy.
-
-Sources:
-- `CLIProxyAPI/internal/home/requests.go`
-- `CLIProxyAPI/internal/home/concurrency_release.go`
-- `CLIProxyAPI/sdk/cliproxy/auth/home_selection.go`
-- `CLIProxyAPI/sdk/cliproxy/auth/home_concurrency.go`
-- `CLIProxyAPI/sdk/cliproxy/usage/accounting.go`
-- `CLIProxyAPI/internal/redisqueue/plugin.go`
-- `AI48Home/internal/respserver/pop/dynamic/dispatch.go`
-- `AI48Home/internal/respserver/get/default.go`
-- `AI48Home/internal/respserver/push/`
-
-## 6. Proposed Rust module boundaries
-
-| Module | Responsibility |
+| Configuration family | Runtime behavior |
 | --- | --- |
-| `bootstrap` | CLI/env, identity storage, enrollment, CA pinning |
-| `home::resp` | Bounded incremental RESP2 codec and typed replies |
-| `home::transport` | TLS connections, isolated subscription/worker/release paths |
-| `home::membership` | Health, lifetime state machine, fencing, reconnect/takeover/drain |
-| `home::cluster` | Discovery, failover, rebalance claim/result and RTT telemetry |
-| `config` | Wire normalization, typed validation, feature support, immutable generations |
-| `execution` | Pending/active registry, scope ownership, cancellation and completion |
-| `home::release` | Lifetime-scoped cumulative release ledger and acknowledged delivery |
-| `home::observation` | Bounded in-flight multipart snapshots and barriers |
-| `gateway` | HTTP routes, Home readiness gate and downstream context |
-| `dispatch` | Home auth/model resolution, retry/exclusion/affinity coordination |
-| `providers` | Selected provider executors and credential-specific transports |
-| `protocol` | Request/response/SSE format-pair translators with request-local state |
-| `thinking` | Canonical reasoning config, suffix precedence, validation and provider mapping |
-| `payload` | Configured rules applied exactly once after all built-in mutation |
-| `reporting` | Usage attribution/delivery and optional request/app logs |
-| `home::kv` | Required shared replay/cache operations |
+| Retry and credential limits | Home-coordinated retry, exclusion and release-before-redispatch |
+| `proxy-url` and selected credential overrides | HTTP(S) proxy/direct upstream transport; SOCKS is rejected |
+| `streaming` and nonstream keepalive | Configured response keepalive and pre-output bootstrap handling |
+| `payload` | Context-aware rules after built-in business mutations, before transport/signing |
+| `credential-concurrency` | Registration revision, heartbeat/cancel bounds and release timing |
+| `credential-in-flight` | Snapshot interval, observation barrier, multipart and cardinality limits |
+| Body-size, shutdown and request-log controls | Pre-dispatch body limit, bounded drain and optional sanitized log forwarding |
+| Dispatch metadata and model capabilities | Provider auth/routing, thinking validation and execution limits |
 
-Use structured Tokio tasks, cancellation tokens, and explicit asynchronous completion. `Drop` alone cannot guarantee release acknowledgement. A shared immutable snapshot mechanism is appropriate; specific crates and versions are not selected yet.
+Known unsupported active controls reject startup/update. Examples include enabled
+plugins, unsupported provider option families, active listener TLS/trusted-proxy
+controls and positive configured TLS-handshake timeout. Do not generalize this to
+all unknown fields or treat successful parsing as provider acceptance.
+`--check-config` validates a saved downstream snapshot's syntax/support, not Home
+connectivity, credentials or upstream behavior. See `src/config.rs`,
+`src/config/wire.rs`, `src/config/unsupported.rs` and `src/home/config_validation.rs`.
 
-Pipeline:
+Payload rules are the final business-payload boundary, including retry, WebSocket
+and supported media paths. Later framing/signing must not restore filtered fields
+or override configured values. Connection acquisition and lifecycle cancellation
+are distinct from broad request/read deadlines; long upstream streams must not
+acquire an undocumented whole-request timeout.
 
-```text
-HTTP context + requested model
-  -> readiness and pending-dispatch tracking
-  -> Home-authoritative selection
-  -> validated owned execution scope
-  -> protocol translation + built-in normalization + thinking
-  -> configured payload rules ONCE
-  -> transport framing/signature/serialization
-  -> upstream execution / response translation / streaming
-  -> completion + usage + acknowledged release
-```
+## RESP operations and execution accounting
 
-No post-payload business mutation may restore filtered fields or overwrite configured values, including retry, fallback, WebSocket, image, and token-count paths. Do not impose broad upstream read/stream timeouts after connection establishment; distinguish connection/credential acquisition from lifecycle cancellation and documented liveness exceptions.
+These are custom RESP arguments, not generic Redis queue semantics.
 
-Current routes and executors are directly assembled; do not assume a generic Amp module framework from older repository descriptions. Route registration does not imply the associated provider or translation pair is supported. The native plugin implementation uses a versioned C ABI, not Go's `plugin` package; Rust support is plausible but unverified.
+| Operation | Arguments | Contract |
+| --- | --- | --- |
+| Configuration | `GET config` | Downstream YAML bulk string |
+| Membership | `SUBSCRIBE config ...` | Acknowledgement, full snapshot and control messages |
+| Dispatch | `RPOP <JSON type=auth>` | Authorized selection or structured business error |
+| Authorization | `RPOP <JSON type=auth-validate>` | Downstream principal validation |
+| Catalog | `GET <JSON type=models>` | Auth-scoped provider buckets, not literal `GET models` |
+| Refresh | `GET <JSON type=refresh>` | Home-owned credential refresh |
+| Release | `LPUSH concurrency-release <JSON>` | Cumulative lifetime-scoped sequence acknowledgement |
+| Observation | `LPUSH in-flight-snapshot <JSON>` | Bounded snapshot ingestion acknowledgement |
+| Usage | `LPUSH usage <JSON>` | Persistence/feedback acknowledgement |
+| Request log | `RPUSH request-log <JSON>` | Separate optional contract, not billing evidence |
+| Discovery | `CLUSTER NODES` | Available Home targets |
+| Rebalance | `CLUSTER BALANCE ENABLE/CLAIM/RESULT ...` | Plan/term/ownership checks; latency helpers also exist |
+| Shared KV | Typed operations in `src/home/kv.rs` | Home-backed state for supported consumers, no local fallback |
 
-Sources:
-- `CLIProxyAPI/internal/api/server_routes.go`
-- `CLIProxyAPI/internal/api/server_middleware.go`
-- `CLIProxyAPI/sdk/cliproxy/service_executors.go`
-- `CLIProxyAPI/sdk/translator/registry.go`
-- `CLIProxyAPI/internal/thinking/`
-- `CLIProxyAPI/internal/runtime/executor/helps/payload_finalizer.go`
-- `CLIProxyAPI/sdk/pluginabi/`
+Optional app-log/plugin synchronization contracts in Home do not imply that this
+worker implements their forwarders or plugin execution. Workers do not perform
+Home-to-Home control operations or request Home node secrets.
 
-## 7. Implementation milestones and acceptance gates
+Dispatch includes requested model, downstream authorization, concurrency protocol,
+retry round, exclusions and supported session/pinning context. Preserve omission
+versus an empty exclusion list where the Home retry contract distinguishes them.
+Never log forwarded authorization. Selection supplies the resolved `model`,
+`provider`, outer `auth_index`, principal, sanitized `auth`, optional `model_info`
+and concurrency identity. Preserve selected provider metadata; do not confuse the
+requested alias, execution model and canonical concurrency counter model.
 
-1. **Control-plane foundation:** bootstrap, RESP codec, mTLS, config normalization, membership, readiness and cancellation. Gate: real Home integration proves registration, healthy subscription, fresh controlled worker connections, invalid revision handling and disconnect fencing.
-2. **Admission correctness:** execution registry, cumulative release, ambiguous dispatch handling, in-flight snapshots. Gate: exact-once scope completion, lost release ACK retry without double decrement, saturation errors, no redispatch before release ACK, no old-lifetime release on a replacement membership.
-3. **First usable provider:** select a concrete deployed provider/protocol pair; implement nonstream + SSE, payload/thinking behavior, usage and Home model listing. Generic OpenAI compatibility is a proposed smaller starting point, not a chosen requirement. Gate: real Home + mock upstream end-to-end tests verify authorization, config-controlled payload/transport/retry behavior, usage deduplication, stream cancellation and token attribution.
-4. **Cluster recovery:** failover, safe takeover, drain, rebalance and telemetry. Gate: two-Home tests cover stale plans, owner changes, pending dispatch during loss, cancellation bounds and no stale config publication.
-5. **Additional provider/protocol coverage:** expand through explicit capability/config matrix and golden fixtures. Codex Responses/WebSocket sessions need separate retained-selection and multi-turn billing tests.
-6. **Optional features:** replay KV, log forwarding, plugin ABI and multimedia/realtime only as required by deployment. Never advertise unavailable functionality.
+An accounted selection identifies `credential_id` and counter `model`. Completion
+increments that counter's lifetime-owned cumulative `release_seq`, not a delta.
+Duplicate release delivery must not decrement twice. Redispatch waits for the
+prior accounted attempt's release ACK. A post-send dispatch error may already
+have consumed concurrency and must fence rather than blindly retry. Usage and
+in-flight observations never release slots.
 
-Reuse existing contracts as test specifications, especially:
-- `CLIProxyAPI/internal/home/client_release_lifecycle_test.go`
-- `CLIProxyAPI/internal/home/client_fence_test.go`
-- `CLIProxyAPI/internal/home/in_flight_contract_test.go`
-- `CLIProxyAPI/sdk/cliproxy/auth/home_retry_contract_test.go`
-- `CLIProxyAPI/sdk/cliproxy/auth/home_fallback_audit_test.go`
-- `CLIProxyAPI/sdk/cliproxy/auth/home_usage_accounting_test.go`
-- `CLIProxyAPI/sdk/cliproxy/auth/home_websocket_reuse_test.go`
-- `CLIProxyAPI/internal/runtime/executor/helps/payload_finalizer_test.go`
+In-flight snapshots contain ordered revisions, UTC timestamps, observation barrier,
+accounted/unaccounted aggregates and bounded optional details. Multipart metadata
+must be consistent. Overflow/staleness must remain visible rather than appear as
+a complete observation. Release and snapshot state are not durable across process
+restart; Home reconciles/reclaims the old membership.
 
-Initially exclude standalone credential stores, local OAuth login flows, local scheduler/cooldown persistence, TUI, embedded management UI, filesystem watchers, local KV, and deprecated management APIs. This reduces breadth, not the admission/lifetime/accounting guarantees.
+### Durable usage and its limits
 
-## 8. Outstanding decisions and validation status
+Usage reports retain a stable `execution_id` across redelivery, request/session
+lineage, alias/execution model, credential/principal attribution, status,
+latency/TTFT and supported schema-v2 token buckets. Missing/partial observations
+remain explicit; overlapping input/reasoning buckets must not be double counted.
+Usage also feeds Home scheduling decisions.
 
-- Confirm the first provider and client-facing protocol pair from deployment requirements.
-- Confirm whether the initial release must include native plugins, Codex WebSocket, or media APIs.
-- Decide Rust identity storage location and whether certificate-cache compatibility with CPA is desired; do not overwrite CPA identities by default.
-- Decide strictness for unsupported execution settings and how that status is surfaced to operators.
-- Select dependency versions and CI targets during implementation.
+The usage outbox lives under the private identity directory. It uses bounded,
+checksummed records, atomic publication/fsync, exclusive ownership, restart replay
+and persistent ACK deletion. Default limits are 4,096 pending items, 16 MiB of
+queued payloads and 256 KiB per payload, with a bounded recent-ID cache. These
+library defaults are not a promise of runtime tuning flags. Capacity or storage
+failure fences admission rather than evicting accepted records. Preserve corrupt
+records for investigation; do not delete the reporting directory to force readiness.
 
-The initial Rust implementation now builds and has 79 passing local tests, including mock Home mTLS registration/dispatch/release, config fencing, heartbeat semantics, mock-upstream HTTP forwarding, and SSE disconnect completion. Formatting and strict Clippy checks pass. No live Home interoperability or full CLIProxyAPI parity has been established. Enrollment currently follows CPA's plaintext RESP bootstrap; normal communication uses mTLS. Protect the enrollment network path. Automatic failover/takeover, OAuth execution, durable reporting and full provider token/billing attribution remain outstanding.
+Durability covers **only events accepted by the outbox**. It cannot reconstruct
+usage never observed before a crash or events rejected for persistence/capacity
+errors. Release delivery is a separate lifetime-bound mechanism. Home deduplication
+must be verified for replay and stale backups; this is not end-to-end exactly-once
+billing or complete provider billing equivalence. See `src/execution.rs`,
+`src/reporting.rs` and `src/reporting/`.
+
+## Compatibility references and validation
+
+The deployed AI48Home handlers and wire schemas are authoritative. Relevant Home
+sources include `internal/home/config_yaml.go`, `internal/home/auth_sanitize.go`,
+`internal/respserver/subscribe/config.go`, `internal/respserver/subscription_liveness.go`,
+`internal/respserver/pop/dynamic/dispatch.go`, `internal/respserver/push/` and
+`internal/cluster/` membership/rebalance handlers. CLIProxyAPI remains an external
+compatibility reference where a shared wire or provider behavior needs comparison;
+that does not establish feature equivalence or automatic version synchronization.
+
+[Implementation status](porting-status.md) records a dated checkpoint, including
+limited reported live results. It is not blanket deployment acceptance; historical
+feature inventories can lag current source. Revalidate the exact
+Home/worker revisions and required provider subset using the acceptance runbook.
+No full compatibility, failover, billing reconciliation or live acceptance result
+is asserted by this architecture document.

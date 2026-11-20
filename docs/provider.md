@@ -98,17 +98,68 @@ explicitly rejects them. Do not report full Home-worker replacement/parity.
 
 ## Explicit limits
 
-Antigravity tools, function calls/responses, thought signature/replay inputs,
-structured output and image generation reject before network execution rather
-than pretending to implement the Go schema/signature/replay machinery. No full Go
-model-specific normalization, credits fallback, local compaction, version updater,
-project discovery or signature cache. Basic native generation is implemented,
-not full Antigravity parity. Vertex Imagen, interactions, countTokens and full
+Focused Gemini/Antigravity function tools are implemented (details below).
+Antigravity structured output, image generation and unsupported reasoning replay
+still reject before network execution. No full Go model-specific normalization,
+credits fallback, local compaction, version updater, project discovery or signature
+cache. This is not full Antigravity parity. Vertex Imagen, interactions, countTokens and full
 reasoning replay are not implemented. Gemini CLI remains plugin-hosted/unsupported.
 Codex WebSocket/SIWC/continuation and advanced Claude parity remain out of scope.
 
 Credential auth headers cannot be replaced by caller headers or trusted custom
 header attributes. Errors do not echo tokens. No local secrets are persisted.
+
+## Focused function tools (current)
+
+- `protocol::gemini::chat_request` handles Chat function declarations, `auto`,
+  `none`, `required`, named `tool_choice`, assistant `tool_calls`, and matching
+  tool results. It emits native Gemini JSON, retaining function-call/result IDs.
+  Parallel results are grouped; missing/duplicate/unknown results reject.
+- **Parent integration:** select `protocol::gemini::antigravity_chat_request` for
+  Chat destined for Antigravity, not `chat_request`. It preserves the original
+  declaration types for provider normalization; the Gemini JSON-schema carrier
+  follows Go's string-enum policy instead. Both return *unwrapped* Gemini input.
+  Apply thinking and provider normalization before the existing final payload
+  barrier. Gateway wiring is owned independently and was not edited here.
+- Gemini JSON and incremental SSE output produce Chat tool IDs, names, JSON
+  argument strings, parallel-call indices (SSE only), and `tool_calls` finish
+  reason on successful tool turns. Provider signatures travel on
+  `tool_calls[].extra_content.google.thought_signature`. Unwrap Antigravity
+  envelopes first using `unwrap_response`; SSE framing remains gateway-owned.
+- Antigravity accepts function declarations and converts `parametersJsonSchema`
+  to `parameters`. Cleaning is scoped to declaration schemas, never function
+  arguments/results. The focused Go port supports constraint/enum description
+  hints, preserved native numeric/boolean types, required-field cleanup, missing
+  array items, metadata removal and empty/nested-object placeholders for Claude
+  and Gemini 3/3.1 Pro. Gemini JSON-schema declarations preserve standard
+  constraints and additionalProperties. Tool results remain strings, not parsed
+  JSON, matching Go's Chat mapping.
+- Synthetic replay attaches the bypass sentinel only to the first parallel call.
+  Antigravity Gemini can replay field-2/field-1 protobuf function signatures with
+  an opaque Tink body or UUID body, including `google#` prefixes. The signature
+  stays on its original call; this is envelope checking, not authentication or
+  proof of conversation provenance. Bare Vertex Tink and unrecognized envelopes
+  fail closed rather than being silently replaced. Real signed Claude replay,
+  signed text/thought blocks, nested server-tool signature envelopes and replay
+  caches are not implemented. Antigravity history currently requires call IDs
+  and complete matched results; native ID-less history rejects.
+- Antigravity Claude uses Go's forced `VALIDATED` mode. Explicit Chat auto/none/
+  required/named choices for Claude reject rather than silently overriding the
+  caller's choice. Gemini-backed Antigravity supports those choices normally.
+- Local `$ref` expansion, allOf/conditional merging, malformed/MCP schema repair
+  and Claude union flattening are not ported: these inputs reject explicitly.
+  Multi-branch unions are preserved on non-placeholder Gemini routes; union
+  schemas on Claude/Pro placeholder routes reject. Built-in tools, media,
+  incremental `partialArgs`/`willContinue`, response schemas and signature-only
+  trailing SSE events remain unsupported. This is deliberately narrower than Go.
+
+Reference sources: Go `internal/util/gemini_schema.go`,
+`internal/signature/gemini_{sanitize,validation}.go`,
+`internal/runtime/executor/antigravity_executor_request.go`, and the Gemini and
+Antigravity OpenAI Chat translators. Offline fixtures cover declaration cleanup
+without history corruption, choices, parallel calls/results, placeholders, native
+signature round-trip, and every split of a tool-bearing SSE event. No live
+provider/authentication test was performed.
 
 ## Validation
 

@@ -28,11 +28,8 @@ pub(super) fn features(raw: &Value) -> Vec<String> {
         "multimedia",
         "oauth-request-scoped-errors",
         "disable-claude-cloak-mode",
-        "force-model-prefix",
-        "request-log",
         "ws-auth",
         "api-keys",
-        "shutdown-timeout",
         "redis-usage-queue-retention-seconds",
     ] {
         if let Some(value) = field(raw, key) {
@@ -111,28 +108,18 @@ pub(super) fn features(raw: &Value) -> Vec<String> {
         }
     }
     // Additional canonical v8 execution controls not projected by normalization.
-    for (container, keys) in [
-        ("routing", &["force-model-prefix"][..]),
-        ("access", &["api-keys"][..]),
-        ("server", &["shutdown-timeout"][..]),
-    ] {
-        if let Some(value) = field(raw, container) {
-            for key in keys {
-                if let Some(v) = field(value, key) {
-                    leaves(v, &format!("{container}.{key}"), &mut out);
-                }
-            }
-        }
+    if let Some(value) = field(raw, "access").and_then(|v| field(v, "api-keys")) {
+        leaves(value, "access.api-keys", &mut out);
     }
-    if let Some(observability) = field(raw, "observability") {
-        for (container, key) in [
-            ("logs", "request-log"),
-            ("usage", "redis-usage-queue-retention-seconds"),
-        ] {
-            if let Some(value) = field(observability, container).and_then(|v| field(v, key)) {
-                leaves(value, &format!("observability.{container}.{key}"), &mut out);
-            }
-        }
+    if let Some(value) = field(raw, "observability")
+        .and_then(|v| field(v, "usage"))
+        .and_then(|v| field(v, "redis-usage-queue-retention-seconds"))
+    {
+        leaves(
+            value,
+            "observability.usage.redis-usage-queue-retention-seconds",
+            &mut out,
+        );
     }
     // Home owns routing strategy, cooldowns, aliases, model catalogs, credentials,
     // cluster/KV metadata, management and usage switches; these are not local
@@ -160,9 +147,11 @@ fn streaming(value: &Value, path: &str, out: &mut Vec<String>) {
         let Some(key) = key.as_str() else {
             continue;
         };
-        if matches!(key, "keepalive-seconds" | "bootstrap-retries")
-            && v.as_i64().is_some_and(|n| n <= 0)
-        {
+        // CPA disables bootstrap replay unconditionally in Home mode.
+        if key == "bootstrap-retries" {
+            continue;
+        }
+        if key == "keepalive-seconds" && v.as_i64().is_some_and(|n| n <= 0) {
             continue;
         }
         // The pre-first-token switch is ineffective without positive keepalives.

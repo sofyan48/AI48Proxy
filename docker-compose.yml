@@ -9,9 +9,9 @@ x-worker: &worker
   user: "10001:10001"
   command: ["--identity-dir", "/var/lib/ai48proxy/identity"]
   depends_on:
-    - home
+    - ai48home
   networks:
-    - cliproxy
+    - ai48proxy
   stop_grace_period: 120s
   restart: unless-stopped
   healthcheck:
@@ -24,7 +24,7 @@ x-worker: &worker
 services:
   postgres:
     image: postgres:17-alpine
-    container_name: cliproxy-postgres
+    container_name: ai48home-postgres
     environment:
       POSTGRES_USER: ${POSTGRES_USER:?Run ./install.sh deploy to generate POSTGRES_USER}
       POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?Run ./install.sh deploy to generate POSTGRES_PASSWORD}
@@ -37,10 +37,10 @@ services:
       timeout: 5s
       retries: 20
     networks:
-      - cliproxy
+      - ai48proxy
     restart: unless-stopped
 
-  home:
+  ai48home:
     image: ${HOME_IMAGE:-ghcr.io/sofyan48/ai48home:latest}
     pull_policy: always
     container_name: ai48home
@@ -62,17 +62,19 @@ services:
       - ./home-logs:/AI48Home/logs
       - ./home-plugins:/AI48Home/plugins
     networks:
-      cliproxy:
+      ai48proxy:
         aliases:
+          - ai48home
+          # Existing cluster.yaml files and issued JWTs may still refer to home.
           - home
     stop_grace_period: 30s
     restart: unless-stopped
 
   # Empty JWTs are permitted only while the installer initializes Home and issues
   # tokens. The installer must fill all three before starting these services.
-  cliproxy-1:
+  ai48proxy-1:
     <<: *worker
-    container_name: cliproxy-worker-1
+    container_name: ai48proxy-worker-1
     environment:
       HOME_JWT: ${HOME_JWT_1:-}
       WORKER_START_DELAY: ${WORKER_START_DELAY:-25}
@@ -80,9 +82,9 @@ services:
     volumes:
       - worker-1-state:/var/lib/ai48proxy
 
-  cliproxy-2:
+  ai48proxy-2:
     <<: *worker
-    container_name: cliproxy-worker-2
+    container_name: ai48proxy-worker-2
     environment:
       HOME_JWT: ${HOME_JWT_2:-}
       WORKER_START_DELAY: ${WORKER_START_DELAY:-25}
@@ -90,9 +92,9 @@ services:
     volumes:
       - worker-2-state:/var/lib/ai48proxy
 
-  cliproxy-3:
+  ai48proxy-3:
     <<: *worker
-    container_name: cliproxy-worker-3
+    container_name: ai48proxy-worker-3
     environment:
       HOME_JWT: ${HOME_JWT_3:-}
       WORKER_START_DELAY: ${WORKER_START_DELAY:-25}
@@ -102,11 +104,11 @@ services:
 
   nginx:
     image: nginx:alpine
-    container_name: cliproxy-lb
+    container_name: ai48proxy-lb
     depends_on:
-      - cliproxy-1
-      - cliproxy-2
-      - cliproxy-3
+      - ai48proxy-1
+      - ai48proxy-2
+      - ai48proxy-3
     ports:
       - "8317:8317"
     volumes:
@@ -117,7 +119,7 @@ services:
         bind:
           create_host_path: false
     networks:
-      - cliproxy
+      - ai48proxy
     stop_grace_period: 15s
     restart: unless-stopped
 
@@ -127,5 +129,5 @@ volumes:
   worker-3-state:
 
 networks:
-  cliproxy:
-    name: cliproxy-network
+  ai48proxy:
+    name: ai48proxy-network

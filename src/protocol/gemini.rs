@@ -6,9 +6,18 @@ use serde_json::{Value, json};
 
 #[path = "gemini_request.rs"]
 mod request;
+#[path = "gemini_schema.rs"]
+pub(crate) mod schema;
+const BYPASS: &str = "skip_thought_signature_validator";
+fn is_bypass(signature: &str) -> bool {
+    matches!(
+        signature,
+        "skip_thought_signature_validator" | "context_engineering_is_the_way_to_go"
+    )
+}
 #[path = "gemini_stream.rs"]
 mod stream;
-pub use request::chat_request;
+pub use request::{antigravity_chat_request, chat_request};
 pub use stream::StreamTranslator;
 #[cfg(test)]
 #[path = "gemini_tests.rs"]
@@ -139,6 +148,10 @@ fn parts(candidate: &Value, index: u64, next_tool: &mut u64) -> Result<Value> {
                 "unsupported Gemini response part: {key}"
             );
         }
+        ensure!(
+            part.get("text").is_some() || part.get("functionCall").is_some(),
+            "unsupported Gemini signature-only or empty response part"
+        );
         if let Some(thought) = part.get("thought") {
             ensure!(thought.is_boolean(), "invalid thought flag");
         }

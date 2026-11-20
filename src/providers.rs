@@ -14,6 +14,10 @@ pub mod antigravity;
 pub mod claude;
 #[path = "providers/claude_identity.rs"]
 pub mod claude_identity;
+#[path = "providers/claude_limits.rs"]
+pub mod claude_limits;
+#[path = "providers/claude_signing.rs"]
+pub mod claude_signing;
 #[path = "providers/codex.rs"]
 pub mod codex;
 #[cfg(test)]
@@ -473,8 +477,13 @@ pub fn prepare_context(
     } else {
         ResponseMode::Json
     };
+    // CCH is a transport signature over the final bytes, never a business mutation.
+    let mut bytes = serde_json::to_vec(&body)?;
+    if format == ProviderFormat::Claude && creds.oauth {
+        bytes = claude_signing::sign(bytes)?;
+    }
     Ok(Prepared {
-        request: client.build()?.post(url).headers(creds.headers).json(&body),
+        request: client.build()?.post(url).headers(creds.headers).body(bytes),
         stream,
         format,
         response_mode,

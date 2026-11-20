@@ -11,6 +11,30 @@ use std::{io, sync::Arc};
 use tracing::Instrument;
 const MAX_RESPONSE: usize = 32 * 1024 * 1024;
 
+/// Route owners call this after translation for both JSON and SSE responses.
+/// The original upstream headers must be captured before consuming the response.
+#[allow(dead_code)] // Awaiting wiring in the separately owned routes module.
+pub(super) fn configured(
+    mut response: Response,
+    headers: &http::HeaderMap,
+    config: &crate::config::Config,
+    sse: bool,
+) -> Response {
+    if config.passthrough_headers {
+        crate::config::keepalive::passthrough(response.headers_mut(), headers);
+    }
+    if sse {
+        crate::config::keepalive::body(
+            response,
+            config.streaming.keepalive_interval,
+            true,
+            config.streaming.send_keepalive_before_ft,
+        )
+    } else {
+        response
+    }
+}
+
 #[cfg(test)]
 #[path = "google_translation_response_tests.rs"]
 mod google_translation_response_tests;

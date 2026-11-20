@@ -7,23 +7,31 @@ Use Docker Engine with the Compose plugin.
 | Service | Image / role | Published port |
 | --- | --- | --- |
 | `postgres` | `postgres:17-alpine`, Home database | None |
-| `home` | `HOME_IMAGE`, alias `home` | `8327:8327` |
-| `cliproxy-1` | Local Rust build, worker 1 | None |
-| `cliproxy-2` | Local Rust build, worker 2 | None |
-| `cliproxy-3` | Local Rust build, worker 3 | None |
+| `ai48home` | `HOME_IMAGE`, alias `ai48home` | `8327:8327` |
+| `ai48proxy-1` | Local Rust build, worker 1 | None |
+| `ai48proxy-2` | Local Rust build, worker 2 | None |
+| `ai48proxy-3` | Local Rust build, worker 3 | None |
 | `nginx` | `nginx:alpine`, least-connections worker ingress | `8317:8317` |
 
-All services join the explicitly named `cliproxy-network`. nginx uses
-`cliproxy-1:8317`, `cliproxy-2:8317`, and `cliproxy-3:8317`. Its configuration is
+All services join the explicitly named `ai48proxy-network`. nginx uses
+`ai48proxy-1:8317`, `ai48proxy-2:8317`, and `ai48proxy-3:8317`. Its configuration is
 copied from Home's installer, including streaming and WebSocket forwarding.
 Every service uses `restart: unless-stopped`.
 
 ## Deploy
 
-Stop the old stack before deployment: the Home installer and this stack use the
-same container names, ports `8327`/`8317`, and network name. Do not run them side
-by side or attach competing worker aliases. Back up existing data before a
-migration; stopping the old stack does not migrate its database or identities.
+Stop the old stack before deployment: the Home installer and this stack publish
+the same ports `8327`/`8317`. New service/container/network names use AI48Home and
+AI48Proxy branding. Do not run both stacks side by side. Back up existing data
+before migration; stopping the old stack does not migrate its database or identities.
+
+For a deployment created before the naming change, stop its containers using the
+old Compose file before starting the renamed services. Do not remove volumes or
+change database credentials in the existing `.env`: PostgreSQL's user/database
+names are not migrated by renaming Compose services. Existing `.env`, generated
+configuration, bind-mount data paths and worker volume keys remain unchanged.
+The `home` DNS alias is retained for existing cluster configuration and issued
+worker identities; new cluster configuration advertises `ai48home`.
 
 From the AI48Proxy root:
 
@@ -41,9 +49,9 @@ Do not start the entire stack before this bootstrap sequence completes.
 
 | Variable in `.env` | Purpose |
 | --- | --- |
-| `POSTGRES_USER` | Database user; installer default `cliproxy` |
+| `POSTGRES_USER` | Database user; installer default `ai48home` |
 | `POSTGRES_PASSWORD` | Generated database password |
-| `POSTGRES_DB` | Database name; installer default `cliproxy_home` |
+| `POSTGRES_DB` | Database name; installer default `ai48home` |
 | `HOME_IMAGE` | Home image; Compose default `ghcr.io/sofyan48/ai48home:latest` |
 | `MANAGEMENT_KEY` | Generated management key written to `deploy/config.yaml` |
 | `GATEWAY_API_KEY` | Generated downstream API key written to `deploy/config.yaml` |
@@ -87,7 +95,7 @@ After a successful `./install.sh deploy`:
 docker compose --env-file .env config --quiet
 ./install.sh start
 docker compose --env-file .env ps
-docker compose --env-file .env logs --tail 100 home cliproxy-1 cliproxy-2 cliproxy-3 nginx
+docker compose --env-file .env logs --tail 100 ai48home ai48proxy-1 ai48proxy-2 ai48proxy-3 nginx
 ```
 
 Home management is on port `8327`; downstream API requests go through nginx on

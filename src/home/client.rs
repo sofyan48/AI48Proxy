@@ -260,6 +260,30 @@ impl HomeClient {
         ensure!(self.ready(), "Home lifetime unavailable");
         self.send(args).await
     }
+    /// Forward one request-log envelope over the existing mTLS command path.
+    pub async fn push_request_log(&self, payload: Vec<u8>) -> Result<()> {
+        let reply = self
+            .command(vec![b"RPUSH".to_vec(), b"request-log".to_vec(), payload])
+            .await?;
+        ensure!(
+            matches!(reply, Frame::Integer(1)),
+            "request log not acknowledged"
+        );
+        Ok(())
+    }
+
+    /// Forward one application-log envelope over the existing mTLS command path.
+    pub async fn push_app_log(&self, payload: Vec<u8>) -> Result<()> {
+        let reply = self
+            .command(vec![b"RPUSH".to_vec(), b"app-log".to_vec(), payload])
+            .await?;
+        ensure!(
+            matches!(reply, Frame::Integer(1)),
+            "application log not acknowledged"
+        );
+        Ok(())
+    }
+
     async fn send(&self, args: Vec<Vec<u8>>) -> Result<Frame> {
         tokio::select! {
             biased;

@@ -4,6 +4,10 @@ use sha2::{Digest, Sha256};
 
 #[path = "antigravity_diagnostic.rs"]
 mod diagnostic;
+#[path = "antigravity_signature.rs"]
+mod signature;
+#[path = "antigravity_tools.rs"]
+mod tools;
 pub use diagnostic::{ForbiddenDiagnostic, forbidden_diagnostic};
 #[cfg(test)]
 #[path = "antigravity_fidelity_tests.rs"]
@@ -59,7 +63,7 @@ fn request_user_agent(configured: &str) -> &str {
 
 pub(super) fn normalize(body: &mut Value, selection: &Selection) -> Result<()> {
     ensure!(!selection.model.is_empty(), "Antigravity model missing");
-    // Image, schema conversion and reasoning replay need their actual implementations,
+    // Image generation, structured output and reasoning replay need their actual implementations,
     // not a generic bearer request that merely looks like provider support.
     ensure!(
         !selection.model.contains("image"),
@@ -69,10 +73,15 @@ pub(super) fn normalize(body: &mut Value, selection: &Selection) -> Result<()> {
         body.get("contents").is_some_and(Value::is_array),
         "Antigravity requires native Gemini contents"
     );
-    for key in ["request", "tools", "toolConfig", "cachedContent"] {
+    for key in [
+        "request",
+        "cachedContent",
+        "generation_config",
+        "system_instruction",
+    ] {
         ensure!(
             body.get(key).is_none(),
-            "Antigravity tools, cache and prewrapped envelopes unsupported"
+            "Antigravity cache, alternate containers and prewrapped envelopes unsupported"
         );
     }
     for key in ["responseSchema", "responseJsonSchema", "responseMimeType"] {
@@ -81,19 +90,7 @@ pub(super) fn normalize(body: &mut Value, selection: &Selection) -> Result<()> {
             "Antigravity structured output conversion unsupported"
         );
     }
-    for content in body["contents"].as_array().unwrap() {
-        if let Some(parts) = content.get("parts").and_then(Value::as_array) {
-            for part in parts {
-                ensure!(
-                    part.get("functionCall").is_none()
-                        && part.get("functionResponse").is_none()
-                        && part.get("thoughtSignature").is_none()
-                        && part.get("thought").and_then(Value::as_bool) != Some(true),
-                    "Antigravity tool/signature replay unsupported"
-                );
-            }
-        }
-    }
+    tools::normalize(body, &selection.model)?;
     let session = body
         .get("sessionId")
         .and_then(Value::as_str)

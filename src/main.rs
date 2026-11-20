@@ -1,21 +1,25 @@
 use ai48proxy::{
     config::Config,
     home::{bootstrap, client::supervisor::Supervisor, transport::Connector},
+    observability::{HomeLogLayer, LogForwarder},
     reporting::{QueueLimits, ReportingQueue},
 };
 use anyhow::{Context, Result, ensure};
 use clap::Parser;
 use std::sync::Arc;
+use tracing_subscriber::prelude::*;
 
 mod cli;
 use cli::Args;
 #[tokio::main]
 async fn main() -> Result<()> {
-    tracing_subscriber::fmt()
-        .with_env_filter(
+    tracing_subscriber::registry()
+        .with(
             tracing_subscriber::EnvFilter::try_from_default_env()
                 .unwrap_or_else(|_| "ai48proxy=info".into()),
         )
+        .with(tracing_subscriber::fmt::layer())
+        .with(HomeLogLayer)
         .init();
     let args = Args::parse();
     if let Some(url) = &args.healthcheck {
@@ -69,6 +73,7 @@ async fn main() -> Result<()> {
         QueueLimits::default(),
     )?);
     let supervisor = Supervisor::new(connector, reporting);
+    let logs = LogForwarder::install(&supervisor)?;
     let stop = supervisor.cancellation();
     let signal_stop = stop.clone();
     let signals = tokio::spawn(async move {
@@ -113,8 +118,13 @@ async fn main() -> Result<()> {
     if let Some(current) = supervisor.current() {
         current.stop_admission();
     }
+    let shutdown_timeout = supervisor
+        .current()
+        .map_or(config.shutdown_timeout, |home| {
+            home.config().shutdown_timeout
+        });
     if !server_finished
-        && tokio::time::timeout(config.lifecycle.cancel_bound, &mut server)
+        && tokio::time::timeout(shutdown_timeout, &mut server)
             .await
             .is_err()
     {
@@ -143,6 +153,14 @@ async fn main() -> Result<()> {
             }
         }
     };
+    let log_stats = logs.shutdown(config.lifecycle.cancel_bound).await;
+    tracing::info!(
+        sent = log_stats.sent,
+        overflow = log_stats.overflow,
+        unavailable = log_stats.unavailable,
+        failed = log_stats.failed,
+        "Home log forwarding stopped"
+    );
     signals.abort();
     let _ = signals.await;
     result

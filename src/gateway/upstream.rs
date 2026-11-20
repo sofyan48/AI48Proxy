@@ -158,7 +158,11 @@ pub(crate) fn prepare(
     let gemini_chat =
         incoming == Format::OpenAi && outgoing == Format::Gemini && path == "/v1/chat/completions";
     let translation = if gemini_chat {
-        body = crate::protocol::gemini::chat_request(&body, &selection.model)?;
+        body = if provider == "antigravity" {
+            crate::protocol::gemini::antigravity_chat_request(&body, &selection.model)?
+        } else {
+            crate::protocol::gemini::chat_request(&body, &selection.model)?
+        };
         None
     } else if incoming != outgoing {
         ensure!(

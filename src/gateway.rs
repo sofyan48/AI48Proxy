@@ -39,6 +39,8 @@ mod lifecycle;
 #[cfg(test)]
 #[path = "gateway/provider_matrix_tests.rs"]
 mod provider_matrix_tests;
+#[path = "gateway/rejection.rs"]
+mod rejection;
 #[path = "gateway/response.rs"]
 mod response;
 #[path = "gateway/routes.rs"]
@@ -55,12 +57,30 @@ mod usage;
 #[path = "gateway/websocket.rs"]
 mod websocket;
 
+#[path = "gateway/media.rs"]
+mod media;
+
 pub fn router(home: Arc<HomeClient>) -> Router {
     Router::new()
         .route("/healthz", get(health))
         .route("/v1/models", get(models))
         .route("/v1/chat/completions", post(generate))
         .route("/v1/completions", post(generate))
+        .route("/v1/images/generations", post(media::handle))
+        .route("/v1/images/edits", post(media::handle))
+        .route("/v1/audio/speech", post(media::handle))
+        .route("/v1/tts", post(media::handle))
+        .route("/v1/videos", post(media::unsupported))
+        .route("/v1/videos/generations", post(media::unsupported))
+        .route("/v1/videos/edits", post(media::unsupported))
+        .route("/v1/videos/extensions", post(media::unsupported))
+        .route("/v1/videos/{request_id}", get(media::unsupported))
+        .route("/openai/v1/videos", post(media::unsupported))
+        .route("/openai/v1/videos/{video_id}", get(media::unsupported))
+        .route(
+            "/openai/v1/videos/{video_id}/content",
+            get(media::unsupported),
+        )
         .route("/v1/responses", post(generate).get(websocket::upgrade))
         .route("/v1/responses/compact", post(generate))
         .route("/v1/messages", post(generate))
@@ -200,7 +220,25 @@ async fn generate(State(home): State<Arc<HomeClient>>, request: Request) -> Resp
             );
         }
     };
-    routes::generate(home, parts.uri, parts.headers, body).await
+    // One Home request log per client request, independent of retries/refresh.
+    let started = std::time::Instant::now();
+    let model = body
+        .get("model")
+        .and_then(Value::as_str)
+        .unwrap_or_default()
+        .to_owned();
+    let record = crate::observability::RequestLogRecord::new(
+        &diagnostics::request_id(),
+        parts.uri.path(),
+        &model,
+    )
+    .headers(&parts.headers);
+    let response = routes::generate(home.clone(), parts.uri, parts.headers, body).await;
+    crate::observability::submit(
+        &home,
+        record.finish(response.status().as_u16(), started.elapsed()),
+    );
+    response
 }
 
 const SESSION_HEADERS: &[&str] = &[

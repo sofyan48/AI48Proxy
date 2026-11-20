@@ -24,6 +24,16 @@ fn text_parts(content: &Value) -> Result<Vec<Value>> {
 /// Convert OpenAI Chat text/function-tool requests to native generateContent JSON.
 /// The caller chooses the model/URL and handles stream_options locally.
 pub fn chat_request(body: &Value, model: &str) -> Result<Value> {
+    chat_request_inner(body, model, false)
+}
+
+/// Preserve original declaration types for the Antigravity provider cleaner.
+/// Returns unwrapped native Gemini input, not a Cloud Code request envelope.
+pub fn antigravity_chat_request(body: &Value, model: &str) -> Result<Value> {
+    chat_request_inner(body, model, true)
+}
+
+fn chat_request_inner(body: &Value, model: &str, antigravity: bool) -> Result<Value> {
     object(body)?;
     ensure!(!model.is_empty(), "target model is required");
     for key in body.as_object().unwrap().keys() {
@@ -115,7 +125,7 @@ pub fn chat_request(body: &Value, model: &str) -> Result<Value> {
                         pending.is_empty(),
                         "unanswered tool calls before assistant turn"
                     );
-                    for call in array(calls)? {
+                    for (call_index, call) in array(calls)?.iter().enumerate() {
                         ensure!(call["type"] == "function", "unsupported tool call type");
                         let id = text(&call["id"])?;
                         ensure!(
@@ -130,9 +140,18 @@ pub fn chat_request(body: &Value, model: &str) -> Result<Value> {
                         let signature = call
                             .pointer("/extra_content/google/thought_signature")
                             .map(text)
-                            .transpose()?
-                            .unwrap_or("skip_thought_signature_validator");
-                        parts.push(json!({"functionCall":{"name":function,"args":args},"thoughtSignature":signature}));
+                            .transpose()?;
+                        let mut part =
+                            json!({"functionCall":{"id":id,"name":function,"args":args}});
+                        if let Some(signature) = signature.filter(|s| !s.is_empty()) {
+                            // Synthetic bypasses belong only on the first parallel call.
+                            if call_index == 0 || !super::is_bypass(signature) {
+                                part["thoughtSignature"] = json!(signature);
+                            }
+                        } else if call_index == 0 {
+                            part["thoughtSignature"] = json!(super::BYPASS);
+                        }
+                        parts.push(part);
                     }
                 }
                 "model"
@@ -154,7 +173,7 @@ pub fn chat_request(body: &Value, model: &str) -> Result<Value> {
                     )
                 };
                 parts = vec![
-                    json!({"functionResponse":{"name":function,"response":{"result":result}}}),
+                    json!({"functionResponse":{"id":id,"name":function,"response":{"result":result}}}),
                 ];
                 "user"
             }
@@ -259,6 +278,11 @@ pub fn chat_request(body: &Value, model: &str) -> Result<Value> {
                 .cloned()
                 .unwrap_or(json!({"type":"object","properties":{}}));
             object(&schema)?;
+            let schema = if antigravity {
+                schema
+            } else {
+                super::schema::clean(&schema, false, false)?
+            };
             let mut declaration = json!({"name":function_name,"parametersJsonSchema":schema});
             if let Some(description) = function.get("description") {
                 declaration["description"] = json!(text(description)?);

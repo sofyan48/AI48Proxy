@@ -27,9 +27,9 @@ initialize() {
     gateway="$(openssl rand -hex 32)"
     cat > "$ENV_FILE" <<EOF
 # Generated locally; do not commit or share this file.
-POSTGRES_USER=cliproxy
+POSTGRES_USER=ai48home
 POSTGRES_PASSWORD=$pg
-POSTGRES_DB=cliproxy_home
+POSTGRES_DB=ai48home
 HOME_IMAGE=ghcr.io/sofyan48/ai48home:latest
 AI48PROXY_IMAGE=ai48proxy:local
 RUST_IMAGE=rust:bookworm
@@ -57,7 +57,7 @@ pgsql:
   database: "$(value POSTGRES_DB)"
   sslmode: disable
 node:
-  external-ip: home
+  external-ip: ai48home
   external-port: 8327
   port: 8327
   heartbeat-interval: 5s
@@ -74,7 +74,7 @@ remote-management:
   allow-remote: true
   secret-key: "$(value MANAGEMENT_KEY)"
   disable-control-panel: false
-auth-dir: "~/.cli-proxy-api"
+auth-dir: "~/.ai48home"
 api-keys:
   - "$(value GATEWAY_API_KEY)"
 EOF
@@ -89,7 +89,7 @@ wait_home() {
       http://127.0.0.1:8327/v8/management/nodes >/dev/null 2>&1; then return 0; fi
     sleep 2
   done
-  fail 'Home did not become ready. Inspect: docker compose logs home'
+  fail 'Home did not become ready. Inspect: docker compose logs ai48home'
 }
 provision_workers() {
   local i token existing seen='|'
@@ -121,34 +121,34 @@ case "$ACTION" in
       [[ ! -d home-data || -z "$(ls -A home-data)" ]] || fail 'Existing Home data without bootstrap marker: refusing automatic import. Inspect/migrate it explicitly.'
       [[ ! -d postgres-data || -z "$(ls -A postgres-data)" ]] || fail 'Existing PostgreSQL data without bootstrap marker: refusing automatic import. Inspect/migrate it explicitly.'
     fi
-    compose build cliproxy-1
+    compose build ai48proxy-1
     compose up -d --wait --wait-timeout 180 postgres
     if [[ ! -e deploy/.home-imported ]]; then
       # Import once into a new database, before starting the persistent Home process.
       # Never import over an existing stack. Use this installer in a fresh directory.
-      compose run --rm --no-deps -v "$ROOT/deploy/config.yaml:/AI48Home/config.yaml:ro" home ./AI48Home -import
+      compose run --rm --no-deps -v "$ROOT/deploy/config.yaml:/AI48Home/config.yaml:ro" ai48home ./AI48Home -import
       touch deploy/.home-imported
     fi
-    compose up -d home
+    compose up -d ai48home
     wait_home
     provision_workers
-    compose up -d --wait --wait-timeout 240 cliproxy-1 cliproxy-2 cliproxy-3
+    compose up -d --wait --wait-timeout 240 ai48proxy-1 ai48proxy-2 ai48proxy-3
     compose up -d nginx
     compose ps
     log 'Stack started: Home :8327, gateway/nginx :8317. Secrets remain in .env.'
-    log 'Check worker readiness: docker compose ps; docker compose logs cliproxy-1'
+    log 'Check worker readiness: docker compose ps; docker compose logs ai48proxy-1'
     ;;
   start)
     [[ -f "$ENV_FILE" && -e deploy/.home-imported ]] || fail 'Run install.sh deploy first.'
     for i in 1 2 3; do [[ -n "$(value "HOME_JWT_$i")" ]] || fail 'Worker JWT missing: finish install.sh deploy first.'; done
     compose up -d --wait --wait-timeout 180 postgres
-    compose up -d home
+    compose up -d ai48home
     wait_home
-    compose up -d --wait --wait-timeout 240 cliproxy-1 cliproxy-2 cliproxy-3
+    compose up -d --wait --wait-timeout 240 ai48proxy-1 ai48proxy-2 ai48proxy-3
     compose up -d nginx
     ;;
-  stop) compose stop nginx cliproxy-1 cliproxy-2 cliproxy-3; compose stop home postgres ;;
+  stop) compose stop nginx ai48proxy-1 ai48proxy-2 ai48proxy-3; compose stop ai48home postgres ;;
   status) compose ps ;;
-  logs) compose logs --tail=100 "${2:-cliproxy-1}" ;;
+  logs) compose logs --tail=100 "${2:-ai48proxy-1}" ;;
   *) fail 'Usage: bash install.sh {init|deploy|start|stop|status|logs [service]}' ;;
 esac

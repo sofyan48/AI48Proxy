@@ -291,6 +291,7 @@ pub(super) async fn generate(
         // This decision is strictly before any body read/output. Body failures below
         // never return to dispatch, including SSE failures after response headers.
         let will_retry = retryable
+            && !(result.is_ok() && attempt.record.fail_code == "request_scoped")
             && can_retry(
                 round,
                 selection.request_retry,
@@ -346,7 +347,11 @@ pub(super) async fn generate(
         if !response.status().is_success() {
             let status = response.status();
             // Upstream error bodies may echo credentials or trusted URLs; never expose them.
-            return error(status, "upstream_error", "Upstream rejected the request");
+            return super::rejection::response(
+                status,
+                &attempt.record.provider,
+                response.headers(),
+            );
         }
         let content_type = response
             .headers()
@@ -443,7 +448,21 @@ async fn observe_result(
         .and_then(|v| v.parse::<u64>().ok());
     let cancellation = attempt.cancellation();
     let body = super::diagnostics::error_body(response, &cancellation).await;
+    let mut request_scoped = false;
     if attempt.record.provider == "claude" {
+        let limit = super::rejection::claude_limit(status, response.headers(), &body);
+        request_scoped = limit.scope == crate::providers::claude_limits::LimitScope::Request;
+        if let Some(delay) = limit.retry_after {
+            let seconds = delay
+                .as_secs()
+                .saturating_add(u64::from(delay.subsec_nanos() > 0));
+            if let Ok(value) = seconds.to_string().parse() {
+                response.headers_mut().insert("retry-after", value);
+            }
+        }
+        tracing::warn!(event = "claude_limit", scope = ?limit.scope,
+            retry_after_seconds = limit.retry_after.map(|delay| delay.as_secs()),
+            "Claude upstream failure classified");
         let category = match body.pointer("/error/type").and_then(Value::as_str) {
             Some("rate_limit_error") => "rate_limit_error",
             Some("overloaded_error") => "overloaded_error",
@@ -475,6 +494,9 @@ async fn observe_result(
     }
     // An unreadable error body does not erase the genuine HTTP failure.
     attempt.record.upstream_failure(status, &body);
+    if request_scoped {
+        attempt.record.fail_code = "request_scoped".into();
+    }
 }
 
 fn accepts_sse(mode: crate::providers::ResponseMode, content_type: &str) -> bool {

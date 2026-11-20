@@ -180,7 +180,7 @@ fn provenance_is_removed_without_inventing_thinking_signatures() {
     assert_eq!(body["messages"][0]["content"][0], thinking);
     assert_eq!(
         body["messages"][0]["content"][1],
-        json!({"type":"tool_use","id":"tool_1","name":"lookup","input":{}})
+        json!({"type":"tool_use","id":"tool_1","name":"lookup","input":{},"cache_control":{"type":"ephemeral","ttl":"1h"}})
     );
 }
 
@@ -315,8 +315,8 @@ fn basic_oauth_model_baselines_match_go_wire_order() {
                 "{model}, stream={stream}"
             );
             assert_eq!(
-                payload(&request)["messages"],
-                json!([{"role":"user","content":"hi"}])
+                payload(&request)["messages"][0]["content"][1],
+                json!({"type":"text","text":"hi","cache_control":{"type":"ephemeral","ttl":"1h"}})
             );
         }
     }

@@ -51,6 +51,7 @@ dependencies = [
  "tracing-subscriber",
  "url",
  "uuid",
+ "xxhash-rust",
 ]
 
 [[package]]
@@ -2422,6 +2423,12 @@ dependencies = [
  "thiserror",
  "time",
 ]
+
+[[package]]
+name = "xxhash-rust"
+version = "0.8.21"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "40de123dbb523ebcc00d61ec01840ad192578afc378d859f3429caa38308fad5"
 
 [[package]]
 name = "yasna"

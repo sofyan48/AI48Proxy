@@ -124,9 +124,10 @@ impl Supervisor {
             tokio::select! {
                 _ = self.stop.cancelled() => {
                     home.stop_admission();
-                    let bound = home.config().lifecycle.cancel_bound;
-                    // Let live responses finish before cancellation; never exceed the configured budget.
-                    let drained = tokio::time::timeout(bound, home.drain()).await;
+                    let config = home.config();
+                    let bound = config.lifecycle.cancel_bound;
+                    // HTTP draining is opt-in; lifecycle cleanup retains its separate safety bound.
+                    let drained = tokio::time::timeout(config.shutdown_timeout, home.drain()).await;
                     home.fence_reason("shutdown");
                     // Cancellation completes stream guards and may enqueue their final usage.
                     let final_drain = tokio::time::timeout(bound, home.drain()).await;

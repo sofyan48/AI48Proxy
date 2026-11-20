@@ -119,6 +119,10 @@ pub(super) fn normalize(mut root: Value) -> Result<Value> {
         ("max-retry-interval", "routing.retry.max-retry-interval"),
         ("proxy-url", "requests.proxy-url"),
         ("streaming", "requests.streaming"),
+        ("passthrough-headers", "requests.passthrough-headers"),
+        ("force-model-prefix", "routing.force-model-prefix"),
+        ("oauth-request-scoped-errors", "oauth.request-scoped-errors"),
+        ("shutdown-timeout", "server.shutdown-timeout"),
         (
             "nonstream-keepalive-interval",
             "requests.nonstream-keepalive-interval",
@@ -129,6 +133,7 @@ pub(super) fn normalize(mut root: Value) -> Result<Value> {
         ),
         ("max-request-body-bytes", "server.max-request-body-bytes"),
         ("payload", "requests.payload"),
+        ("request-log", "observability.logs.request-log"),
         ("credential-concurrency", "credentials.concurrency"),
         ("credential-in-flight", "credentials.in-flight"),
     ] {

@@ -1,5 +1,5 @@
-//! Claude Messages bearer/API-key execution. This is a native-input subset,
-//! not CPA's full cloaking, signing, tool aliasing or per-model beta engine.
+//! Claude Messages bearer/API-key execution with focused OAuth CLI wire policy.
+//! Advanced helper/subagent profiles and reversible tool aliasing are not implemented.
 use super::{insert, text};
 use anyhow::{Result, ensure};
 use http::HeaderMap;
@@ -7,6 +7,8 @@ use serde_json::{Value, json};
 
 #[path = "claude_betas.rs"]
 mod betas;
+#[path = "claude_wire.rs"]
+mod wire;
 
 #[cfg(test)]
 #[path = "claude_contract_tests.rs"]
@@ -42,7 +44,10 @@ pub(super) fn prepare_body(
         body.get("messages").is_some_and(Value::is_array),
         "Claude Messages input missing"
     );
-    normalize_native_body(body);
+    let native = oauth && wire::confirmed(body, incoming);
+    if !native {
+        normalize_native_body(body);
+    }
     if let Some(version) = incoming.get("anthropic-version") {
         headers.insert("anthropic-version", version.clone());
     }
@@ -75,13 +80,7 @@ pub(super) fn prepare_body(
                 .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b)),
         "Claude OAuth requires canonical Home claude_device_ids"
     );
-    for field in [
-        "thread",
-        "fallbacks",
-        "safeguards",
-        "diagnostics",
-        "context_management",
-    ] {
+    for field in ["thread", "fallbacks", "safeguards", "diagnostics"] {
         ensure!(
             body.get(field).is_none(),
             "Claude extended feature requires unsupported native handling"
@@ -94,6 +93,10 @@ pub(super) fn prepare_body(
             }),
             "Claude server/advanced tools unsupported"
         );
+    }
+    wire::apply(body, auth, incoming, native)?;
+    if !native {
+        wire::context_management(body)?;
     }
     // Go rebuilds typed client declarations without `type`. Names remain native:
     // aliasing requires a per-request reverse map in both JSON and SSE responses.
@@ -142,7 +145,29 @@ pub(super) fn prepare_body(
     )?;
     // Basic OAuth baseline follows Go's model capability ordering. Explicit
     // caller/operator extensions still pass through the existing merge policy.
-    let baseline = betas::baseline(body);
+    let baseline = if native {
+        Vec::new()
+    } else {
+        betas::baseline(body)
+    };
+    if native {
+        for name in [
+            "user-agent",
+            "x-app",
+            "x-stainless-package-version",
+            "x-stainless-runtime-version",
+            "x-stainless-os",
+            "x-stainless-arch",
+            "x-stainless-timeout",
+            "x-stainless-lang",
+            "x-stainless-runtime",
+            "anthropic-dangerous-direct-browser-access",
+        ] {
+            if let Some(value) = incoming.get(name) {
+                headers.insert(http::header::HeaderName::from_static(name), value.clone());
+            }
+        }
+    }
     request_betas(body, headers, incoming, baseline)
 }
 

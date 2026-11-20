@@ -206,6 +206,10 @@ async fn bulk(peer: &mut Peer, bytes: &[u8]) {
 }
 
 async fn upstream(status: u16, body: &str) -> reqwest::Response {
+    upstream_headers(status, body, "").await
+}
+
+async fn upstream_headers(status: u16, body: &str, extra: &str) -> reqwest::Response {
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let url = format!("http://{}/", listener.local_addr().unwrap());
     let serve = async {
@@ -215,7 +219,7 @@ async fn upstream(status: u16, body: &str) -> reqwest::Response {
             headers.push(socket.read_u8().await.unwrap());
             assert!(headers.len() < 8192);
         }
-        socket.write_all(format!("HTTP/1.1 {status} Test\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}", body.len()).as_bytes()).await.unwrap();
+        socket.write_all(format!("HTTP/1.1 {status} Test\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n{extra}\r\n{body}", body.len()).as_bytes()).await.unwrap();
     };
     let client = reqwest::Client::builder().no_proxy().build().unwrap();
     let (response, ()) = bounded(async { tokio::join!(client.get(url).send(), serve) }).await;
@@ -301,6 +305,27 @@ async fn feedback_429_consumes_body_and_reports_only_allowlisted_quota_hints() {
         serde_json::from_str::<Value>(payload["fail"]["body"].as_str().unwrap()).unwrap(),
         expected
     );
+    client.fence();
+}
+
+#[tokio::test]
+async fn claude_rejection_keeps_reset_header_and_safe_home_attribution() {
+    let home = Home::new().await;
+    let (client, _subscription) = home.start().await;
+    let mut attempt = home.attempt(client.clone(), "claude").await;
+    let body = json!({"error":{"type":"rate_limit_error","message":SECRET}});
+    let mut result = Ok(upstream_headers(429, &body.to_string(), "Retry-After: 0.5\r\n").await);
+    bounded(observe_result(&mut result, &mut attempt)).await;
+    let response = result.as_ref().unwrap();
+    assert_eq!(response.headers()["retry-after"], "1");
+    assert!(attempt.record.fail_code.is_empty());
+    assert!(attempt.record.fail_body.is_empty());
+    let downstream =
+        super::super::rejection::response(response.status(), "claude", response.headers());
+    assert_eq!(downstream.headers()["retry-after"], "1");
+    let payload = finish(&client, attempt);
+    assert_eq!(payload["fail"]["status_code"], 429);
+    assert!(!payload.to_string().contains(SECRET));
     client.fence();
 }
 

@@ -235,6 +235,117 @@ fn antigravity_retry_feedback_is_typed_and_redacted() {
     assert!(!payload.to_string().contains("secret"));
 }
 
+fn failure_body(provider: &str, status: u16, body: Value) -> String {
+    let mut record = UsageRecord {
+        execution_id: "canonical".into(),
+        provider: provider.into(),
+        ..Default::default()
+    };
+    record.upstream_failure(status, &body);
+    // Re-deriving from the emitted canonical body must be stable (stream event round trip).
+    let reparsed: Value = serde_json::from_str(&record.fail_body).unwrap_or_default();
+    let mut again = record.clone();
+    again.upstream_failure(status, &reparsed);
+    assert_eq!(again.fail_body, record.fail_body);
+    assert!(!record.fail_body.contains("secret"));
+    record.fail_body
+}
+
+#[test]
+fn model_support_failures_emit_matched_home_pattern_only() {
+    for status in [400, 422] {
+        let body = failure_body(
+            "openai",
+            status,
+            json!({"error":{"message":"The Requested Model Is Not Supported for key secret","code":"secret"}}),
+        );
+        assert_eq!(
+            serde_json::from_str::<Value>(&body).unwrap(),
+            json!({"error":{"message":"requested model is not supported"}})
+        );
+    }
+    let body = failure_body(
+        "claude",
+        400,
+        json!({"error":{"detail":["x", {"m":"Not available for your plan secret"}]}}),
+    );
+    assert!(body.contains("not available for your plan"));
+    // Other statuses or unrelated 400 text keep the body empty.
+    assert!(
+        failure_body(
+            "openai",
+            500,
+            json!({"error":{"message":"model not supported"}})
+        )
+        .is_empty()
+    );
+    assert!(
+        failure_body(
+            "openai",
+            400,
+            json!({"error":{"message":"secret prompt too long"}})
+        )
+        .is_empty()
+    );
+    assert!(failure_body("openai", 400, Value::Null).is_empty());
+}
+
+#[test]
+fn store_false_not_found_emits_fixed_sentence() {
+    let body = failure_body(
+        "codex",
+        404,
+        json!({"error":{"message":"Item with id 'rs_secret' not found. Items are not persisted when `store` is set to false. Try again with `store` set to true, or remove this item from your input."}}),
+    );
+    assert_eq!(
+        serde_json::from_str::<Value>(&body).unwrap(),
+        json!({"error":{"message":"Item with id not found. Items are not persisted when `store` is set to false."}})
+    );
+    let message = body.to_lowercase();
+    assert!(message.contains("item with id") && message.contains("not found"));
+    assert!(message.contains("items are not persisted when `store` is set to false"));
+    assert!(
+        failure_body(
+            "codex",
+            404,
+            json!({"error":{"message":"model secret not found"}})
+        )
+        .is_empty()
+    );
+    assert!(failure_body("codex", 400, json!({"error":{"message":"Item with id x not found. Items are not persisted when `store` is set to false."}})).is_empty());
+}
+
+#[test]
+fn antigravity_tos_violation_emits_minimal_error_info() {
+    let upstream = json!({"error":{"code":403,"status":"PERMISSION_DENIED","message":"secret","details":[
+        {"@type":"type.googleapis.com/google.rpc.ErrorInfo","reason":" tos_violation ","domain":"secret","metadata":{"email":"secret"}}
+    ]}});
+    let body = failure_body("antigravity", 403, upstream.clone());
+    assert_eq!(
+        serde_json::from_str::<Value>(&body).unwrap(),
+        json!({"error":{"code":403,"status":"PERMISSION_DENIED","details":[
+            {"@type":"type.googleapis.com/google.rpc.ErrorInfo","reason":"TOS_VIOLATION"}
+        ]}})
+    );
+    assert!(failure_body("claude", 403, upstream).is_empty());
+    for other in [
+        json!({"error":{"code":403,"status":"PERMISSION_DENIED","details":[{"@type":"type.googleapis.com/google.rpc.ErrorInfo","reason":"SECRET"}]}}),
+        json!({"error":{"code":403,"status":"UNAUTHENTICATED","details":[{"@type":"type.googleapis.com/google.rpc.ErrorInfo","reason":"TOS_VIOLATION"}]}}),
+        json!({"error":{"code":"403","status":"PERMISSION_DENIED","details":[{"@type":"type.googleapis.com/google.rpc.ErrorInfo","reason":"TOS_VIOLATION"}]}}),
+        json!({"error":{"code":403,"status":"PERMISSION_DENIED","details":[{"@type":"other","reason":"TOS_VIOLATION"}]}}),
+    ] {
+        assert!(failure_body("antigravity", 403, other).is_empty());
+    }
+}
+
+#[test]
+fn claude_and_openai_rate_limits_keep_empty_body() {
+    // Home has no Claude/OpenAI 429 body parser; quota backoff uses status alone.
+    let rate_limit = json!({"type":"error","error":{"type":"rate_limit_error","message":"secret"}});
+    assert!(failure_body("claude", 429, rate_limit.clone()).is_empty());
+    assert!(failure_body("openai", 429, rate_limit).is_empty());
+}
+
 #[tokio::test]
 async fn dropped_output_owner_releases_once_and_reporting_does_not_release_again() {
     use crate::execution::Registry;

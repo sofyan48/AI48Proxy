@@ -45,28 +45,7 @@ pub(super) fn baseline(body: &Value) -> Vec<String> {
             })
         });
     let progress = opus55 || sonnet55 || haiku55 || sonnet5 || fable52 || fable51;
-    let legacy = matches!(
-        model.as_str(),
-        "claude-3-5-haiku-20241022"
-            | "claude-3-5-haiku-latest"
-            | "claude-3-7-sonnet-20250219"
-            | "claude-3-7-sonnet-latest"
-            | "claude-haiku-4-5"
-            | "claude-haiku-4-5-20251001"
-            | "claude-opus-4"
-            | "claude-opus-4-20250514"
-            | "claude-opus-4-1"
-            | "claude-opus-4-1-20250805"
-            | "claude-opus-4-5"
-            | "claude-opus-4-5-20251101"
-            | "claude-opus-4-6"
-            | "claude-opus-4-7"
-            | "claude-sonnet-4"
-            | "claude-sonnet-4-20250514"
-            | "claude-sonnet-4-5"
-            | "claude-sonnet-4-5-20250929"
-            | "claude-sonnet-4-6"
-    );
+    let legacy = is_legacy(&model);
     let mut betas = Vec::new();
     if !haiku55 {
         betas.push("claude-code-20250219");
@@ -107,4 +86,51 @@ pub(super) fn baseline(body: &Value) -> Vec<String> {
     }
     betas.push("extended-cache-ttl-2025-04-11");
     betas.into_iter().map(str::to_owned).collect()
+}
+
+pub(super) fn uses_progress(model: &str) -> bool {
+    let model = canonical(model);
+    let fable51 = ["fable-5-1", "fable-5.1", "mythos-5-1", "mythos-5.1"]
+        .iter()
+        .any(|target| {
+            model.find(target).is_some_and(|i| {
+                model
+                    .as_bytes()
+                    .get(i + target.len())
+                    .is_none_or(|b| !b.is_ascii_digit())
+            })
+        });
+    model == "claude-opus-5-5"
+        || model.starts_with("claude-opus-5-5[")
+        || variant(&model, "claude-sonnet-5")
+        || is_haiku55(&model)
+        || variant(&model, "claude-fable-5-2")
+        || variant(&model, "claude-fable-5.2")
+        || fable51
+}
+
+pub(super) fn is_legacy(model: &str) -> bool {
+    let model = canonical(model);
+    matches!(
+        model.as_str(),
+        "claude-3-5-haiku-20241022"
+            | "claude-3-5-haiku-latest"
+            | "claude-3-7-sonnet-20250219"
+            | "claude-3-7-sonnet-latest"
+            | "claude-haiku-4-5"
+            | "claude-haiku-4-5-20251001"
+            | "claude-opus-4"
+            | "claude-opus-4-20250514"
+            | "claude-opus-4-1"
+            | "claude-opus-4-1-20250805"
+            | "claude-opus-4-5"
+            | "claude-opus-4-5-20251101"
+            | "claude-opus-4-6"
+            | "claude-opus-4-7"
+            | "claude-sonnet-4"
+            | "claude-sonnet-4-20250514"
+            | "claude-sonnet-4-5"
+            | "claude-sonnet-4-5-20250929"
+            | "claude-sonnet-4-6"
+    )
 }

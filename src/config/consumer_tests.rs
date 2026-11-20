@@ -21,7 +21,6 @@ fn typed_transport_fields_do_not_pretend_to_have_consumers() {
     let unsupported = c.unsupported_features();
     for key in [
         "streaming.keepalive-seconds",
-        "streaming.bootstrap-retries",
         "streaming.send-keepalive-before-ft",
         "nonstream-keepalive-interval",
         "tls-handshake-timeout-seconds",
@@ -49,19 +48,36 @@ fn disabled_fields_follow_go_signed_contract_and_saturate_handshake_duration() {
 }
 
 #[test]
+fn request_logging_accepts_both_layouts_and_validates_types() {
+    assert!(!parse("").request_log);
+    for extra in [
+        "request-log: true\n",
+        "observability: {logs: {request-log: true}}\n",
+    ] {
+        let config = parse(extra);
+        assert!(config.request_log);
+        assert!(config.unsupported_features().is_empty());
+    }
+    for extra in [
+        "request-log: yes\n",
+        "observability: {logs: {request-log: 1}}\n",
+        "request-log: true\nobservability: {logs: {request-log: false}}\n",
+    ] {
+        let yaml = format!("credential-concurrency: {{lifecycle-config-revision: 1}}\n{extra}");
+        assert!(Config::parse(yaml.as_bytes()).is_err());
+    }
+}
+
+#[test]
 fn added_inventory_is_key_only_for_legacy_and_canonical_layouts() {
     let c = parse(
         "force-model-prefix: true\nrequest-log: true\nws-auth: true\naccess: {api-keys: [never-print-this]}\nobservability: {logs: {request-log: true}}\n",
     );
     let keys = c.unsupported_features();
-    for key in [
-        "force-model-prefix",
-        "request-log",
-        "ws-auth",
-        "access.api-keys[0]",
-        "observability.logs.request-log",
-    ] {
+    for key in ["ws-auth", "access.api-keys[0]"] {
         assert!(keys.contains(&key.into()), "{key}");
     }
     assert!(!keys.join(",").contains("never-print-this"));
+    assert!(c.request_log);
+    assert!(!keys.iter().any(|key| key.contains("request-log")));
 }

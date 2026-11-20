@@ -2,6 +2,7 @@ pub mod config;
 pub mod execution;
 pub mod gateway;
 pub mod home;
+pub mod observability;
 pub mod payload;
 pub mod protocol;
 pub mod providers;

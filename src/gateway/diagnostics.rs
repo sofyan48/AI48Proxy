@@ -191,7 +191,14 @@ pub(super) async fn error_body(
             Ok(Some(chunk)) if chunk.len() <= (64 * 1024usize).saturating_sub(bytes.len()) => {
                 bytes.extend_from_slice(&chunk);
             }
-            Ok(None) => return serde_json::from_slice(&bytes).unwrap_or_default(),
+            Ok(None) => {
+                return serde_json::from_slice(&bytes).unwrap_or_else(|_| {
+                    // Used only by canonical scheduler matchers, never returned or logged.
+                    String::from_utf8(bytes)
+                        .map(serde_json::Value::String)
+                        .unwrap_or_default()
+                });
+            }
             _ => return serde_json::Value::Null,
         }
     }

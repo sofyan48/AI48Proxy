@@ -7,6 +7,12 @@ use std::time::Duration;
 #[cfg(test)]
 #[path = "config/consumer_tests.rs"]
 mod consumer_tests;
+pub mod execution;
+#[cfg(test)]
+#[path = "config/execution_tests.rs"]
+mod execution_tests;
+#[path = "gateway/keepalive.rs"]
+pub mod keepalive;
 #[cfg(test)]
 #[path = "config/tests.rs"]
 mod tests;
@@ -30,11 +36,19 @@ pub struct Config {
     pub host: String,
     pub port: u16,
     pub request_retry: u32,
+    /// Opt-in Home request-log forwarding; raw bodies are never captured.
+    pub request_log: bool,
     pub max_retry_credentials: usize,
     pub max_retry_interval: Duration,
     pub proxy_url: Option<String>,
     pub streaming: Streaming,
     pub nonstream_keepalive_interval: Duration,
+    pub passthrough_headers: bool,
+    /// Home owns prefix publication and dispatch; never re-resolve its selected model.
+    pub force_model_prefix: bool,
+    pub oauth_request_scoped_errors: execution::OAuthErrorRules,
+    /// Zero closes immediately, matching CPA's opt-in graceful drain.
+    pub shutdown_timeout: Duration,
     /// None disables the inbound body limit, matching Go's <= 0 contract.
     pub max_request_body_bytes: Option<usize>,
     /// Handshake-only bound; never a whole-request timeout.
@@ -85,6 +99,10 @@ impl Config {
         };
         let port = u16::try_from(integer(&raw, "port", 8317)?).context("port exceeds 65535")?;
         ensure!(port > 0, "port must be positive");
+        let request_log = match field(&raw, "request-log") {
+            None => false,
+            Some(v) => v.as_bool().context("request-log must be a boolean")?,
+        };
         let request_retry = u32::try_from(integer(&raw, "request-retry", 0)?)
             .context("request-retry exceeds u32")?;
         let max_retry_credentials = integer(&raw, "max-retry-credentials", 0)?;
@@ -127,6 +145,11 @@ impl Config {
             n => Some(n),
         };
         let tls_handshake_timeout = positive_seconds(&raw, "tls-handshake-timeout-seconds")?;
+        let passthrough_headers = boolean(&raw, "passthrough-headers")?;
+        let force_model_prefix = boolean(&raw, "force-model-prefix")?;
+        let oauth_request_scoped_errors =
+            execution::oauth_rules(field(&raw, "oauth-request-scoped-errors"))?;
+        let shutdown_timeout = positive_seconds(&raw, "shutdown-timeout")?;
         let lifecycle = Lifecycle::parse(section(&raw, "credential-concurrency")?)?;
         let observation = Observation::parse(section(&raw, "credential-in-flight")?)?;
         let payload = match field(&raw, "payload") {
@@ -137,11 +160,16 @@ impl Config {
             host,
             port,
             request_retry,
+            request_log,
             max_retry_credentials,
             max_retry_interval,
             proxy_url,
             streaming,
             nonstream_keepalive_interval,
+            passthrough_headers,
+            force_model_prefix,
+            oauth_request_scoped_errors,
+            shutdown_timeout,
             max_request_body_bytes,
             tls_handshake_timeout,
             lifecycle,
@@ -156,6 +184,13 @@ impl Config {
     pub fn unsupported_features(&self) -> Vec<String> {
         unsupported::features(&self.raw)
     }
+}
+
+fn boolean(value: &Value, key: &str) -> Result<bool> {
+    field(value, key).map_or(Ok(false), |v| {
+        v.as_bool()
+            .with_context(|| format!("{key} must be a boolean"))
+    })
 }
 
 fn positive_integer(value: &Value, key: &str) -> Result<usize> {

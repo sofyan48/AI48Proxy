@@ -35,6 +35,11 @@ chrono = { version = "0.4", features = ["serde"] }
 url = "2"
 regex = "1"
 tower = { version = "0.5", features = ["util"] }
+xxhash-rust = { version = "0.8", features = ["xxh64"] }
 
 [dev-dependencies]
 tempfile = "3"
+
+[[test]]
+name = "claude_signing"
+path = "src/providers/claude_signing.rs"

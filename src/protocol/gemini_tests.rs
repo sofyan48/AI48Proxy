@@ -54,11 +54,11 @@ fn go_function_declaration_call_result() {
     );
     assert_eq!(
         request["contents"][2]["parts"][0]["functionResponse"],
-        json!({"name":"weather","response":{"result":"sunny"}})
+        json!({"id":"abc","name":"weather","response":{"result":"sunny"}})
     );
     assert_eq!(
         request["tools"][0]["functionDeclarations"][0]["parametersJsonSchema"],
-        json!({"type":"object"})
+        json!({"type":"object","properties":{}})
     );
     assert_eq!(
         request["toolConfig"]["functionCallingConfig"]["mode"],
@@ -243,6 +243,59 @@ fn multiline_sse_and_incomplete_candidates() {
             .is_err()
     );
 }
+#[test]
+fn unsupported_signature_only_and_incremental_calls_fail_closed() {
+    for part in [
+        json!({"thoughtSignature":"opaque"}),
+        json!({"functionCall":{"name":"run","partialArgs":[],"willContinue":true}}),
+    ] {
+        let body = json!({"candidates":[{"content":{"parts":[part]},"finishReason":"STOP"}]});
+        assert!(chat_response(&body, "g").is_err());
+        let mut stream = StreamTranslator::new("g", false);
+        assert!(stream.feed(&sse(body)).is_err());
+        assert!(stream.finish().is_err());
+    }
+}
+
+#[test]
+fn tool_choices_and_schema_carriers_match_provider_semantics() {
+    let base = json!({"messages":[{"role":"user","content":"run"}],
+        "tools":[{"type":"function","function":{"name":"run","parameters":{
+            "type":"object","properties":{"count":{"type":"integer","enum":[1,2]},
+            "pattern":{"type":"string","pattern":"^[a-z]+$"}},"required":["count","missing"],"additionalProperties":false}}}]});
+    for (choice, mode) in [
+        (json!("auto"), "AUTO"),
+        (json!("none"), "NONE"),
+        (json!("required"), "ANY"),
+        (json!({"type":"function","function":{"name":"run"}}), "ANY"),
+    ] {
+        let mut body = base.clone();
+        body["tool_choice"] = choice;
+        let out = chat_request(&body, "g").unwrap();
+        assert_eq!(out["toolConfig"]["functionCallingConfig"]["mode"], mode);
+        let schema = &out["tools"][0]["functionDeclarations"][0]["parametersJsonSchema"];
+        assert_eq!(schema["properties"]["count"]["type"], "string");
+        assert_eq!(schema["properties"]["count"]["enum"], json!(["1", "2"]));
+        assert_eq!(schema["properties"]["pattern"]["pattern"], "^[a-z]+$");
+        assert_eq!(schema["additionalProperties"], false);
+        assert_eq!(schema["required"], json!(["count"]));
+        let out = antigravity_chat_request(&body, "g").unwrap();
+        assert_eq!(
+            out["tools"][0]["functionDeclarations"][0]["parametersJsonSchema"]["properties"]["count"]
+                ["type"],
+            "integer"
+        );
+    }
+    for choice in [
+        json!("unknown"),
+        json!({"type":"function","function":{"name":"missing"}}),
+    ] {
+        let mut body = base.clone();
+        body["tool_choice"] = choice;
+        assert!(chat_request(&body, "g").is_err());
+    }
+}
+
 #[test]
 fn terminal_reasons_metadata_multicandidate_and_no_usage() {
     for (reason, expected) in [

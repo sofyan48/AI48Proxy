@@ -129,6 +129,159 @@ fn forbidden_diagnostic_returns_only_allowlisted_values() {
 }
 
 #[test]
+fn chat_tools_go_schema_cleanup_and_synthetic_replay() {
+    let selection = selected(json!({"metadata":{"project_id":"p"}}));
+    let args = json!({"title":"keep", "format":"keep", "default":3, "const":4});
+    let chat = json!({"messages":[{"role":"user","content":"run"},
+        {"role":"assistant","content":null,"tool_calls":[
+            {"id":"a","type":"function","function":{"name":"run","arguments":args.to_string()}},
+            {"id":"b","type":"function","function":{"name":"run","arguments":"{}"}}]},
+        {"role":"tool","tool_call_id":"b","content":"{\"raw\":true}"},
+        {"role":"tool","tool_call_id":"a","content":"done"}],
+        "tools":[{"type":"function","function":{"name":"run","strict":true,"parameters":{
+            "type":"object","additionalProperties":false,"properties":{
+                "title":{"type":"integer","enum":[1,2],"minimum":1},
+                "items":{"type":"array"}},"required":["title","missing"]}}}],
+        "tool_choice":{"type":"function","function":{"name":"run"}}});
+    let mut body =
+        crate::protocol::gemini::antigravity_chat_request(&chat, "gemini-3-flash").unwrap();
+    normalize(&mut body, &selection).unwrap();
+    let request = &body["request"];
+    let schema = &request["tools"][0]["functionDeclarations"][0]["parameters"];
+    assert_eq!(schema["properties"]["title"]["type"], "integer");
+    assert_eq!(
+        schema["properties"]["title"]["description"],
+        "Allowed: 1, 2 (minimum: 1)"
+    );
+    assert!(schema["properties"]["title"].get("enum").is_none());
+    assert_eq!(schema["required"], json!(["title"]));
+    assert_eq!(
+        schema["properties"]["items"]["items"],
+        json!({"type":"string"})
+    );
+    assert_eq!(
+        request["contents"][1]["parts"][0]["functionCall"]["args"],
+        args
+    );
+    assert_eq!(
+        request["contents"][1]["parts"][0]["thoughtSignature"],
+        BYPASS_FIXTURE
+    );
+    assert!(
+        request["contents"][1]["parts"][1]
+            .get("thoughtSignature")
+            .is_none()
+    );
+    assert_eq!(
+        request["contents"][2]["parts"][0]["functionResponse"]["id"],
+        "b"
+    );
+    assert_eq!(
+        request["contents"][2]["parts"][0]["functionResponse"]["response"]["result"],
+        "{\"raw\":true}"
+    );
+    assert_eq!(
+        request["toolConfig"]["functionCallingConfig"],
+        json!({"mode":"ANY","allowedFunctionNames":["run"]})
+    );
+}
+const BYPASS_FIXTURE: &str = "skip_thought_signature_validator";
+
+#[test]
+fn native_tool_schema_preserves_types_and_claude_placeholders() {
+    for model in ["gemini-3-flash", "claude-sonnet-4-5"] {
+        let mut selection = selected(json!({"metadata":{"project_id":"p"}}));
+        selection.model = model.into();
+        let mut body = json!({"contents":[],"tools":[{"functionDeclarations":[
+            {"name":"run","parametersJsonSchema":{"type":"object","properties":{
+                "count":{"type":"integer","enum":[1,2]},"empty":{"type":"object"}},"required":["count"]}}]}]});
+        normalize(&mut body, &selection).unwrap();
+        let schema = &body["request"]["tools"][0]["functionDeclarations"][0]["parameters"];
+        assert_eq!(schema["properties"]["count"]["type"], "integer");
+        assert!(schema["properties"]["count"].get("enum").is_none());
+        if model.contains("claude") {
+            assert_eq!(schema["properties"]["empty"]["required"], json!(["reason"]));
+        } else {
+            assert_eq!(schema["properties"]["empty"]["properties"], json!({}));
+        }
+    }
+}
+
+#[test]
+fn unsupported_replay_and_schema_still_fail_closed() {
+    let selection = selected(json!({"metadata":{"project_id":"p"}}));
+    for part in [
+        json!({"text":"thinking","thought":true}),
+        json!({"text":"signed","thought_signature":"opaque"}),
+        json!({"functionCall":{"id":"a","name":"run","args":{}},"thoughtSignature":"opaque"}),
+        json!({"functionResponse":{"id":"a","name":"run","response":{}}}),
+        json!({"functionCall":{"id":"a","name":"run","args":{},"partialArgs":[]}}),
+    ] {
+        let mut body = json!({"contents":[{"role":"model","parts":[part]}]});
+        assert!(normalize(&mut body, &selection).is_err());
+    }
+    for schema in [
+        json!({"$ref":"#/$defs/A"}),
+        json!({"allOf":[{"type":"object"}]}),
+        json!({"if":{}}),
+    ] {
+        let mut body = json!({"contents":[],"tools":[{"functionDeclarations":[{"name":"run","parameters":schema}]}]});
+        assert!(normalize(&mut body, &selection).is_err());
+    }
+    for mode in ["AUTO", "NONE", "ANY"] {
+        let mut selection = selected(json!({"metadata":{"project_id":"p"}}));
+        selection.model = "claude-sonnet-4-5".into();
+        let mut body = json!({"contents":[],"tools":[{"functionDeclarations":[{"name":"run"}]}],"toolConfig":{"functionCallingConfig":{"mode":mode}}});
+        assert!(normalize(&mut body, &selection).is_err());
+    }
+}
+
+#[test]
+fn go_gemini_function_signature_roundtrip_json_and_fragmented_sse() {
+    let sig = "EjQKMgEMOdbHO0Gd+c9Mxk4ELwPGbpCEcp2mFfYYLix2UVtBH3fL8GECc4+JITVnHF4qZDsA";
+    assert!(signature::function_signature(sig));
+    assert!(!signature::function_signature(
+        "AQAAAAEAAAAAAAAAAAAAAAAAAAAA"
+    ));
+    let native = unwrap_response(&json!({"response":{"candidates":[{"content":{"parts":[
+        {"functionCall":{"id":"native-id","name":"run","args":{}},"thoughtSignature":sig} ]},"finishReason":"STOP"}]}})).unwrap();
+    let chat = crate::protocol::gemini::chat_response(&native, "g").unwrap();
+    let message = &chat["choices"][0]["message"];
+    let mut body = crate::protocol::gemini::chat_request(
+        &json!({"messages":[
+        {"role":"user","content":"run"}, message,
+        {"role":"tool","tool_call_id":"native-id","content":"ok"}]}),
+        "g",
+    )
+    .unwrap();
+    normalize(&mut body, &selected(json!({"metadata":{"project_id":"p"}}))).unwrap();
+    assert_eq!(
+        body["request"]["contents"][1]["parts"][0]["thoughtSignature"],
+        sig
+    );
+    let bytes = format!("data: {native}\n\n").into_bytes();
+    for split in 0..=bytes.len() {
+        let mut stream = crate::protocol::gemini::StreamTranslator::new("g", false);
+        let mut out = stream.feed(&bytes[..split]).unwrap();
+        out.extend(stream.feed(&bytes[split..]).unwrap());
+        out.extend(stream.finish().unwrap());
+        let out = String::from_utf8(out).unwrap();
+        let chunk: Value = serde_json::from_str(
+            out.split("\n\n")
+                .next()
+                .unwrap()
+                .strip_prefix("data: ")
+                .unwrap(),
+        )
+        .unwrap();
+        let call = &chunk["choices"][0]["delta"]["tool_calls"][0];
+        assert_eq!(call["id"], "native-id");
+        assert_eq!(call["extra_content"]["google"]["thought_signature"], sig);
+        assert_eq!(chunk["choices"][0]["finish_reason"], "tool_calls");
+    }
+}
+
+#[test]
 fn generic_permission_denied_does_not_claim_account_suspension() {
     assert_eq!(
         forbidden_diagnostic(

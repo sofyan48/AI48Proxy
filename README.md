@@ -55,10 +55,10 @@ The repository includes `docker-compose.yml` for PostgreSQL + Home + three Rust 
 ./install.sh init      # Generate private .env/config files; preserve existing files
 ./install.sh deploy    # Build, import a fresh Home, issue JWTs, start the stack
 ./install.sh status
-./install.sh logs cliproxy-1
+./install.sh logs ai48proxy-1
 ```
 
-Home publishes `8327`; nginx publishes gateway port `8317`. Stop an older installer stack first because container names, ports and `cliproxy-network` intentionally match. This does not automatically migrate an existing database. See [Docker deployment](docs/docker.md).
+Home publishes `8327`; nginx publishes gateway port `8317`. The stack uses AI48Home/AI48Proxy container names and `ai48proxy-network`. Stop an older installer stack before deployment because the published ports overlap. This does not automatically migrate an existing database. See [Docker deployment](docs/docker.md).
 
 ## Run
 

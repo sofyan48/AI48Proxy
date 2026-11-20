@@ -159,10 +159,6 @@ fn effective_unsupported_settings_still_fail_support_validation() {
             "streaming.keepalive-seconds",
         ),
         (
-            "requests: {streaming: {bootstrap-retries: 1}}\n",
-            "streaming.bootstrap-retries",
-        ),
-        (
             "nonstream-keepalive-interval: 10\n",
             "nonstream-keepalive-interval",
         ),
@@ -177,7 +173,7 @@ fn effective_unsupported_settings_still_fail_support_validation() {
         ),
         (
             "requests: {passthrough-headers: true}\n",
-            "requests.passthrough-headers",
+            "passthrough-headers",
         ),
     ] {
         assert!(

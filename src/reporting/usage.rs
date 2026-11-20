@@ -181,13 +181,46 @@ impl UsageRecord {
         self.fail_body.clear();
     }
 
-    /// Home currently parses 429 retry hints from provider-specific fail.body JSON,
-    /// not Retry-After headers or generic retry_after fields. Copy only those hints.
+    /// Home derives scheduler decisions from fail.body text. Go CPA forwards the raw
+    /// upstream body; here only fixed canonical bodies are emitted, and only when the
+    /// matching Home classifier would fire on the original body. Upstream text is never
+    /// copied, so the output is idempotent when re-derived from its own canonical body.
     pub fn upstream_failure(&mut self, status: u16, body: &Value) {
         self.upstream_status(status);
-        if status != 429 {
-            return;
+        let canonical = match status {
+            400 | 422 => model_support_body(body),
+            404 => store_not_persisted_body(body),
+            403 if self.provider.eq_ignore_ascii_case("antigravity") => antigravity_tos_body(body),
+            429 => self.quota_hint_body(body),
+            _ => None,
+        };
+        if let Some(canonical) = canonical {
+            self.fail_body = canonical;
         }
+    }
+
+    /// Match against the original bounded body before sanitization. The caller must
+    /// honor stop/continue in its retry loop; no upstream text is persisted here.
+    pub fn upstream_failure_with_rules(
+        &mut self,
+        status: u16,
+        raw_body: &str,
+        rules: &[crate::config::execution::RequestScopedRule],
+    ) -> Option<crate::config::execution::ErrorAction> {
+        let body =
+            serde_json::from_str(raw_body).unwrap_or_else(|_| Value::String(raw_body.to_owned()));
+        self.upstream_failure(status, &body);
+        let action = rules.iter().find_map(|rule| rule.matches(status, raw_body));
+        if let Some(action) = action {
+            self.fail_code = action.fail_code().into();
+        }
+        action
+    }
+
+    /// Home currently parses 429 retry hints from provider-specific fail.body JSON,
+    /// not Retry-After headers or generic retry_after fields. Copy only those hints.
+    /// Claude/OpenAI 429 bodies stay empty: Home has no provider hint parser for them.
+    fn quota_hint_body(&self, body: &Value) -> Option<String> {
         let mut error = serde_json::Map::new();
         match self.provider.to_ascii_lowercase().as_str() {
             "codex"
@@ -242,10 +275,98 @@ impl UsageRecord {
             }
             _ => {}
         }
-        if !error.is_empty() {
-            self.fail_body = json!({"error": error}).to_string();
+        (!error.is_empty()).then(|| json!({"error": error}).to_string())
+    }
+}
+
+/// Copied verbatim from Home `isModelSupportErrorMessage` (internal/cliproxy/auth/result.go).
+const MODEL_SUPPORT_PATTERNS: [&str; 10] = [
+    "model_not_supported",
+    "requested model is not supported",
+    "requested model is unsupported",
+    "requested model is unavailable",
+    "model is not supported",
+    "model not supported",
+    "unsupported model",
+    "model unavailable",
+    "not available for your plan",
+    "not available for your account",
+];
+
+/// Satisfies Home `isRequestScopedNotFoundMessage` without the upstream item ID.
+const STORE_NOT_PERSISTED_MESSAGE: &str =
+    "Item with id not found. Items are not persisted when `store` is set to false.";
+
+const GOOGLE_ERROR_INFO: &str = "type.googleapis.com/google.rpc.ErrorInfo";
+
+/// Lowercased string values of the bounded upstream body, newline-joined. Go matches the
+/// raw body text; non-string JSON leaves and object keys carry no Home-relevant phrases.
+fn body_text(body: &Value) -> String {
+    fn walk(value: &Value, depth: usize, out: &mut String) {
+        match value {
+            Value::String(text) => {
+                out.push_str(&text.to_lowercase());
+                out.push('\n');
+            }
+            Value::Array(items) if depth < 32 => {
+                items.iter().for_each(|item| walk(item, depth + 1, out));
+            }
+            Value::Object(map) if depth < 32 => {
+                map.values().for_each(|item| walk(item, depth + 1, out));
+            }
+            _ => {}
         }
     }
+    let mut out = String::new();
+    walk(body, 0, &mut out);
+    out
+}
+
+/// Emits the matched Home pattern constant itself, so Home suspends the model as unsupported.
+fn model_support_body(body: &Value) -> Option<String> {
+    let text = body_text(body);
+    MODEL_SUPPORT_PATTERNS
+        .iter()
+        .find(|pattern| text.contains(*pattern))
+        .map(|pattern| json!({"error": {"message": pattern}}).to_string())
+}
+
+/// Home treats this 404 as request-scoped instead of a 12h not_found model suspension.
+fn store_not_persisted_body(body: &Value) -> Option<String> {
+    let text = body_text(body);
+    (text.contains("item with id")
+        && text.contains("not found")
+        && text.contains("items are not persisted when `store` is set to false"))
+    .then(|| json!({"error": {"message": STORE_NOT_PERSISTED_MESSAGE}}).to_string())
+}
+
+/// Mirrors Home `recordAntigravityTOSPause`: error.code 403, error.status PERMISSION_DENIED,
+/// and an ErrorInfo detail with reason TOS_VIOLATION. Emits only those fields.
+fn antigravity_tos_body(body: &Value) -> Option<String> {
+    let error = body.get("error")?;
+    let code_ok = error.get("code").and_then(Value::as_i64) == Some(403);
+    let status_ok = error
+        .get("status")
+        .and_then(Value::as_str)
+        .is_some_and(|s| s.eq_ignore_ascii_case("PERMISSION_DENIED"));
+    let violation = error
+        .get("details")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .any(|detail| {
+            detail.get("@type").and_then(Value::as_str) == Some(GOOGLE_ERROR_INFO)
+                && detail
+                    .get("reason")
+                    .and_then(Value::as_str)
+                    .is_some_and(|r| r.trim().eq_ignore_ascii_case("TOS_VIOLATION"))
+        });
+    (code_ok && status_ok && violation).then(|| {
+        json!({"error": {"code": 403, "status": "PERMISSION_DENIED", "details": [
+            {"@type": GOOGLE_ERROR_INFO, "reason": "TOS_VIOLATION"}
+        ]}})
+        .to_string()
+    })
 }
 
 fn valid_retry_delay(delay: &str) -> bool {

@@ -1,4 +1,28 @@
-# Claude rate-limit compatibility and pending wiring
+# Claude rate-limit compatibility and integration status
+
+## Current integration (2026-11-20)
+
+The provider module is now active through `providers.rs`. HTTP rejections in
+`gateway/routes.rs::observe_result` classify bounded errors, select the applicable
+reset, and expose a validated, rounded-up `Retry-After` to downstream callers.
+Fast-mode entitlement refusals use existing Home `request_scoped` feedback and do
+not rotate credentials. Ordinary 429 responses are returned as `rate_limit_error`;
+raw upstream messages and arbitrary headers remain withheld.
+
+The initial HTTP rejection path is shared by streaming and buffered requests.
+Terminal SSE classification still uses the existing effective-status parser, not
+this reset-header classifier. Home does not consume generic Claude reset/scope
+fields; model/credential scope is diagnostic only and does not establish a new
+cross-repository scheduling contract. No cooldown or account state is reset.
+
+Validation: full Cargo tests and strict Clippy pass, including a real loopback
+HTTP/mTLS-Home feedback test for fractional Retry-After and sanitized attribution.
+Live Haiku 5.5 cannot currently reach upstream: Home returns `auth_not_found` and
+read-only database inspection shows both Claude credentials are soft-deleted.
+Codex `gpt-6-luna` still completes live SSE with usage and `[DONE]`.
+
+The sections below preserve the original helper audit; references to pending
+HTTP wiring describe the pre-integration state.
 
 ## Delivery boundary
 

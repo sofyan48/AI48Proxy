@@ -20,6 +20,8 @@ use tokio_util::sync::CancellationToken;
 mod ws_home;
 #[path = "ws_http.rs"]
 mod ws_http;
+#[path = "ws_replay.rs"]
+mod ws_replay;
 #[path = "ws_state.rs"]
 mod ws_state;
 #[cfg(test)]
@@ -138,6 +140,7 @@ async fn session(
 ) -> Result<()> {
     let mut history = ws_state::History::default();
     history.native = true;
+    let mut replay = ws_replay::ReplayCache::default();
     let mut first = loop {
         let frame = decode(
             input
@@ -212,7 +215,7 @@ async fn session(
         tokio::select! {
             biased;
             _ = cancel.cancelled() => break,
-            _ = &mut idle => anyhow::bail!("Codex websocket idle deadline"),
+            _ = &mut idle => { replay.invalidate(); anyhow::bail!("Codex websocket idle deadline") },
             message = upstream.next() => {
                 idle.as_mut().reset(tokio::time::Instant::now() + std::time::Duration::from_secs(300));
                 let Some(Ok(message)) = message else { anyhow::bail!("upstream disconnected"); };
@@ -246,8 +249,18 @@ async fn session(
                     current.record.failed = !successful || current.usage.failed;
                     current.record.status_code = if current.record.failed { 502 } else { 200 };
                     if !current.record.failed {
-                        history.commit(pending.take().ok_or_else(|| anyhow::anyhow!("request missing"))?, &event, limit)?;
-                    } else { history.invalidate(); pending = None; }
+                        let request = pending.take().ok_or_else(|| anyhow::anyhow!("request missing"))?;
+                        history.commit(request.clone(), &event, limit)?;
+                        replay.commit(
+                            active_id.clone().ok_or_else(|| anyhow::anyhow!("response id missing"))?,
+                            request,
+                            event.clone(),
+                        );
+                    } else {
+                        history.invalidate();
+                        replay.invalidate();
+                        pending = None;
+                    }
                     // Usage completes per response; the stream lease is deliberately retained.
                     drop(turn.take());
                     active_id = None;
@@ -274,6 +287,10 @@ async fn session(
                 if turn.is_some() {
                     send_error(writer, "response_in_progress", "Wait for the active response terminal event").await?;
                     continue;
+                }
+                if let Some(response_id) = frame.get("previous_response_id").and_then(Value::as_str) {
+                    let replay_known = replay.get(response_id).is_some();
+                    tracing::debug!(replay_known, "Codex websocket continuation replay state checked");
                 }
                 let mut body = match history.hydrate(frame, limit) {
                     Ok(body) => body,

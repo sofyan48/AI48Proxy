@@ -197,7 +197,8 @@ pub(super) fn streaming(
     response_kind: upstream::ResponseKind,
 ) -> Response {
     let status = response.status();
-    let (tx, rx) = tokio::sync::mpsc::channel::<Result<Bytes, io::Error>>(1);
+    // The marker travels with the bytes; queueing alone is not delivery.
+    let (tx, rx) = tokio::sync::mpsc::channel::<(Result<Bytes, io::Error>, bool)>(1);
     let completed = Arc::new(std::sync::atomic::AtomicBool::new(false));
     let producer_completed = completed.clone();
     let downstream_complete = Arc::new(std::sync::atomic::AtomicBool::new(false));
@@ -300,7 +301,7 @@ pub(super) fn streaming(
                                 tokio::select! {
                                     biased;
                                     _ = cancellation.cancelled() => true,
-                                    result = tx.send(Ok(Bytes::from(bytes))) => result.is_err(),
+                                    result = tx.send((Ok(Bytes::from(bytes)), false)) => result.is_err(),
                                 }
                             }
                             Ok(_) => false,
@@ -388,15 +389,29 @@ pub(super) fn streaming(
                 } else {
                     bytes
                 };
+                // OpenAI's complete flag means finish_reason, not its final DONE;
+                // keep that direction's existing EOF/usage handling unchanged.
+                let translated_terminal = translation.is_some_and(|(from, _)| {
+                    from == crate::protocol::Format::ClaudeMessages
+                }) && translator.as_ref().is_some_and(|t| t.complete);
+                if translated_terminal {
+                    attempt.record.failed = usage.failed
+                        || translator.as_ref().is_some_and(|t| t.finish().is_err());
+                    if attempt.record.failed {
+                        attempt.record.status_code = 502;
+                        break;
+                    }
+                }
                 let sent = tokio::select! {
                     biased;
                     _ = cancellation.cancelled() => false,
-                    result = tx.send(Ok(bytes)) => result.is_ok(),
+                    result = tx.send((Ok(bytes), translated_terminal)) => result.is_ok(),
                 };
                 if !sent {
                     break;
                 }
-                if codex.as_ref().is_some_and(|events| events.complete())
+                if translated_terminal
+                    || codex.as_ref().is_some_and(|events| events.complete())
                     || chat_responses
                         .as_ref()
                         .is_some_and(|translator| translator.complete())
@@ -429,7 +444,17 @@ pub(super) fn streaming(
         let completed = completed.clone();
         let downstream_complete = downstream_complete.clone();
         async move {
-            if let Some(item) = rx.recv().await {
+            if let Some((item, terminal)) = rx.recv().await {
+                if terminal {
+                    // Finalize before yielding terminal bytes: the consumer may drop
+                    // immediately after this poll, without ever polling EOF.
+                    let attempt = owner.take()?.await.ok();
+                    downstream_complete.store(true, std::sync::atomic::Ordering::Release);
+                    if let Some(attempt) = &attempt {
+                        attempt.terminal_delivered();
+                    }
+                    drop(attempt);
+                }
                 return Some((item, (rx, owner)));
             }
             let receiver = owner.take()?;

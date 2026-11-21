@@ -10,7 +10,7 @@ pub(super) mod completion {
         pin::Pin,
         sync::{
             Arc, Mutex,
-            atomic::{AtomicU16, Ordering},
+            atomic::{AtomicBool, AtomicU16, Ordering},
         },
         task::{Context, Poll},
         time::Instant,
@@ -22,10 +22,14 @@ pub(super) mod completion {
     pub(in crate::gateway) struct RequestContext {
         provider: Mutex<String>,
         status: AtomicU16,
+        terminal_delivered: AtomicBool,
     }
     impl RequestContext {
         pub(in crate::gateway) fn selected(&self, provider: &str) {
             *self.provider.lock().unwrap_or_else(|e| e.into_inner()) = provider.to_owned();
+        }
+        pub(in crate::gateway) fn terminal_delivered(&self) {
+            self.terminal_delivered.store(true, Ordering::Release);
         }
         pub(in crate::gateway) fn status(&self, status: u16) {
             self.status.store(status, Ordering::Release);
@@ -115,6 +119,17 @@ pub(super) mod completion {
         fn drop(&mut self) {
             // Cancel transport/body work before recording the disconnect.
             self.source.take();
+            // A validated terminal frame can finalize the attempt in the same
+            // poll that yields it, without the consumer subsequently polling EOF.
+            let observed = self.completion.context.status.load(Ordering::Acquire);
+            if self
+                .completion
+                .context
+                .terminal_delivered
+                .load(Ordering::Acquire)
+            {
+                self.completion.finish(observed);
+            }
         }
     }
 }
@@ -143,6 +158,12 @@ pub(super) struct Attempt {
 }
 
 impl Attempt {
+    pub(super) fn terminal_delivered(&self) {
+        if let Some(context) = &self.context {
+            context.terminal_delivered();
+        }
+    }
+
     pub fn cancellation(&self) -> tokio_util::sync::CancellationToken {
         self.guard.cancellation()
     }

@@ -46,6 +46,18 @@ async fn fixture() -> (
     tokio::sync::mpsc::Receiver<()>,
     tokio::sync::oneshot::Sender<u8>,
 ) {
+    fixture_for("openai", None).await
+}
+
+async fn fixture_for(
+    provider_name: &'static str,
+    terminal_gate: Option<tokio::sync::oneshot::Receiver<()>>,
+) -> (
+    Arc<HomeClient>,
+    tokio::task::JoinHandle<()>,
+    tokio::sync::mpsc::Receiver<()>,
+    tokio::sync::oneshot::Sender<u8>,
+) {
     let mut params = CertificateParams::default();
     params.is_ca = IsCa::Ca(BasicConstraints::Unconstrained);
     params.key_usages = vec![
@@ -128,7 +140,7 @@ async fn fixture() -> (
         ping.get_mut().write_all(b"+PONG\r\n").await.unwrap();
         let mut dispatch = accept(&listener, &acceptor).await;
         assert_eq!(command(&mut dispatch).await[0], b"RPOP");
-        bulk(&mut dispatch, json!({"model":"resolved", "provider":"openai", "auth_index":"index", "auth":{"id":"credential","attributes":{"api_key":"PRIVATE_TOKEN","base_url":base}},"concurrency":{"accounted":true,"credential_id":"credential","model":"resolved"}}).to_string().as_bytes()).await;
+        bulk(&mut dispatch, json!({"model":"resolved", "provider":provider_name, "auth_index":"index", "auth":{"id":"credential","attributes":{"api_key":"PRIVATE_TOKEN","base_url":base}},"concurrency":{"accounted":true,"credential_id":"credential","model":"resolved"}}).to_string().as_bytes()).await;
         let (mut socket, _) = upstream_listener.accept().await.unwrap();
         use tokio::io::AsyncReadExt;
         let mut buf = [0; 8192];
@@ -145,6 +157,44 @@ async fn fixture() -> (
             std::future::pending::<()>().await;
             return;
         };
+        if let Some(gate) = terminal_gate {
+            let start = "data: {\"type\":\"message_start\",\"message\":{\"id\":\"msg_fixture\",\"usage\":{\"input_tokens\":5,\"output_tokens\":0}}}\n\n";
+            socket.write_all(b"HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nTransfer-Encoding: chunked\r\n\r\n").await.unwrap();
+            socket
+                .write_all(format!("{:x}\r\n{start}\r\n", start.len()).as_bytes())
+                .await
+                .unwrap();
+            if gate.await.is_ok() {
+                let delta = "data: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"end_turn\"},\"usage\":{\"output_tokens\":2}}\n\n";
+                let stop = "data: {\"type\":\"message_stop\"}\n\n";
+                let tail = match outcome {
+                    1 => format!("{delta}{stop}"),
+                    2 => delta.to_owned(), // Valid finish reason, missing message_stop.
+                    3 => format!("{delta}{stop}data: {{"), // Partial event after terminal.
+                    4 => stop.to_owned(),  // Missing finish reason.
+                    5 => format!(
+                        "{delta}data: {{\"type\":\"ping\",\"error\":{{\"message\":\"failed\"}}}}\n\n{stop}"
+                    ),
+                    _ => "data: invalid-json\n\n".to_owned(),
+                };
+                socket
+                    .write_all(format!("{:x}\r\n{tail}\r\n", tail.len()).as_bytes())
+                    .await
+                    .unwrap();
+                if outcome == 2 {
+                    socket.write_all(b"0\r\n\r\n").await.unwrap();
+                }
+            }
+            // Never send EOF on success: completion must close this connection.
+            loop {
+                if socket.read(&mut buf).await.unwrap() == 0 {
+                    break;
+                }
+            }
+            seen_tx.send(()).await.unwrap();
+            std::future::pending::<()>().await;
+            return;
+        }
         let (status, content_type, body) = if outcome > 0 {
             (
                 "200 OK",
@@ -173,6 +223,9 @@ async fn fixture() -> (
     .unwrap();
     (client, task, seen_rx, reply_tx)
 }
+
+#[path = "claude_sse_completion_tests.rs"]
+mod claude_sse_completion_tests;
 
 #[tokio::test]
 async fn gateway_log_completes_once_for_success_failure_and_pre_header_disconnect() {

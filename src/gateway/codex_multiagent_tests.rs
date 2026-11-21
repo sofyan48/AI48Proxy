@@ -395,3 +395,506 @@ async fn restore_response_wraps_json_body_and_drops_content_length() {
         br#"{"output":[{"name":"collaboration__a","type":"function_call"}]}"#
     );
 }
+
+// Go TestCodexSpawnAgentModelsFromSourcesIncludesModelMetadata.
+#[test]
+fn codex_models_from_sources_include_metadata() {
+    use models::{AvailableModel, ModelInfo, models_from_sources};
+    let catalog = r#"{"models":[
+        {"slug":"model-template","display_name":"Template","description":"Template model.","default_reasoning_level":"low","supported_reasoning_levels":[{"effort":"low"},{"effort":"medium"}],"service_tiers":[{"id":"priority"}],"priority":1},
+        {"slug":"gpt-5.5","display_name":"Default","description":"Default model.","default_reasoning_level":"medium","supported_reasoning_levels":[{"effort":"low"},{"effort":"medium"},{"effort":"high"}],"service_tiers":[{"id":"priority"}],"priority":2}
+    ]}"#;
+    let available = |id: &str, display: &str, description: &str| AvailableModel {
+        id: id.into(),
+        display_name: display.into(),
+        description: description.into(),
+    };
+    let lookup = |id: &str| {
+        (id == "custom-model").then(|| ModelInfo {
+            description: "Dynamic model.".into(),
+            thinking_levels: ["none", "low", "medium", "high"].map(String::from).to_vec(),
+        })
+    };
+    let got = models_from_sources(
+        &[
+            available("custom-model", "Custom", "Registry description."),
+            available("model-template", "", ""),
+            available("custom-model", "", "duplicate"),
+        ],
+        catalog,
+        &lookup,
+    );
+    assert_eq!(got.len(), 2);
+    assert_eq!(got[0].id, "model-template");
+    assert_eq!(got[0].description, "Template model.");
+    assert_eq!(got[0].default_reasoning_effort, "low");
+    assert_eq!(got[0].service_tiers, ["priority"]);
+    let custom = &got[1];
+    assert_eq!(custom.id, "custom-model");
+    assert_eq!(custom.description, "Dynamic model.");
+    assert_eq!(custom.reasoning_efforts, ["none", "low", "medium", "high"]);
+    assert_eq!(custom.default_reasoning_effort, "medium");
+    assert!(custom.service_tiers.is_empty());
+
+    // Without gpt-5.5 the first catalog entry is the default template.
+    let without_default = r#"{"models":[
+        {"slug":"gpt-6.1-sol","display_name":"First Fallback","description":"First fallback model.","default_reasoning_level":"high","supported_reasoning_levels":[{"effort":"low"},{"effort":"high"}],"service_tiers":[{"id":"priority"}],"priority":1},
+        {"slug":"gpt-5.6-sol","display_name":"Second","description":"Second model.","default_reasoning_level":"medium","supported_reasoning_levels":[{"effort":"medium"}],"priority":2}
+    ]}"#;
+    let fallback = models_from_sources(
+        &[available("third-party-model", "", "")],
+        without_default,
+        &|_| None,
+    );
+    assert_eq!(fallback.len(), 1);
+    assert_eq!(fallback[0].id, "third-party-model");
+    assert_eq!(fallback[0].default_reasoning_effort, "high");
+    assert_eq!(fallback[0].description, "third-party-model");
+    assert!(models_from_sources(&[available("x", "", "")], "{}", &|_| None).is_empty());
+}
+
+// Go TestDecodeCodexHomeAvailableModels.
+#[test]
+fn codex_models_decode_home_available_models_matches_go() {
+    let raw = json!({
+        "codex":[{"id":"model-b","display_name":"Model B"},{"id":"model-a"}],
+        "other":[{"name":"models/model-c","displayName":"Model C"},{"id":"model-a","display_name":"duplicate"}]
+    });
+    let got = models::decode_home_available_models(&raw);
+    let ids: Vec<_> = got.iter().map(|m| m.id.as_str()).collect();
+    assert_eq!(ids, ["model-a", "model-b", "model-c"]);
+    assert_eq!(got[1].description, "Model B");
+    assert_eq!(got[2].display_name, "Model C");
+    assert!(
+        models::decode_home_available_models(&json!({"error":{"type":"no_credentials"}}))
+            .is_empty()
+    );
+}
+
+fn spawn_models() -> Vec<models::SpawnAgentModel> {
+    vec![
+        models::SpawnAgentModel {
+            id: "model-alpha".into(),
+            description: "Alpha model.".into(),
+            reasoning_efforts: ["low", "medium", "high"].map(String::from).to_vec(),
+            default_reasoning_effort: "medium".into(),
+            service_tiers: vec!["priority".into()],
+            ..Default::default()
+        },
+        models::SpawnAgentModel {
+            id: "model-beta".into(),
+            description: "Beta model".into(),
+            reasoning_efforts: ["low", "high"].map(String::from).to_vec(),
+            default_reasoning_effort: "low".into(),
+            ..Default::default()
+        },
+    ]
+}
+
+// Go TestRewriteCodexSpawnAgentDescriptionNormalizesModelList.
+#[test]
+fn spawn_agent_description_normalizes_model_list() {
+    let h = headers(&[("user-agent", CODEX_UA)]);
+    let mut body = json!({"input":[{"type":"additional_tools","role":"developer","tools":[{
+        "type":"namespace","name":"collaboration","tools":[
+            {"type":"function","name":"send_message","description":"unchanged"},
+            {"type":"function","name":"spawn_agent","description":"\n        Available model overrides (optional; inherited parent model is preferred):\n- old duplicate\n- old duplicate\n        Spawns an agent to work on a task.","parameters":{"type":"object","properties":{"message":{"type":"string","encrypted":true}}}}]}]}]});
+    prepare_boundary_with_models(
+        &config(true, false),
+        "/v1/responses",
+        &h,
+        &mut body,
+        &spawn_models(),
+    );
+    let tools = &body["input"][0]["tools"][0]["tools"];
+    assert_eq!(
+        tools[1]["description"],
+        "\n        Available model overrides (optional; inherited parent model is preferred):\n\
+         - `model-alpha`: Alpha model. Reasoning efforts: low, medium (default), high. Service tiers: priority.\n\
+         - `model-beta`: Beta model. Reasoning efforts: low (default), high.\n        Spawns an agent to work on a task."
+    );
+    assert_eq!(tools[0]["description"], "unchanged");
+    assert!(
+        tools[1]
+            .pointer("/parameters/properties/message/encrypted")
+            .is_none()
+    );
+    // Namespace is renamed only at the executor stage.
+    assert_eq!(body["input"][0]["tools"][0]["name"], "collaboration");
+}
+
+// Go TestRewriteCodexSpawnAgentDescriptionTopLevelWithoutMarker.
+#[test]
+fn spawn_agent_description_appends_without_marker() {
+    let mut body = json!({"tools":[{"type":"namespace","name":"collaboration","tools":[
+        {"type":"function","name":"spawn_agent","description":"Create a worker."}]}]});
+    let list = models::format_models(&[models::SpawnAgentModel {
+        id: "model-a".into(),
+        description: "Model A.".into(),
+        reasoning_efforts: vec!["medium".into()],
+        default_reasoning_effort: "medium".into(),
+        ..Default::default()
+    }]);
+    assert!(rewrite_spawn_agent_descriptions(&mut body, &list));
+    assert_eq!(
+        body["tools"][0]["tools"][0]["description"],
+        format!(
+            "Create a worker.\n\n{}\n- `model-a`: Model A. Reasoning efforts: medium (default).",
+            models::MODELS_HEADING
+        )
+    );
+}
+
+// Go TestRewriteCodexSpawnAgentDescriptionWithoutModelsStillRemovesEncrypted
+// and ...LeavesPayloadWithoutToolUnchanged.
+#[test]
+fn spawn_agent_description_without_models_or_tool_is_unchanged() {
+    let h = headers(&[("user-agent", CODEX_UA)]);
+    let mut body = json!({"tools":[{"type":"function","name":"spawn_agent","description":"unchanged",
+        "parameters":{"properties":{"message":{"encrypted":true}}}}]});
+    prepare_boundary_with_models(&config(true, false), "/v1/responses", &h, &mut body, &[]);
+    assert_eq!(body["tools"][0]["description"], "unchanged");
+    assert!(
+        body.pointer("/tools/0/parameters/properties/message/encrypted")
+            .is_none()
+    );
+
+    let mut other = json!({"tools":[{"type":"function","name":"other","description":"unchanged"}]});
+    let original = other.clone();
+    let list = models::format_models(&spawn_models());
+    assert!(!rewrite_spawn_agent_descriptions(&mut other, &list));
+    assert_eq!(other, original);
+    assert!(!needs_spawn_agent_models(
+        &config(true, false),
+        "/v1/responses",
+        &h,
+        &other
+    ));
+}
+
+// Conflicting requests only lose encryption (CPA hasCodexOptimizedCollaborationConflictDoc).
+#[test]
+fn spawn_agent_description_skips_namespace_conflict_and_other_routes() {
+    let h = headers(&[("user-agent", CODEX_UA)]);
+    let request = || {
+        json!({"tools":[{"type":"namespace","name":"collaboration","tools":[
+            {"type":"function","name":"spawn_agent","description":"Spawns an agent."}]},
+            {"type":"namespace","name":"collaboration-optimize","tools":[]}]})
+    };
+    let mut body = request();
+    assert!(!needs_spawn_agent_models(
+        &config(true, false),
+        "/v1/responses",
+        &h,
+        &body
+    ));
+    prepare_boundary_with_models(
+        &config(true, false),
+        "/v1/responses",
+        &h,
+        &mut body,
+        &spawn_models(),
+    );
+    assert_eq!(body, request());
+
+    let mut compact = collaboration_request();
+    compact["tools"][0]["tools"][0]["description"] = "Spawns an agent.".into();
+    let original = compact.clone();
+    assert!(!needs_spawn_agent_models(
+        &config(true, false),
+        "/v1/responses/compact",
+        &h,
+        &compact
+    ));
+    prepare_boundary_with_models(
+        &config(true, false),
+        "/v1/responses/compact",
+        &h,
+        &mut compact,
+        &spawn_models(),
+    );
+    assert_eq!(compact, original);
+    for (cfg, ua) in [
+        (config(false, false), CODEX_UA),
+        (config(true, false), "curl/8"),
+    ] {
+        let h = headers(&[("user-agent", ua)]);
+        assert!(!needs_spawn_agent_models(
+            &cfg,
+            "/v1/responses",
+            &h,
+            &original
+        ));
+    }
+    assert!(needs_spawn_agent_models(
+        &config(true, false),
+        "/v1/responses",
+        &h,
+        &original
+    ));
+}
+
+// Go TestReplaceCodexSpawnAgentModelsNormalizesSectionsAndPreservesInstructions.
+#[test]
+fn replace_models_normalizes_sections_and_preserves_instructions() {
+    let heading = models::MODELS_HEADING;
+    let description = format!(
+        "{heading}\n- `old-model`: old\nKeep this multi-agent instruction.\nSpawns an agent.\n{heading}"
+    );
+    let got = models::replace_models(&description, "- `new-model`: New model.");
+    assert!(!got.contains("old-model"), "{got}");
+    assert_eq!(got.matches(heading).count(), 1, "{got}");
+    assert!(got.contains("Keep this multi-agent instruction."), "{got}");
+    assert_eq!(models::replace_models("keep", ""), "keep");
+}
+
+#[test]
+fn format_models_handles_backticks_whitespace_and_empty_ids() {
+    let got = models::format_models(&[
+        models::SpawnAgentModel {
+            id: "a`b".into(),
+            description: "  Multi\n  line  ".into(),
+            ..Default::default()
+        },
+        models::SpawnAgentModel {
+            id: "  ".into(),
+            ..Default::default()
+        },
+        models::SpawnAgentModel {
+            id: "plain".into(),
+            description: "Done!".into(),
+            service_tiers: vec!["flex".into(), "priority".into()],
+            ..Default::default()
+        },
+    ]);
+    assert_eq!(
+        got,
+        "- `` a`b ``: Multi line.\n- `plain`: Done! Service tiers: flex, priority."
+    );
+}
+
+// Home mode (Go TestRewriteCodexSpawnAgentDescriptionEnabledOptimizesTool with
+// the model supplied by Home instead of the local registry).
+#[test]
+fn codex_models_home_resolves_against_embedded_catalog() {
+    assert!(
+        models::embedded_templates().is_some(),
+        "embedded catalog parses"
+    );
+    let raw = json!({
+        "codex-pro":[{"id":"gpt-5.5","display_name":"ignored"}],
+        "claude":[{"id":"codex-spawn-agent-test-model","description":"Test agent model.",
+            "thinking":{"levels":["low","medium","high"]}}]
+    });
+    let got = models::models_from_home(&raw);
+    assert_eq!(got.len(), 2);
+    // Catalog-backed models come first and keep catalog metadata.
+    assert_eq!(got[0].id, "gpt-5.5");
+    assert_eq!(
+        got[0].description,
+        "GPT-6 Chat Thinking for the paid CCA experiment."
+    );
+    assert_eq!(got[0].default_reasoning_effort, "medium");
+    let list = models::format_models(&got);
+    assert!(
+        list.contains(
+            "- `codex-spawn-agent-test-model`: Test agent model. Reasoning efforts: low, medium (default), high."
+        ),
+        "{list}"
+    );
+    // Without Home thinking levels, synthesized models inherit the default template.
+    let plain = models::models_from_home(&json!({"x":[{"id":"zz-plain"}]}));
+    assert_eq!(plain[0].description, "zz-plain");
+    assert!(!plain[0].reasoning_efforts.is_empty());
+    assert!(plain[0].service_tiers.is_empty());
+
+    assert!(models::models_from_home(&json!({"error":{"type":"unauthorized"}})).is_empty());
+
+    let h = headers(&[("user-agent", CODEX_UA)]);
+    let mut body = json!({"tools":[{"type":"namespace","name":"collaboration","tools":[
+        {"type":"function","name":"spawn_agent","description":"Spawns an agent.",
+         "parameters":{"properties":{"message":{"type":"string","encrypted":true}}}}]}]});
+    prepare_boundary_with_models(&config(true, false), "/v1/responses", &h, &mut body, &got);
+    assert!(prepare_attempt(
+        &config(true, false),
+        &selection("codex", json!({})),
+        "/v1/responses",
+        &h,
+        &mut body
+    ));
+    assert_eq!(body["tools"][0]["name"], "collaboration-optimize");
+    let description = body["tools"][0]["tools"][0]["description"]
+        .as_str()
+        .unwrap();
+    assert!(
+        description.starts_with(models::MODELS_HEADING),
+        "{description}"
+    );
+    assert!(description.ends_with("\nSpawns an agent."), "{description}");
+    assert!(description.contains(&list), "{description}");
+}
+
+#[test]
+fn codex_models_catalog_provenance_and_invalid_sources() {
+    use sha2::{Digest, Sha256};
+    let catalog = include_bytes!("codex_models_catalog.json");
+    assert_eq!(
+        hex::encode(Sha256::digest(catalog)),
+        "5088dd5ed900cf7a420ba4651af7f747130d6380a7fe23365fd1b02f0ac2ca8c"
+    );
+    for raw in [
+        "invalid",
+        "null",
+        "{}",
+        r#"{"models":[]}"#,
+        r#"{"models":[null,{}]}"#,
+        r#"{"models":[{"slug":"valid"},42]}"#,
+    ] {
+        assert!(models::parse_templates(raw).is_none(), "{raw}");
+    }
+    for raw in [
+        json!(null),
+        json!([]),
+        json!({"x":{}}),
+        json!({"x":[42]}),
+        json!({"valid":[{"id":"hidden"}],"error":"unauthorized"}),
+    ] {
+        assert!(models::models_from_home(&raw).is_empty(), "{raw}");
+    }
+    let got = models::decode_home_available_models(&json!({"empty":null,"x":[null,
+        {"id":"  ","name":"models/fallback","displayName":" Fallback "},
+        {"id":" explicit ","name":"models/ignored"}]}));
+    assert_eq!(
+        got.iter().map(|m| m.id.as_str()).collect::<Vec<_>>(),
+        ["explicit", "fallback"]
+    );
+    assert_eq!(got[1].description, "Fallback");
+}
+
+#[test]
+fn codex_models_normalize_metadata_and_sort_profiles() {
+    let catalog = r#"{"models":[
+        {"slug":"z","priority":1},
+        {"slug":"a","priority":1},
+        {"slug":"gpt-5.5","default_reasoning_level":"invalid",
+         "supported_reasoning_levels":[{"effort":" LOW "},{"effort":"invalid"},{"effort":"ULTRA"}],
+         "service_tiers":[null,{"id":" priority "},{"id":"priority"},{"id":""},{"id":"flex"}]}
+    ]}"#;
+    let available = |id: &str, display: &str| models::AvailableModel {
+        id: id.into(),
+        display_name: display.into(),
+        ..Default::default()
+    };
+    let profiles = models::models_from_sources(
+        &[
+            available("z", ""),
+            available("custom-z", "Beta"),
+            available("a", ""),
+            available("custom-b", "alpha"),
+            available("custom-a", "Alpha"),
+            available("gpt-5.5", ""),
+            available(" a ", "duplicate"),
+            available(" ", ""),
+        ],
+        catalog,
+        &|id| {
+            (id == "custom-a").then(|| models::ModelInfo {
+                thinking_levels: vec!["invalid".into(), " NONE ".into()],
+                ..Default::default()
+            })
+        },
+    );
+    assert_eq!(
+        profiles.iter().map(|m| m.id.as_str()).collect::<Vec<_>>(),
+        ["gpt-5.5", "a", "z", "custom-a", "custom-b", "custom-z"]
+    );
+    assert_eq!(profiles[0].reasoning_efforts, ["low", "ultra"]);
+    assert_eq!(profiles[0].default_reasoning_effort, "low");
+    assert_eq!(profiles[0].service_tiers, ["priority", "flex"]);
+    assert_eq!(profiles[3].reasoning_efforts, ["none"]);
+    assert_eq!(profiles[3].default_reasoning_effort, "none");
+    assert!(profiles[3].service_tiers.is_empty());
+    assert_eq!(profiles[4].reasoning_efforts, ["low", "ultra"]);
+}
+
+#[tokio::test]
+async fn codex_models_runtime_catalog_changes_spawn_agent_description() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("catalog.json");
+    let mut catalog: Value =
+        serde_json::from_str(include_str!("codex_models_catalog.json")).unwrap();
+    for model in catalog["models"].as_array_mut().unwrap() {
+        if model["slug"] == "gpt-5.5" {
+            model["description"] = "Runtime catalog description".into();
+        }
+    }
+    std::fs::write(&path, serde_json::to_vec(&catalog).unwrap()).unwrap();
+    let mut cfg = config(true, false);
+    let raw = serde_yaml::from_str(&format!(
+        "models: {{codex-catalog: {:?}}}",
+        path.to_str().unwrap()
+    ))
+    .unwrap();
+    cfg.providers.codex_catalog =
+        crate::config::providers::codex_catalog::Catalog::parse(&raw).unwrap();
+    let cancel = tokio_util::sync::CancellationToken::new();
+    let snapshot = cfg.providers.codex_catalog.snapshot(&cancel).await.unwrap();
+    let templates = models::parse_templates(&snapshot).unwrap();
+    let profiles =
+        models::models_from_home_templates(&json!({"codex":[{"id":"gpt-5.5"}]}), &templates);
+    let mut body =
+        json!({"tools":[{"type":"function","name":"spawn_agent","description":"Spawns an agent"}]});
+    let h = headers(&[("user-agent", CODEX_UA)]);
+    prepare_boundary_with_models(&cfg, "/v1/responses", &h, &mut body, &profiles);
+    assert!(
+        body["tools"][0]["description"]
+            .as_str()
+            .unwrap()
+            .contains("Runtime catalog description")
+    );
+}
+
+#[test]
+fn codex_models_request_preserves_auth_scope_and_empty_client_version() {
+    let h = headers(&[
+        ("authorization", "Bearer test-caller"),
+        ("x-api-key", "test-key"),
+        ("user-agent", CODEX_UA),
+        ("x-untrusted-header", "do-not-forward"),
+    ]);
+    let request = spawn_agent_models_request(&h);
+    assert_eq!(request["type"], "models");
+    assert_eq!(request["query"], json!({"client_version":""}));
+    assert_eq!(
+        request["headers"]["authorization"],
+        json!(["Bearer test-caller"])
+    );
+    assert_eq!(request["headers"]["x-api-key"], json!(["test-key"]));
+    assert!(request["headers"].get("x-untrusted-header").is_none());
+}
+
+#[test]
+fn spawn_agent_descriptions_are_idempotent_and_require_string_descriptions() {
+    let h = headers(&[("user-agent", CODEX_UA)]);
+    let cfg = config(true, false);
+    let mut body = json!({"tools":[
+        {"type":"function","name":"spawn_agent"},
+        {"type":"function","name":"spawn_agent","description":null},
+        {"type":"function","name":"spawn_agent","description":42}
+    ]});
+    assert!(!needs_spawn_agent_models(&cfg, "/v1/responses", &h, &body));
+    body["input"] = json!([{"type":"additional_tools","tools":[
+        {"type":"namespace","name":"nested","tools":[
+            {"type":"function","name":"spawn_agent","description":"Spawns an agent."}
+        ]}
+    ]}]);
+    assert!(needs_spawn_agent_models(&cfg, "/v1/responses", &h, &body));
+    let profiles = spawn_models();
+    prepare_boundary_with_models(&cfg, "/v1/responses", &h, &mut body, &profiles);
+    let first = body.clone();
+    prepare_boundary_with_models(&cfg, "/v1/responses", &h, &mut body, &profiles);
+    assert_eq!(body, first);
+    assert!(body["tools"][0].get("description").is_none());
+    assert_eq!(body["tools"][1]["description"], Value::Null);
+    assert_eq!(body["tools"][2]["description"], 42);
+}

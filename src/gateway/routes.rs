@@ -41,7 +41,14 @@ pub(super) async fn generate(
     }
     let config = home.config();
     // Responses API boundary rewrites precede dispatch, like CPA's handler.
-    super::codex::multiagent::prepare_boundary(&config, uri.path(), &headers, &mut body);
+    super::codex::multiagent::prepare_boundary_home(
+        &home,
+        &config,
+        uri.path(),
+        &headers,
+        &mut body,
+    )
+    .await;
     let Ok(format) = upstream::format(uri.path()) else {
         return error(
             StatusCode::NOT_IMPLEMENTED,

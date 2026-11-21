@@ -9,7 +9,10 @@ use futures_util::StreamExt;
 use serde_json::{Map, Value, json};
 
 use crate::config::Config;
-use crate::home::client::Selection;
+use crate::home::client::{HomeClient, Selection};
+
+#[path = "codex_models.rs"]
+pub(crate) mod models;
 
 const COLLABORATION: &str = "collaboration";
 const OPTIMIZED: &str = "collaboration-optimize";
@@ -71,18 +74,148 @@ fn name(value: &Value) -> &str {
 
 /// Responses API boundary (CPA prepareCodexRequestPayload / Compact handler).
 /// Applies to every provider, before dispatch-derived session keys are computed.
+#[cfg(test)]
 pub(crate) fn prepare_boundary(config: &Config, path: &str, headers: &HeaderMap, body: &mut Value) {
+    prepare_boundary_with_models(config, path, headers, body, &[]);
+}
+
+/// Applies boundary rewrites and also renders the spawn_agent "Available model
+/// overrides" list from `models` (CPA prepareCodexMultiAgentV2ToolsDoc). An
+/// empty list leaves descriptions untouched, like CPA without catalog/models.
+pub(crate) fn prepare_boundary_with_models(
+    config: &Config,
+    path: &str,
+    headers: &HeaderMap,
+    body: &mut Value,
+    models: &[models::SpawnAgentModel],
+) {
     if !responses_path(path) {
         return;
     }
     if path == "/v1/responses" && optimize_enabled(config, headers) {
-        // Without the Codex client catalog the spawn_agent model list cannot be
-        // rendered (CPA's catalog-unavailable path), so only encryption is removed.
+        if !has_conflict(body) {
+            rewrite_spawn_agent_descriptions(body, &models::format_models(models));
+        }
         remove_message_encryption(body);
     }
     if orphan_enabled(config, headers) {
         rewrite_orphan_delegation(body);
     }
+}
+
+/// Whether the boundary would render a spawn_agent model list for this request,
+/// i.e. whether fetching Home's models is worthwhile.
+pub(crate) fn needs_spawn_agent_models(
+    config: &Config,
+    path: &str,
+    headers: &HeaderMap,
+    body: &Value,
+) -> bool {
+    fn spawns(tools: Option<&Value>) -> bool {
+        tools.and_then(Value::as_array).is_some_and(|tools| {
+            tools.iter().any(|tool| match kind(tool) {
+                "function" => {
+                    name(tool) == "spawn_agent"
+                        && tool.get("description").is_some_and(Value::is_string)
+                }
+                "namespace" => spawns(tool.get("tools")),
+                _ => false,
+            })
+        })
+    }
+    if path != "/v1/responses" || !optimize_enabled(config, headers) || has_conflict(body) {
+        return false;
+    }
+    spawns(body.get("tools"))
+        || body
+            .get("input")
+            .and_then(Value::as_array)
+            .is_some_and(|input| {
+                input
+                    .iter()
+                    .any(|i| kind(i) == "additional_tools" && spawns(i.get("tools")))
+            })
+}
+
+fn spawn_agent_models_request(headers: &HeaderMap) -> Value {
+    json!({"type":"models", "headers":super::super::auth_headers(headers),
+        "query":{"client_version":""}})
+}
+
+/// Home-mode spawn_agent models (CPA codexHomeAvailableModels): Home's scoped
+/// `GET models` view resolved against the runtime Codex client catalog.
+/// Any Home failure yields no models, so descriptions stay untouched.
+pub(crate) async fn fetch_spawn_agent_models(
+    home: &HomeClient,
+    headers: &HeaderMap,
+) -> Vec<models::SpawnAgentModel> {
+    // Always read the current config, not a potentially stale boundary snapshot.
+    // A reload owns a new cache; old in-flight work cannot publish into it.
+    let config = home.config();
+    let cancel = home.cancellation();
+    let Some(catalog) = config.providers.codex_catalog.snapshot(&cancel).await else {
+        return Vec::new();
+    };
+    if !std::sync::Arc::ptr_eq(&config, &home.config()) || cancel.is_cancelled() {
+        return Vec::new();
+    }
+    let Some(templates) = models::parse_templates(&catalog) else {
+        return Vec::new();
+    };
+    let request = spawn_agent_models_request(headers);
+    let Ok(payload) = serde_json::to_vec(&request) else {
+        return Vec::new();
+    };
+    let raw = tokio::select! {
+        biased;
+        _ = cancel.cancelled() => return Vec::new(),
+        result = home.command(vec![b"GET".to_vec(), payload]) => result.and_then(|frame| frame.bytes()),
+    };
+    match raw
+        .ok()
+        .and_then(|raw| serde_json::from_slice::<Value>(&raw).ok())
+    {
+        Some(raw) if std::sync::Arc::ptr_eq(&config, &home.config()) && !cancel.is_cancelled() => {
+            models::models_from_home_templates(&raw, &templates)
+        }
+        Some(_) => Vec::new(),
+        None => Vec::new(),
+    }
+}
+
+/// HTTP Responses boundary with Home-provided spawn_agent models.
+pub(crate) async fn prepare_boundary_home(
+    home: &HomeClient,
+    config: &Config,
+    path: &str,
+    headers: &HeaderMap,
+    body: &mut Value,
+) {
+    let models = if needs_spawn_agent_models(config, path, headers, body) {
+        fetch_spawn_agent_models(home, headers).await
+    } else {
+        Vec::new()
+    };
+    prepare_boundary_with_models(config, path, headers, body, &models);
+}
+
+/// Replace the model list in every spawn_agent string description.
+pub(crate) fn rewrite_spawn_agent_descriptions(body: &mut Value, model_list: &str) -> bool {
+    if model_list.is_empty() {
+        return false;
+    }
+    let mut changed = false;
+    visit_tools(body, &["spawn_agent"], &mut |tool| {
+        let Some(Value::String(description)) = tool.get_mut("description") else {
+            return;
+        };
+        let rewritten = models::replace_models(description, model_list);
+        if rewritten != *description {
+            *description = rewritten;
+            changed = true;
+        }
+    });
+    changed
 }
 
 /// Per-attempt executor stage. Returns whether the Codex collaboration

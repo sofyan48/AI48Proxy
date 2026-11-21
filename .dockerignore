@@ -6,4 +6,8 @@
 !src/
 !src/**
 !Dockerfile
+!LICENSE
+!THIRD_PARTY_NOTICES.md
+!licenses/
+!licenses/**
 !.dockerignore

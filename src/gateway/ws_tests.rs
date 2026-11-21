@@ -65,6 +65,125 @@ fn cancellation_and_terminals_do_not_release_stream_lease() {
     assert_eq!(registry.pending_releases()[0].release_seq, 1);
 }
 #[test]
+fn ws_failure_ownership_does_not_consume_running_or_ambiguous_creates() {
+    let make = |event: &str, automatic| ws_codex::Owner {
+        request: json!({"event_id":event}),
+        flags: ws_codex::Flags::default(),
+        automatic,
+        turn: (),
+    };
+    let mut owners = ws_codex::Owners::default();
+    owners.active.insert("r1".into(), make("c1", false));
+    owners.pending.push_back(make("c2", false));
+    assert_eq!(
+        owners
+            .failure_owner(&json!({"response_id":"r1"}), false)
+            .unwrap()
+            .as_deref(),
+        Some("r1")
+    );
+    assert_eq!(
+        owners
+            .failure_owner(&json!({"response_id":"rejected"}), false)
+            .unwrap(),
+        None
+    );
+    assert!(owners.failure_owner(&json!({}), false).is_err());
+    assert!(owners.failure_owner(&json!({}), true).is_err());
+    assert_eq!(owners.pending.front().unwrap().event_id(), "c2");
+    owners.pending.clear();
+    assert_eq!(
+        owners.failure_owner(&json!({}), false).unwrap().as_deref(),
+        Some("r1")
+    );
+    owners.active.insert("r2".into(), make("c2", false));
+    assert!(owners.failure_owner(&json!({}), false).is_err());
+}
+
+#[test]
+fn ws_response_owners_finish_once_even_when_other_responses_are_abandoned() {
+    struct Reporter(std::sync::Arc<std::sync::atomic::AtomicUsize>);
+    impl Drop for Reporter {
+        fn drop(&mut self) {
+            self.0.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        }
+    }
+    let count = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let mut owners = ws_codex::Owners::default();
+    for event in ["c1", "c2", "c3"] {
+        owners.pending.push_back(ws_codex::Owner {
+            request: json!({"event_id":event}),
+            flags: ws_codex::Flags::default(),
+            automatic: false,
+            turn: Reporter(count.clone()),
+        });
+    }
+    owners
+        .active
+        .insert("r1".into(), owners.pending.pop_front().unwrap());
+    owners
+        .active
+        .insert("r2".into(), owners.pending.pop_front().unwrap());
+    drop(owners.active.remove("r1"));
+    drop(owners.active.remove("r1"));
+    assert_eq!(count.load(std::sync::atomic::Ordering::SeqCst), 1);
+    drop(owners);
+    assert_eq!(count.load(std::sync::atomic::Ordering::SeqCst), 3);
+}
+
+#[test]
+fn ws_pipeline_and_abandoned_events_keep_request_correlation() {
+    let mut steering = ws_steering::Steering::new(true);
+    assert!(
+        steering.ready(false),
+        "an explicit running response permits pipelining"
+    );
+    assert!(
+        !steering.ready(true),
+        "automatic successor blocks pipelining"
+    );
+    steering.submitted("r1", "s-unacked");
+    steering.submitted("r1", "s-accepted");
+    steering.observe(
+        &json!({"type":"response.steer.accepted","steer":{"id":"s1","previous_response_id":"r1"}}),
+    );
+    steering
+        .enqueue(json!({"type":"response.create","event_id":"c-queued"}))
+        .unwrap();
+    let (sent, queued) = steering.abandoned();
+    assert_eq!(sent, ["s-accepted", "s-unacked"]);
+    assert_eq!(queued, ["c-queued"]);
+    assert_eq!(
+        ws_failure::lost(&sent[0], false)["error"]["code"],
+        "upstream_websocket_lost"
+    );
+    assert_eq!(
+        ws_failure::lost(&queued[0], true)["error"]["event_id"],
+        "c-queued"
+    );
+    let mut history = ws_state::History::default();
+    history.native = true;
+    let body = history
+        .hydrate(
+            json!({"type":"response.create","model":"m","input":[],"event_id":"c1"}),
+            10000,
+        )
+        .unwrap();
+    history.submitted(&body);
+    history.created("r1");
+    let next = history
+        .hydrate(
+            json!({"type":"response.create","input":[],"event_id":"c2"}),
+            10000,
+        )
+        .unwrap();
+    assert_eq!(body["event_id"], "c1");
+    assert_eq!(next["model"], "m");
+    assert_eq!(next["previous_response_id"], "r1");
+    assert_eq!(next["event_id"], "c2");
+}
+
+#[test]
 fn websocket_encoding_preserves_final_payload_rules() {
     let config = Config::parse(br#"{"credential-concurrency":{"lifecycle-config-revision":1},"payload":{"override":[{"models":[{"name":"*","protocol":"codex"}],"params":{"instructions":"final-rule","store":true,"custom_final":42}}],"filter":[{"models":[{"name":"*","protocol":"codex"}],"params":["include"]}]}}"#).unwrap();
     let selection: Selection = serde_json::from_value(json!({"model":"m","provider":"codex","auth_index":"idx","user_api_key":"user","auth":{"id":"a","attributes":{"api_key":"upstream","base_url":"http://127.0.0.1:9"}}})).unwrap();

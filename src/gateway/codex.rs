@@ -280,8 +280,8 @@ const BOOTSTRAP_MAX_BYTES: usize = 1 << 20;
 pub(super) enum Bootstrap {
     /// Held bytes are replayed ahead of the untouched remainder of the body.
     Released(reqwest::Response),
-    /// A synthesized HTTP 503 carrying the normalized error body, so the caller
-    /// runs the same failure/rotation path as a genuine upstream 503.
+    /// A synthetic rejection carrying normalized error and retry metadata through
+    /// the same failure/rotation path as a genuine upstream rejection.
     Rejected(reqwest::Response),
     Cancelled,
 }
@@ -289,7 +289,8 @@ pub(super) enum Bootstrap {
 enum Line {
     Hold,
     Release,
-    Reject(Value),
+    Reject(Value, Value),
+    EmptyIncomplete,
 }
 
 /// Go stream-bootstrap-buffering (HTTP/SSE): hold pre-generation frames until the
@@ -315,22 +316,43 @@ pub(super) async fn bootstrap(
             if lines > BOOTSTRAP_MAX_LINES {
                 break 'probe "frame_budget";
             }
+            if deadline.is_some_and(|deadline| tokio::time::Instant::now() >= deadline) {
+                break 'probe "time_budget";
+            }
             match classify(&held[scanned..scanned + end]) {
                 Line::Hold => scanned += end + 1,
                 Line::Release => break 'probe "generation_started",
-                Line::Reject(body) => {
+                Line::EmptyIncomplete => {
+                    // Keep the handshake, but deliver the silent abort as a request-scoped
+                    // body error instead of allowing an empty incomplete to look successful.
+                    held.truncate(scanned);
+                    let body = futures_util::stream::iter([
+                        Ok(bytes::Bytes::from(held)),
+                        Err(std::io::Error::other(
+                            "stream disconnected: empty response.incomplete",
+                        )),
+                    ]);
+                    let mut released = http::Response::new(reqwest::Body::wrap_stream(body));
+                    *released.status_mut() = status;
+                    *released.version_mut() = version;
+                    *released.headers_mut() = headers;
+                    return Bootstrap::Released(released.into());
+                }
+                Line::Reject(body, event) => {
                     tracing::info!(
                         event = "codex_bootstrap_rejected",
                         held_lines = lines,
                         "Codex overload during stream bootstrap; failing attempt over"
                     );
+                    let (status, retry_after) =
+                        bootstrap_rejection(&body, &event, chrono::Utc::now());
                     let body = serde_json::to_vec(&body).unwrap_or_default();
                     let mut builder = http::Response::builder()
-                        .status(StatusCode::SERVICE_UNAVAILABLE)
+                        .status(status)
                         .version(version)
                         .header("content-type", "application/json");
-                    if let Some(value) = headers.get("retry-after") {
-                        builder = builder.header("retry-after", value);
+                    if let Some(seconds) = retry_after {
+                        builder = builder.header("retry-after", seconds.to_string());
                     }
                     return match builder.body(reqwest::Body::from(body)) {
                         Ok(rejected) => Bootstrap::Rejected(rejected.into()),
@@ -399,9 +421,23 @@ fn classify(line: &[u8]) -> Line {
     let kind = event.get("type").and_then(Value::as_str).unwrap_or("");
     if matches!(kind, "error" | "response.failed") {
         return match terminal_error(&event, kind) {
-            Some(body) if overload(&body) => Line::Reject(body),
+            Some(body) if overload(&body) => Line::Reject(body, event),
             _ => Line::Release,
         };
+    }
+    // Any generated delta or completed output item already releases the probe, so
+    // no separate output history is needed here.
+    if kind == "response.incomplete"
+        && event
+            .pointer("/response/usage/output_tokens")
+            .and_then(Value::as_i64)
+            == Some(0)
+        && event
+            .pointer("/response/output")
+            .and_then(Value::as_array)
+            .is_none_or(Vec::is_empty)
+    {
+        return Line::EmptyIncomplete;
     }
     if bufferable(kind, &event) {
         Line::Hold
@@ -485,7 +521,177 @@ fn terminal_error(event: &Value, kind: &str) -> Option<Value> {
                 Value::Object(error)
             })
         })?;
-    Some(serde_json::json!({ "error": error }))
+    let mut body = serde_json::json!({ "error": error });
+    for path in [
+        "/status_code",
+        "/status",
+        "/body/status_code",
+        "/body/status",
+    ] {
+        if let Some(status) = event
+            .pointer(path)
+            .and_then(integer)
+            .filter(|s| (400..=599).contains(s))
+        {
+            body["status"] = status.into();
+            break;
+        }
+    }
+    Some(body)
+}
+
+fn integer(value: &Value) -> Option<i64> {
+    value.as_i64().or_else(|| value.as_str()?.parse().ok())
+}
+
+/// Select the terminal status first, then preserve hinted 429s during bootstrap.
+/// Body quota resets win over event headers; HTTP handshake headers are not
+/// terminal error headers in Go and must not supply an unrelated cooldown.
+fn bootstrap_rejection(
+    body: &Value,
+    event: &Value,
+    now: chrono::DateTime<chrono::Utc>,
+) -> (StatusCode, Option<u64>) {
+    let field = |key: &str| {
+        body["error"][key]
+            .as_str()
+            .unwrap_or("")
+            .trim()
+            .to_ascii_lowercase()
+    };
+    let kind = field("type");
+    let code = field("code");
+    let usage = kind == "usage_limit_reached";
+    let capacity = matches!(
+        code.as_str(),
+        "" | "turn_rate_limit_exceeded" | "model_at_capacity" | "model_is_at_capacity"
+    ) && (code == "turn_rate_limit_exceeded"
+        || (code.is_empty()
+            && kind == "rate_limit_error"
+            && field("message").contains("at capacity"))
+        || {
+            let raw = body.to_string().to_ascii_lowercase();
+            raw.contains("model_at_capacity")
+                || raw.contains("model_is_at_capacity")
+                || (raw.contains("model") && raw.contains("at capacity"))
+        });
+    let status = if usage || capacity {
+        429
+    } else {
+        [
+            "/error/status_code",
+            "/error/status",
+            "/status_code",
+            "/status",
+        ]
+        .iter()
+        .find_map(|path| {
+            body.pointer(path)
+                .and_then(integer)
+                .filter(|s| (400..=599).contains(s))
+        })
+        .unwrap_or(match (kind.as_str(), code.as_str()) {
+            (
+                _,
+                "cyber_policy"
+                | "cyber_policy_violation"
+                | "bio_policy"
+                | "misalignment_policy_violation"
+                | "invalid_prompt"
+                | "content_policy_violation"
+                | "image_content_policy_violation",
+            ) => 400,
+            ("not_found_error", _) | (_, "not_found" | "model_not_found") => 404,
+            ("authentication_error", _) | (_, "invalid_api_key" | "unauthorized") => 401,
+            ("permission_error", _) | (_, "forbidden" | "permission_denied") => 403,
+            ("rate_limit_error", _) | (_, "rate_limit_exceeded") => 429,
+            ("invalid_request_error" | "bad_request_error" | "image_generation_user_error", _)
+            | (_, "invalid_value" | "invalid_request_error") => 400,
+            _ => 502,
+        })
+    };
+    let retry = if status == 429 && usage {
+        body["error"]
+            .get("resets_at")
+            .and_then(integer)
+            .and_then(|reset| reset.checked_mul(1000)?.checked_sub(now.timestamp_millis()))
+            .filter(|ms| *ms > 0)
+            .map(|ms| (ms as u64).div_ceil(1000))
+            .or_else(|| {
+                body["error"]
+                    .get("resets_in_seconds")
+                    .and_then(integer)
+                    .filter(|s| *s > 0)
+                    .map(|s| s as u64)
+            })
+    } else {
+        None
+    };
+    let retry = retry.or_else(|| {
+        if !matches!(status, 429 | 408 | 500 | 502 | 503 | 504 | 520..=526) {
+            return None;
+        }
+        for path in [
+            "/headers",
+            "/body/headers",
+            "/error/headers",
+            "/body/error/headers",
+            "/response/error/headers",
+        ] {
+            let Some(headers) = event.pointer(path).and_then(Value::as_object) else {
+                continue;
+            };
+            if let Some((_, value)) = headers
+                .iter()
+                .find(|(key, _)| key.trim().eq_ignore_ascii_case("retry-after"))
+            {
+                // An explicit invalid outer value shadows nested fallback headers.
+                let raw = match value {
+                    Value::String(value) => value.clone(),
+                    Value::Number(_) | Value::Bool(_) => value.to_string(),
+                    _ => return None,
+                };
+                return retry_after_seconds(raw.trim(), now);
+            }
+        }
+        None
+    });
+    (
+        if status == 429 && retry.is_some() {
+            StatusCode::TOO_MANY_REQUESTS
+        } else {
+            StatusCode::SERVICE_UNAVAILABLE
+        },
+        retry,
+    )
+}
+
+fn retry_after_seconds(raw: &str, now: chrono::DateTime<chrono::Utc>) -> Option<u64> {
+    const MAX_SECONDS: u64 = (i64::MAX as u64).div_ceil(1_000_000_000);
+    if let Ok(seconds) = raw.parse::<i64>()
+        && seconds >= 0
+    {
+        return Some((seconds as u64).min(MAX_SECONDS));
+    }
+    for format in [
+        "%a, %d %b %Y %H:%M:%S GMT",
+        "%A, %d-%b-%y %H:%M:%S GMT",
+        "%a %b %e %H:%M:%S %Y",
+    ] {
+        if let Ok(deadline) = chrono::NaiveDateTime::parse_from_str(raw, format) {
+            return Some(
+                deadline
+                    .and_utc()
+                    .signed_duration_since(now)
+                    .num_milliseconds()
+                    .max(0)
+                    .unsigned_abs()
+                    .div_ceil(1000)
+                    .min(MAX_SECONDS),
+            );
+        }
+    }
+    None
 }
 
 /// Go isCodexOverloadBootstrapFailure: only transient capacity, overload and

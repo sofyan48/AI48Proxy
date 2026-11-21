@@ -2,10 +2,7 @@
 use crate::home::client::HomeClient;
 use anyhow::{Result, ensure};
 use axum::{
-    extract::{
-        State, WebSocketUpgrade,
-        ws::{Message, WebSocket},
-    },
+    extract::{State, ws::Message},
     http::{HeaderMap, StatusCode},
     response::Response,
 };
@@ -15,11 +12,20 @@ use std::sync::Arc;
 use tokio::sync::mpsc;
 use tokio_tungstenite::tungstenite::Message as UpMessage;
 use tokio_util::sync::CancellationToken;
+use ws_deflate::{self as tokio_tungstenite, WebSocket, WebSocketUpgrade};
 
+#[path = "ws_codex.rs"]
+mod ws_codex;
+#[path = "ws_deflate.rs"]
+mod ws_deflate;
+#[path = "ws_failure.rs"]
+mod ws_failure;
 #[path = "ws_home.rs"]
 mod ws_home;
 #[path = "ws_http.rs"]
 mod ws_http;
+#[path = "ws_recovery.rs"]
+mod ws_recovery;
 #[path = "ws_replay.rs"]
 mod ws_replay;
 #[path = "ws_state.rs"]
@@ -58,9 +64,10 @@ pub(super) async fn upgrade(
         .config()
         .max_request_body_bytes
         .unwrap_or(16 * 1024 * 1024);
-    ws.max_message_size(limit)
-        .max_frame_size(limit)
-        .on_upgrade(move |socket| run(home, headers, principal, socket, limit))
+    let compression = home.config().providers.codex_websocket_compression;
+    ws.on_upgrade(compression, limit, move |socket| {
+        run(home, headers, principal, socket, limit)
+    })
 }
 
 struct Reader(tokio::task::JoinHandle<()>);
@@ -172,6 +179,14 @@ async fn session(
     {
         first["prompt_cache_key"] = key.into();
     }
+    super::codex::multiagent::prepare_boundary_home(
+        &home,
+        &home.config(),
+        "/v1/responses",
+        headers,
+        &mut first,
+    )
+    .await;
     let alias = first["model"].as_str().unwrap_or("").to_owned();
     ws_home::authorize(&home, headers, Some(principal), Some(&alias)).await?;
     // No redispatch loop: an ambiguous admission/write/output can never replay.
@@ -183,7 +198,12 @@ async fn session(
     );
     let cancel = lease.cancellation();
     ensure!(!cancel.is_cancelled(), "membership ended");
-    let prepared = ws_transport::prepare(&home.config(), &selection, headers, first.clone())?;
+    let (mut prepared, mut flags) =
+        ws_codex::attempt(&home.config(), &selection, headers, first.clone())?;
+    ensure!(
+        prepared.message.len() <= limit,
+        "prepared request exceeds limit"
+    );
     if !prepared.native {
         return ws_http::session(
             &home, headers, principal, &selection, first, writer, input, limit, cancel,
@@ -191,34 +211,49 @@ async fn session(
         .await;
     }
     history.native = true;
-    // Read once per socket, as Go binds steering at connect time. permessage-deflate
-    // (`codex.websocket-compression`) is never negotiated by tungstenite/axum, so
-    // both directions behave like Go's `websocket-compression: false`.
+    // Read once per socket, as Go binds steering at connect time.
     let mut steering = ws_steering::Steering::new(home.config().providers.codex_response_steering);
-    let mut turn = Some(ws_home::Turn::new(home.clone(), &selection, &alias));
-    // CPA bounds connection acquisition, never the established response stream.
-    let (mut upstream, _) = tokio::time::timeout(
-        std::time::Duration::from_secs(30),
-        tokio_tungstenite::connect_async_with_config(
-            prepared.handshake,
-            Some(
-                tokio_tungstenite::tungstenite::protocol::WebSocketConfig::default()
-                    .max_message_size(Some(limit))
-                    .max_frame_size(Some(limit)),
-            ),
-            true,
-        ),
-    )
-    .await??;
-    upstream
-        .send(UpMessage::Text(prepared.message.into()))
-        .await?;
-    let mut pending = Some(first);
-    let mut active_id: Option<String> = None;
-    let idle = tokio::time::sleep(std::time::Duration::from_secs(300));
-    tokio::pin!(idle);
+    let mut owners = ws_codex::Owners::default();
     loop {
-        let queued = steering.pop_ready(turn.is_none() && active_id.is_none());
+        owners.pending.push_back(ws_codex::Owner {
+            request: first.clone(),
+            flags,
+            automatic: false,
+            turn: ws_home::Turn::new(home.clone(), &selection, &alias),
+        });
+        let mut connection = ws_codex::connection_state(false, flags);
+        // Retain only settings needed by automatic successors; steers pin their parent.
+        let mut settings = std::collections::HashMap::new();
+        let mut settings_order = std::collections::VecDeque::new();
+        let mut pinned = std::collections::HashMap::new();
+        // CPA bounds connection acquisition, never the established response stream.
+        let (mut upstream, _) = tokio::time::timeout(
+            std::time::Duration::from_secs(30),
+            tokio_tungstenite::connect_async_with_config(
+                prepared.handshake,
+                Some(
+                    tokio_tungstenite::tungstenite::protocol::WebSocketConfig::default()
+                        .max_message_size(Some(limit))
+                        .max_frame_size(Some(limit)),
+                ),
+                true,
+            ),
+        )
+        .await??;
+        history.submitted(&first);
+        let mut active_id: Option<String> = None;
+        let mut latest_id = String::new();
+        let mut established = false;
+        let mut consumed_event: Option<String> = None;
+        let idle = tokio::time::sleep(std::time::Duration::from_secs(300));
+        tokio::pin!(idle);
+        let outcome: Result<()> = async {
+    upstream.send(UpMessage::Text(prepared.message.into())).await.map_err(ws_recovery::transport)?;
+    loop {
+        consumed_event = None;
+        let queued = if established && owners.outstanding() < ws_steering::MAX_QUEUED {
+            steering.pop_ready(owners.automatic_active())
+        } else { None };
         let frame = if let Some(frame) = queued {
             frame
         } else {
@@ -228,12 +263,17 @@ async fn session(
                 _ = &mut idle => { replay.invalidate(); anyhow::bail!("Codex websocket idle deadline") },
                 message = upstream.next() => {
                     idle.as_mut().reset(tokio::time::Instant::now() + std::time::Duration::from_secs(300));
-                    let Some(Ok(message)) = message else { anyhow::bail!("upstream disconnected"); };
+                    let message = match message {
+                        Some(Ok(message)) => message,
+                        Some(Err(error)) => return Err(ws_recovery::transport(error)),
+                        None => return Err(ws_recovery::Lost.into()),
+                    };
                     let text = match message {
                         UpMessage::Text(text) => text.to_string(),
                         UpMessage::Binary(bytes) => String::from_utf8(bytes.to_vec())?,
-                        UpMessage::Ping(bytes) => { tokio::time::timeout(std::time::Duration::from_secs(10), upstream.send(UpMessage::Pong(bytes))).await??; continue; },
+                        UpMessage::Ping(bytes) => { tokio::time::timeout(std::time::Duration::from_secs(10), upstream.send(UpMessage::Pong(bytes))).await?.map_err(ws_recovery::transport)?; continue; },
                         UpMessage::Pong(_) => continue,
+                        UpMessage::Close(Some(close)) if u16::from(close.code) == 1006 => return Err(ws_recovery::Lost.into()),
                         UpMessage::Close(_) => anyhow::bail!("upstream closed"),
                         _ => continue,
                     };
@@ -246,61 +286,90 @@ async fn session(
                         writer.send(Message::Text(text.into())).await?;
                         continue;
                     }
-                    if kind == "response.created" && steering.enabled {
-                        ensure!(active_id.is_none(), "unexpected upstream response");
-                        let explicit = turn.is_some();
-                        steering.created(&event, explicit)?;
-                        if !explicit {
-                            // Automatic successor: same selection and lease, new usage record.
-                            turn = Some(ws_home::Turn::new(home.clone(), &selection, &alias));
-                            pending = None;
-                        }
-                    }
-                    if let Some(turn) = turn.as_mut() { turn.event(&event); }
                     if kind == "response.created" {
-                        ensure!(turn.is_some() && active_id.is_none(), "unexpected upstream response");
-                        active_id = event.pointer("/response/id").and_then(Value::as_str).map(str::to_owned);
-                        ensure!(active_id.is_some(), "response id missing");
-                    }
-                    let terminal = matches!(kind, "error" | "response.completed" | "response.done" | "response.failed" | "response.incomplete" | "response.cancelled");
-                    let owns_active = ws_state::terminal_owns_active(&event, active_id.as_deref());
-                    if terminal && kind != "error" {
-                        ensure!(ws_state::terminal_response_id(&event, active_id.as_deref()).is_some(), "terminal response id missing");
-                    }
-                    if terminal && let Some(id) = ws_state::terminal_response_id(&event, active_id.as_deref()) {
-                        steering.ended(id);
-                    }
-                    if owns_active {
-                        ensure!(turn.is_some(), "terminal response without active turn");
-                        let successful = matches!(kind, "response.completed" | "response.done")
-                            && event.pointer("/response/status").and_then(Value::as_str).is_none_or(|s| s == "completed");
-                        let current = turn.as_mut().expect("checked turn");
-                        current.record.failed = !successful || current.usage.failed;
-                        current.record.status_code = if current.record.failed { 502 } else { 200 };
-                        if !current.record.failed {
-                            if let Some(request) = pending.take() {
-                                history.commit(request.clone(), &event, limit)?;
-                                replay.commit(
-                                    active_id.clone().ok_or_else(|| anyhow::anyhow!("response id missing"))?,
-                                    request,
-                                    event.clone(),
-                                );
-                            } else {
-                                ensure!(steering.enabled, "request missing");
-                                // A steering successor continues the parent's chain.
-                                history.chain(&event, limit)?;
-                            }
-                        } else {
-                            history.invalidate();
-                            replay.invalidate();
-                            pending = None;
+                        let id = event.pointer("/response/id").and_then(Value::as_str)
+                            .filter(|id| !id.is_empty()).ok_or_else(|| anyhow::anyhow!("response id missing"))?.to_owned();
+                        ensure!(!owners.active.contains_key(&id), "duplicate response id");
+                        let parent = event.pointer("/response/previous_response_id").and_then(Value::as_str)
+                            .filter(|id| !id.is_empty()).unwrap_or(&latest_id).to_owned();
+                        let explicit = !owners.pending.is_empty();
+                        steering.created(&event, explicit)?;
+                        let owner = if let Some(owner) = owners.pending.pop_front() { owner } else {
+                            ensure!(steering.enabled, "unexpected automatic response");
+                            let (request, flags) = pinned.get(&parent).or_else(|| settings.get(&parent))
+                                .cloned().ok_or_else(|| anyhow::anyhow!("automatic successor has no parent settings"))?;
+                            ws_codex::Owner { request, flags, automatic: true,
+                                turn: ws_home::Turn::new(home.clone(), &selection, &alias) }
+                        };
+                        let mut snapshot = json!({});
+                        for key in ["model", "instructions", "reasoning", "service_tier"] {
+                            if let Some(value) = owner.request.get(key) { snapshot[key] = value.clone(); }
                         }
-                        // Usage completes per response; the stream lease is deliberately retained.
-                        drop(turn.take());
-                        active_id = None;
+                        settings.insert(id.clone(), (snapshot, owner.flags));
+                        settings_order.push_back(id.clone());
+                        if settings_order.len() > 16 && let Some(old) = settings_order.pop_front() { settings.remove(&old); }
+                        owners.active.insert(id.clone(), owner);
+                        active_id = Some(id.clone());
+                        established = true;
+                        latest_id = id.clone();
+                        history.created(&id);
                     }
-                    writer.send(Message::Text(text.into())).await?;
-                    if kind == "error" && owns_active { anyhow::bail!("upstream rejected request"); }
+                    let failure = matches!(kind, "error" | "response.failed");
+                    let terminal = failure || matches!(kind, "response.completed" | "response.done" | "response.incomplete" | "response.cancelled");
+                    let id = if failure {
+                        match owners.failure_owner(&event, steering.has_unacknowledged()) {
+                            Ok(id) => id,
+                            Err(error) => {
+                                let status = ws_failure::status(&event);
+                                if ws_failure::credential(status) {
+                                    // Account health applies to the socket even when the
+                                    // rejected request cannot safely be identified.
+                                    for owner in owners.active.values_mut().chain(owners.pending.iter_mut()) {
+                                        owner.turn.record.status_code = status;
+                                    }
+                                }
+                                writer.send(Message::Text(text.into())).await?;
+                                return Err(error);
+                            }
+                        }
+                    } else {
+                        event.get("response_id").and_then(Value::as_str)
+                            .or_else(|| event.pointer("/response/id").and_then(Value::as_str))
+                            .map(str::to_owned).or_else(|| if terminal { None } else { active_id.clone() })
+                    };
+                    if terminal && !failure {
+                        ensure!(id.as_ref().is_some_and(|id| owners.active.contains_key(id)), "terminal response has no owner");
+                    }
+                    let mut rejected = if failure && id.is_none() { owners.pending.pop_front() } else { None };
+                    let owner = id.as_ref().and_then(|id| owners.active.get_mut(id)).or(rejected.as_mut());
+                    let flags = owner.as_ref().map(|owner| owner.flags).unwrap_or_default();
+                    let restored = ws_codex::restore(text, flags, connection);
+                    let restored_event: Value = serde_json::from_str(&restored)?;
+                    if let Some(owner) = owner {
+                        owner.turn.event(&restored_event);
+                        if terminal {
+                            let successful = matches!(kind, "response.completed" | "response.done")
+                                && event.pointer("/response/status").and_then(Value::as_str).is_none_or(|s| s == "completed");
+                            owner.turn.record.failed = !successful || owner.turn.usage.failed;
+                            owner.turn.record.status_code = if failure { ws_failure::status(&event) }
+                                else if owner.turn.record.failed { 502 } else { 200 };
+                            if !owner.turn.record.failed && id.as_deref() == Some(latest_id.as_str()) {
+                                history.commit(owner.request.clone(), &restored_event, limit)?;
+                                replay.commit(id.clone().unwrap(), owner.request.clone(), restored_event);
+                            } else if owner.turn.record.failed { history.invalidate(); replay.invalidate(); }
+                        }
+                    }
+                    if terminal && let Some(id) = id {
+                        steering.ended(&id);
+                        owners.active.remove(&id);
+                        if active_id.as_deref() == Some(&id) { active_id = owners.active.keys().next_back().cloned(); }
+                    }
+                    drop(rejected);
+                    if steering.settled() { pinned.clear(); }
+                    writer.send(Message::Text(restored.into())).await?;
+                    if failure && ws_failure::credential(ws_failure::status(&event)) {
+                        anyhow::bail!("upstream credential rejected");
+                    }
                     continue;
                 },
                 message = input.recv() => {
@@ -311,13 +380,13 @@ async fn session(
                     };
                     let kind = frame.get("type").and_then(Value::as_str);
                     if matches!(kind, Some("response.interrupt" | "response.cancel")) {
-                        if !ws_state::control(&frame, active_id.as_deref()) {
+                        if !frame.get("response_id").and_then(Value::as_str).is_some_and(|id| owners.active.contains_key(id)) {
                             send_error(writer, "no_active_response", "Control frame does not own the active response").await?;
                             continue;
                         }
                         ws_home::authorize(&home, headers, Some(principal), Some(&alias)).await?;
                         // Native controls retain their original fields and never acquire/release a turn.
-                        upstream.send(UpMessage::Text(serde_json::to_string(&frame)?.into())).await?;
+                        upstream.send(UpMessage::Text(serde_json::to_string(&frame)?.into())).await.map_err(ws_recovery::transport)?;
                         continue;
                     }
                     if steering.enabled && kind == Some("response.steer") {
@@ -326,18 +395,24 @@ async fn session(
                             continue;
                         }
                         ws_home::authorize(&home, headers, Some(principal), Some(&alias)).await?;
+                        let event_id = frame.get("event_id").and_then(Value::as_str).unwrap_or("").to_owned();
                         let (message, parent) = match ws_steering::prepare(&home.config(), &selection, headers, &alias, frame, limit) {
                             Ok(prepared) => prepared,
                             Err(_) => { send_error(writer, "invalid_steer", "Steering input cannot be prepared").await?; continue; },
                         };
                         // Only upstream acknowledges steering; it never acquires a turn or redispatches.
-                        steering.submitted(&parent);
-                        upstream.send(UpMessage::Text(message.into())).await?;
+                        let target = if parent.is_empty() { latest_id.as_str() } else { &parent };
+                        if let Some(snapshot) = settings.get(target) { pinned.insert(target.to_owned(), snapshot.clone()); }
+                        steering.submitted(&parent, &event_id);
+                        upstream.send(UpMessage::Text(message.into())).await.map_err(ws_recovery::transport)?;
                         continue;
                     }
                     if steering.enabled && matches!(kind, Some("response.create" | "response.append")) {
-                        // Go queues explicit creates until the active response and any
-                        // steering successor have settled on this same socket.
+                        // Queue behind steering, but pipeline while an explicit response runs.
+                        if owners.outstanding() + steering.queued_len() >= ws_steering::MAX_QUEUED {
+                            send_error(writer, "too_many_requests", "Too many outstanding response.create requests").await?;
+                            continue;
+                        }
                         steering.enqueue(frame)?;
                         continue;
                     }
@@ -345,7 +420,8 @@ async fn session(
                 },
             }
         };
-        if turn.is_some() {
+        consumed_event = frame.get("event_id").and_then(Value::as_str).map(str::to_owned);
+        if !steering.enabled && owners.outstanding() > 0 {
             send_error(
                 writer,
                 "response_in_progress",
@@ -400,9 +476,12 @@ async fn session(
             .await?;
             continue;
         }
+        super::codex::multiagent::prepare_boundary_home(
+            &home, &home.config(), "/v1/responses", headers, &mut body,
+        ).await;
         ws_home::authorize(&home, headers, Some(principal), Some(&alias)).await?;
-        let prepared =
-            match ws_transport::prepare(&home.config(), &selection, headers, body.clone()) {
+        let (prepared, flags) =
+            match ws_codex::attempt(&home.config(), &selection, headers, body.clone()) {
                 Ok(prepared) => prepared,
                 Err(_) => {
                     send_error(
@@ -414,16 +493,133 @@ async fn session(
                     continue;
                 }
             };
-        turn = Some(ws_home::Turn::new(home.clone(), &selection, &alias));
-        pending = Some(body);
-        // Even a failed send may have been admitted: terminate, never reconnect/reselect.
+        if prepared.message.len() > limit {
+            send_error(writer, "unsupported_payload", "Prepared request exceeds session limit").await?;
+            continue;
+        }
+        connection = ws_codex::connection_state(connection, flags);
+        history.submitted(&body);
+        consumed_event = None;
+        owners.pending.push_back(ws_codex::Owner {
+            request: body, flags, automatic: false,
+            turn: ws_home::Turn::new(home.clone(), &selection, &alias),
+        });
+        // A failed send is uncertain: abandon it, never replay it on recovery.
         upstream
             .send(UpMessage::Text(prepared.message.into()))
-            .await?;
+            .await.map_err(ws_recovery::transport)?;
     }
-    // Drop upstream before the exactly-once execution guard on every return/cancellation.
-    drop(upstream);
-    drop(turn);
-    drop(lease);
     Ok(())
+    }.await;
+        drop(upstream);
+        if outcome.is_err() {
+            let recoverable = outcome.as_ref().unwrap_err().is::<ws_recovery::Lost>();
+            if recoverable {
+                for owner in owners.active.values_mut().chain(owners.pending.iter_mut()) {
+                    owner.turn.record.failed = true;
+                    owner.turn.record.status_code = 502;
+                }
+            }
+            history.disconnected();
+            replay.invalidate();
+            let mut losses =
+                ws_recovery::abandon(&mut owners, &mut steering, consumed_event.as_deref());
+            if recoverable {
+                // Fence input already buffered in the failed epoch. It is never a
+                // subsequent explicit request, even if it has not reached steering.
+                while let Ok(message) = input.try_recv() {
+                    if let Ok(frame) = decode(message) {
+                        let event_id = frame.get("event_id").and_then(Value::as_str).unwrap_or("");
+                        let continuation = frame
+                            .get("previous_response_id")
+                            .and_then(Value::as_str)
+                            .is_some_and(|id| !id.is_empty())
+                            || frame.get("type").and_then(Value::as_str) == Some("response.append");
+                        losses.push(if continuation {
+                            ws_recovery::continuation(event_id)
+                        } else {
+                            ws_failure::lost(event_id, true)
+                        });
+                    }
+                }
+            }
+            for event in losses {
+                writer.send(Message::Text(event.to_string().into())).await?;
+            }
+            if recoverable && !cancel.is_cancelled() {
+                // No reporter or steer crosses the epoch. The original Home lease
+                // and selection remain pinned; recovery never redispatches.
+                loop {
+                    let frame = decode(
+                        input
+                            .recv()
+                            .await
+                            .ok_or_else(|| anyhow::anyhow!("downstream closed"))?,
+                    );
+                    let event_id = frame
+                        .as_ref()
+                        .ok()
+                        .and_then(|frame| frame.get("event_id"))
+                        .and_then(Value::as_str)
+                        .unwrap_or("")
+                        .to_owned();
+                    let mut body = match frame.and_then(|frame| history.hydrate(frame, limit)) {
+                        Ok(body) => body,
+                        Err(_) => {
+                            writer
+                                .send(Message::Text(
+                                    ws_recovery::continuation(&event_id).to_string().into(),
+                                ))
+                                .await?;
+                            continue;
+                        }
+                    };
+                    if body["model"].as_str() != Some(&alias) {
+                        send_error(writer, "model_changed", "Reconnect to change the model")
+                            .await?;
+                        continue;
+                    }
+                    ws_home::authorize(&home, headers, Some(principal), Some(&alias)).await?;
+                    if body
+                        .get("prompt_cache_key")
+                        .and_then(Value::as_str)
+                        .is_none_or(str::is_empty)
+                        && let Some(key) =
+                            crate::providers::codex::cache::provider_session(&execution, "")
+                    {
+                        body["prompt_cache_key"] = key.into();
+                    }
+                    super::codex::multiagent::prepare_boundary_home(
+                        &home,
+                        &home.config(),
+                        "/v1/responses",
+                        headers,
+                        &mut body,
+                    )
+                    .await;
+                    match ws_codex::attempt(&home.config(), &selection, headers, body.clone()) {
+                        Ok((next, next_flags)) if next.native && next.message.len() <= limit => {
+                            first = body;
+                            prepared = next;
+                            flags = next_flags;
+                            break;
+                        }
+                        _ => {
+                            send_error(
+                                writer,
+                                "unsupported_payload",
+                                "Request cannot be prepared for native WebSocket transport",
+                            )
+                            .await?
+                        }
+                    }
+                }
+                continue;
+            }
+        }
+        // Reporters settle before the socket-scoped lease is released.
+        drop(owners);
+        drop(lease);
+        return outcome;
+    }
 }

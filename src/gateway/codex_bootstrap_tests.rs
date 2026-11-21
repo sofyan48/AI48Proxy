@@ -100,9 +100,159 @@ async fn overload_rejections_become_http_503_before_commit() {
 }
 
 #[tokio::test]
+async fn hinted_rate_limits_preserve_429_and_quota_body() {
+    for (error, headers, expected) in [
+        (
+            serde_json::json!({"code":"rate_limit_exceeded"}),
+            serde_json::json!({"Retry-After":"17"}),
+            "17",
+        ),
+        (
+            serde_json::json!({"type":"rate_limit_error"}),
+            serde_json::json!({"retry-after":0}),
+            "0",
+        ),
+        (
+            serde_json::json!({"code":"turn_rate_limit_exceeded"}),
+            serde_json::json!({"Retry-After":"21"}),
+            "21",
+        ),
+        (
+            serde_json::json!({"type":"usage_limit_reached","code":"rate_limit_exceeded","resets_at":1,"resets_in_seconds":45}),
+            serde_json::json!({"Retry-After":"9"}),
+            "45",
+        ),
+    ] {
+        let (tx, response) = upstream();
+        send(
+            &tx,
+            &frame(
+                serde_json::json!({"type":"response.failed","response":{"error":error},"headers":headers}),
+            ),
+        );
+        let Bootstrap::Rejected(rejected) =
+            bootstrap(response, None, &CancellationToken::new()).await
+        else {
+            panic!("hinted rate limit must reject before commit");
+        };
+        assert_eq!(rejected.status(), StatusCode::TOO_MANY_REQUESTS);
+        assert_eq!(rejected.headers()["retry-after"], expected);
+        let body: Value = serde_json::from_str(&body(rejected).await).unwrap();
+        assert_eq!(body["error"], error);
+        if error["type"] == "usage_limit_reached" {
+            let mut record = crate::reporting::UsageRecord {
+                provider: "codex".into(),
+                ..Default::default()
+            };
+            record.upstream_failure(429, &body);
+            let hints: Value = serde_json::from_str(&record.fail_body).unwrap();
+            assert_eq!(hints["error"]["resets_at"], 1);
+            assert_eq!(hints["error"]["resets_in_seconds"], 45);
+        }
+    }
+}
+
+#[test]
+fn retry_hint_precedence_and_status_selection_match_terminal_errors() {
+    let now = chrono::DateTime::from_timestamp(1_700_000_000, 0).unwrap();
+    let quota = serde_json::json!({"error":{"type":"usage_limit_reached","resets_at":1_700_000_100,"resets_in_seconds":45}});
+    assert_eq!(
+        bootstrap_rejection(
+            &quota,
+            &serde_json::json!({"headers":{"Retry-After":9}}),
+            now
+        ),
+        (StatusCode::TOO_MANY_REQUESTS, Some(100))
+    );
+    for (body, event, status, retry) in [
+        (
+            serde_json::json!({"error":{"type":"rate_limit_error"}}),
+            serde_json::json!({"headers":{"Retry-After":"Tue, 14 Nov 2023 22:15:00 GMT"}}),
+            StatusCode::TOO_MANY_REQUESTS,
+            Some(100),
+        ),
+        (
+            serde_json::json!({"error":{"code":"rate_limit_exceeded"}}),
+            serde_json::json!({"headers":{"retry-after":"bad"},"error":{"headers":{"retry-after":30}}}),
+            StatusCode::SERVICE_UNAVAILABLE,
+            None,
+        ),
+        (
+            serde_json::json!({"error":{"type":"service_unavailable_error"}}),
+            serde_json::json!({"headers":{"retry-after":30}}),
+            StatusCode::SERVICE_UNAVAILABLE,
+            Some(30),
+        ),
+        (
+            serde_json::json!({"error":{"type":"rate_limit_error","status":503}}),
+            serde_json::json!({"body":{"headers":{"retry-after":30}}}),
+            StatusCode::SERVICE_UNAVAILABLE,
+            Some(30),
+        ),
+        (
+            serde_json::json!({"error":{"code":"rate_limit_exceeded"}}),
+            serde_json::json!({"error":{"headers":{"retry-after":"-1"}}}),
+            StatusCode::SERVICE_UNAVAILABLE,
+            None,
+        ),
+    ] {
+        assert_eq!(bootstrap_rejection(&body, &event, now), (status, retry));
+    }
+}
+
+#[tokio::test]
+async fn handshake_retry_after_does_not_replace_terminal_retry_hints() {
+    let event = serde_json::json!({"type":"error","error":{"type":"rate_limit_error"}});
+    let response: reqwest::Response = http::Response::builder()
+        .status(200)
+        .header("retry-after", "99")
+        .body(frame(event))
+        .unwrap()
+        .into();
+    let Bootstrap::Rejected(rejected) = bootstrap(response, None, &CancellationToken::new()).await
+    else {
+        panic!("rate limit must reject")
+    };
+    assert_eq!(rejected.status(), StatusCode::SERVICE_UNAVAILABLE);
+    assert!(!rejected.headers().contains_key("retry-after"));
+}
+
+#[tokio::test]
+async fn empty_incomplete_stays_request_scoped_and_empty_eof_stays_empty() {
+    let (tx, response) = upstream();
+    send(
+        &tx,
+        &format!(
+            "{}{}",
+            preamble(),
+            frame(
+                serde_json::json!({"type":"response.incomplete","response":{"output":[],"usage":{"output_tokens":0}}})
+            )
+        ),
+    );
+    let Bootstrap::Released(released) = bootstrap(response, None, &CancellationToken::new()).await
+    else {
+        panic!("empty incomplete must not fail over")
+    };
+    assert_eq!(released.status(), 200);
+    assert!(released.bytes().await.is_err());
+
+    let (tx, response) = upstream();
+    drop(tx);
+    let Bootstrap::Released(released) = bootstrap(response, None, &CancellationToken::new()).await
+    else {
+        panic!("clean empty end must release")
+    };
+    assert!(released.bytes().await.unwrap().is_empty());
+}
+
+#[tokio::test]
 async fn non_overload_failures_and_unknown_frames_keep_in_stream_delivery() {
     for event in [
         serde_json::json!({"type":"error","error":{"code":"invalid_prompt","message":"no"}}),
+        // Go does not classify quota exhaustion alone as a bootstrap overload.
+        serde_json::json!({"type":"error","error":{"type":"usage_limit_reached","resets_in_seconds":45}}),
+        serde_json::json!({"type":"response.incomplete","response":{"output":[],"usage":{"output_tokens":0.5}}}),
         serde_json::json!({"type":"response.failed","response":{"error":{"code":"context_length_exceeded"}}}),
         serde_json::json!({"type":"response.output_item.added","item":{"type":"web_search_call"}}),
         serde_json::json!({"type":"response.output_item.added",

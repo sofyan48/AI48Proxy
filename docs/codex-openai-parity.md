@@ -131,3 +131,52 @@ cargo test --locked --all-targets
 ```
 
 The contract suite is a normal acceptance suite, not a list of intentionally ignored parity failures. Historical test counts are not current guarantees. Synthetic fixtures and loopback integration tests do not establish live-provider entitlement, authentication, or exhaustive CLIProxyAPI equivalence. No live-provider requests or cross-project differential runs were performed for this documentation update.
+
+## Codex WS and bootstrap update
+
+- Native WS now uses RFC 7692 permessage-deflate upstream and downstream when
+  `codex.websocket-compression` is enabled (default). Disabled connections do not
+  negotiate it. Compressed wire round trips and bounded inflation have local tests.
+- Multi-agent/orphan rewrites run before WS payload rules. Responses are restored
+  according to their response owner, including pipelined creates and steering successors.
+- Both HTTP and WS boundaries can fetch Home models to rewrite `spawn_agent`
+  descriptions, using the pinned, attributed Codex catalog for metadata and ordering.
+- Steering queues support pipelined creates; disconnect errors distinguish sent
+  events with unknown outcomes from events never sent. Ambiguous failures do not
+  redispatch. Socket-scoped leases and response-scoped usage remain separate.
+- SSE bootstrap preserves 429 when a valid retry hint exists, otherwise uses 503;
+  quota-reset fields remain available to Home's usage parser.
+
+Validation is targeted (`cargo test --locked --lib ws_`, `codex_models`,
+`codex_multiagent`, and `codex_bootstrap` filters), not a full-suite or live-provider
+acceptance run. Remaining limitations: no Go-style keep-open reconnect recovery;
+client disappearance/cancellation cannot guarantee abandoned-event delivery;
+HTTP fallback lacks native WS response restoration; the embedded catalog is pinned.
+
+Compression uses yawc 0.5.0 (MPL-2.0). Its dependency license obligations must be
+included in distribution review; the project's own license is unchanged.
+
+### Recovery, fallback, and runtime catalog follow-up
+
+Native upstream transport loss now leaves downstream open. Only a subsequent
+explicit create can reconnect on the pinned selection and lease. Uncertain sent
+creates/steers are settled once and never replayed; lost-history continuations get
+`409 previous_response_not_found`. Credential/policy/protocol failures and normal
+close remain terminal, as does a failed recovery handshake. Local mock Home
+mTLS/RESP and socket tests cover ownership and single lease release.
+
+HTTP fallback now applies request rewrites before payload rules and restores JSON
+and SSE using attempt-owned flags, before downstream output, usage, and history
+commit. It does not inherit another socket response's restoration state.
+
+`models.codex-catalog` can select an HTTP(S) URL or absolute local file. Catalog
+refresh is demand-driven: three-hour successful refresh cadence, 60-second failure
+backoff, 8 MiB limit, and a 10-second fetch bound. Empty source uses the embedded
+catalog. Failure keeps the last valid snapshot; replacement configs own independent
+caches. Fetches use no Home/caller credentials, redirects, or inherited proxies.
+This is not Go's background updater or complete model registry: no default public
+remote fetch or management-triggered refresh is added. Old config fetches are
+bounded and cannot publish into a replacement config.
+
+Dependency notices and the yawc MPL-2.0 text are shipped in the release Docker
+image under `/usr/share/licenses/ai48proxy/`; see `THIRD_PARTY_NOTICES.md`.

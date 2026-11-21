@@ -90,6 +90,15 @@ pub(super) fn prepare(
             HeaderValue::from_static("responses_websockets=2026-02-06"),
         );
     }
+    if codex && config.providers.codex_websocket_compression {
+        // The adapter consumes this offer and lets yawc validate negotiation.
+        handshake.headers_mut().insert(
+            "sec-websocket-extensions",
+            HeaderValue::from_static(
+                "permessage-deflate; server_no_context_takeover; client_no_context_takeover",
+            ),
+        );
+    }
     Ok(Prepared {
         handshake,
         message,

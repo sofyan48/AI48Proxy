@@ -3,8 +3,12 @@ use super::wire::{field, section};
 use anyhow::{Context, Result};
 use serde_yaml::Value;
 
+#[path = "../gateway/codex_catalog.rs"]
+pub(crate) mod codex_catalog;
+
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct ProviderSettings {
+    pub(crate) codex_catalog: std::sync::Arc<codex_catalog::Catalog>,
     pub codex_user_agent: String,
     pub codex_beta_features: String,
     pub codex_request_compression: bool,
@@ -20,8 +24,7 @@ pub struct ProviderSettings {
     /// Full-duplex native Codex WebSockets: `response.steer` while a response is
     /// active, bound to the session's single Home selection and upstream socket.
     pub codex_response_steering: bool,
-    /// Go permessage-deflate preference (unset = true). The worker's WebSocket
-    /// stack never negotiates compression, so only `false` matches Go exactly.
+    /// Upstream and downstream RFC7692 permessage-deflate (unset = true).
     pub codex_websocket_compression: bool,
     pub xai_inject_x_search: bool,
     pub disable_claude_cloak_mode: bool,
@@ -79,6 +82,7 @@ impl ClaudeHeaderDefaults {
 
 /// Paths consumed by `ProviderSettings`; the unsupported-feature gate skips them.
 pub(super) const CONSUMED: &[&str] = &[
+    "models.codex-catalog",
     "codex.upstream-request-compression",
     "codex.upstream-request-compression-min-bytes",
     "codex.stream-bootstrap-buffering",
@@ -298,6 +302,7 @@ impl ProviderSettings {
                 .context("upstream-request-compression-min-bytes must be an integer")?,
         };
         Ok(Self {
+            codex_catalog: codex_catalog::Catalog::parse(raw)?,
             codex_user_agent: string(codex_headers, "user-agent")?,
             codex_beta_features: string(codex_headers, "beta-features")?,
             codex_request_compression: flag(codex, "upstream-request-compression")?,

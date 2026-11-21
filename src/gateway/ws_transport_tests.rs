@@ -39,9 +39,30 @@ async fn native_upstream_handshake_and_responses_messages() {
         json!({"model":"m","input":[]}),
     )
     .unwrap();
-    let (mut socket, _) = tokio_tungstenite::connect_async(prepared.handshake)
-        .await
-        .unwrap();
+    assert!(
+        prepared
+            .handshake
+            .headers()
+            .contains_key("sec-websocket-extensions")
+    );
+    let disabled = Config::parse(b"codex: {websocket-compression: false}\ncredential-concurrency:\n  lifecycle-config-revision: 1\n").unwrap();
+    let plain = prepare(
+        &disabled,
+        &selection,
+        &HeaderMap::new(),
+        json!({"model":"m","input":[]}),
+    )
+    .unwrap();
+    assert!(
+        !plain
+            .handshake
+            .headers()
+            .contains_key("sec-websocket-extensions")
+    );
+    let (mut socket, _) =
+        super::super::ws_deflate::connect_async_with_config(prepared.handshake, None, true)
+            .await
+            .unwrap();
     socket
         .send(Message::Text(prepared.message.into()))
         .await

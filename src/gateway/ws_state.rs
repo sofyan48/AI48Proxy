@@ -9,6 +9,7 @@ pub(super) struct History {
     response_id: String,
     valid: bool,
     pub native: bool,
+    disconnected: bool,
 }
 
 impl History {
@@ -33,6 +34,12 @@ impl History {
             _ => anyhow::bail!("input must be an array"),
         };
         let explicit = !previous.is_empty();
+        ensure!(
+            !self.disconnected
+                || (explicit && self.valid && previous == self.response_id)
+                || (!explicit && (kind == "response.create" || self.valid)),
+            "previous_response_id is not available after upstream loss; send full input"
+        );
         if explicit && !self.native {
             ensure!(
                 self.valid && previous == self.response_id,
@@ -87,7 +94,7 @@ impl History {
         } else {
             object.remove("previous_response_id");
         }
-        object.remove("event_id");
+        // Preserve client correlation through preparation and transport loss reporting.
         for field in ["model", "instructions"] {
             if !object.contains_key(field)
                 && let Some(value) = self.request.as_ref().and_then(|r| r.get(field))
@@ -132,22 +139,38 @@ impl History {
                 <= limit,
             "session history exceeds limit"
         );
-        self.request = Some(request);
+        // A terminal for an older native response must not overwrite the
+        // settings of a newer create already submitted on the same socket.
+        if !self.native || self.request.is_none() {
+            self.request = Some(request);
+        }
         self.output = output.clone();
         self.response_id = id.to_owned();
         self.valid = true;
         Ok(())
     }
 
-    /// Advance the native chain to an automatic steering successor. It has no
-    /// client request of its own; model/instructions stay inherited from the
-    /// last explicit request.
-    pub fn chain(&mut self, event: &Value, limit: usize) -> Result<()> {
-        let request = self
-            .request
-            .clone()
-            .ok_or_else(|| anyhow::anyhow!("successor without a prior request"))?;
-        self.commit(request, event, limit)
+    /// Native follow-ups inherit the most recently submitted request, even before
+    /// its terminal event. Only upstream-created IDs can extend the native chain.
+    pub fn submitted(&mut self, request: &Value) {
+        if self.native {
+            self.request = Some(request.clone());
+        }
+    }
+
+    pub fn created(&mut self, id: &str) {
+        if self.native {
+            self.response_id = id.to_owned();
+            self.valid = true;
+        }
+    }
+
+    /// Keep model/instructions, but never carry a response chain across sockets.
+    pub fn disconnected(&mut self) {
+        self.valid = false;
+        self.response_id.clear();
+        self.output.clear();
+        self.disconnected = true;
     }
 
     pub fn invalidate(&mut self) {
@@ -155,6 +178,7 @@ impl History {
     }
 }
 
+#[cfg(test)]
 pub(super) fn control(frame: &Value, active_id: Option<&str>) -> bool {
     matches!(
         frame.get("type").and_then(Value::as_str),
@@ -168,6 +192,7 @@ pub(super) fn control(frame: &Value, active_id: Option<&str>) -> bool {
 /// Classify an upstream terminal event without letting an overlapping response
 /// close the currently streamed turn. Failures may omit an id, in which case
 /// the only safe attribution is the active response.
+#[cfg(test)]
 pub(super) fn terminal_response_id<'a>(
     event: &'a Value,
     active_id: Option<&'a str>,
@@ -197,6 +222,7 @@ pub(super) fn terminal_response_id<'a>(
     }
 }
 
+#[cfg(test)]
 pub(super) fn terminal_owns_active(event: &Value, active_id: Option<&str>) -> bool {
     terminal_response_id(event, active_id).is_some_and(|id| Some(id) == active_id)
 }

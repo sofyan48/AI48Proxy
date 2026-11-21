@@ -20,7 +20,7 @@ fn config(extra: &str) -> Config {
 fn accepted_steer_owns_successor_and_blocks_creates_until_it_ends() {
     let mut s = Steering::new(true);
     s.created(&json!({"response":{"id":"r1"}}), true).unwrap();
-    s.submitted("r1");
+    s.submitted("r1", "e1");
     assert!(!s.ready(true), "unacknowledged steer blocks creates");
     s.observe(
         &json!({"type":"response.steer.accepted","steer":{"id":"s1","previous_response_id":"r1"}}),
@@ -32,7 +32,7 @@ fn accepted_steer_owns_successor_and_blocks_creates_until_it_ends() {
         false,
     )
     .unwrap();
-    assert!(s.ready(true) && !s.ready(false));
+    assert!(!s.ready(true) && s.ready(false));
     s.ended("r2");
     assert!(s.accepted.is_empty());
 }
@@ -48,24 +48,24 @@ fn unowned_automatic_successor_and_failed_steer_fail_closed() {
         )
         .is_err()
     );
-    s.submitted("r1");
+    s.submitted("r1", "e1");
     // An id-less ack falls back to the latest response as its parent.
     s.observe(&json!({"type":"response.steer.failed","steer":{"id":"s1"}}));
-    assert!(s.ready(true));
+    assert!(s.ready(false));
 }
 
 #[test]
 fn pending_steer_allows_only_the_waiting_parent_continuation() {
     let mut s = Steering::new(true);
     s.created(&json!({"response":{"id":"r1"}}), true).unwrap();
-    s.submitted("r1");
+    s.submitted("r1", "e1");
     s.observe(
         &json!({"type":"response.steer.accepted","steer":{"id":"s1","previous_response_id":"r1"}}),
     );
     s.observe(
         &json!({"type":"response.steer.pending","steer":{"id":"s1","previous_response_id":"r1"}}),
     );
-    assert!(s.ready(true));
+    assert!(s.ready(false));
     assert!(s.create_parent_ok("r1") && !s.create_parent_ok("r0"));
 }
 
@@ -76,8 +76,8 @@ fn queue_is_bounded_and_disabled_steering_never_pops() {
         s.enqueue(json!({"type":"response.create"})).unwrap();
     }
     assert!(s.enqueue(json!({})).is_err());
-    assert!(s.pop_ready(false).is_none());
-    assert!(s.pop_ready(true).is_some());
+    assert!(s.pop_ready(true).is_none());
+    assert!(s.pop_ready(false).is_some());
     let mut off = Steering::new(false);
     off.enqueue(json!({})).unwrap();
     assert!(off.pop_ready(true).is_none());
@@ -169,7 +169,7 @@ async fn duplex_steer_and_successor_share_one_upstream_socket() {
                 .unwrap();
         }
     });
-    let config = config("codex: {response-steering: true}\n");
+    let config = config("codex: {response-steering: true, websocket-compression: false}\n");
     let selection = selection(&format!("http://{address}"));
     let create = super::super::ws_transport::prepare(
         &config,
@@ -195,7 +195,7 @@ async fn duplex_steer_and_successor_share_one_upstream_socket() {
         1 << 20,
     )
     .unwrap();
-    steering.submitted(&parent);
+    steering.submitted(&parent, "");
     upstream.send(Message::Text(steer.into())).await.unwrap();
     steering
         .enqueue(json!({"type":"response.create","input":[]}))
@@ -214,7 +214,7 @@ async fn duplex_steer_and_successor_share_one_upstream_socket() {
                 let id = event["response"]["id"].as_str().unwrap().to_owned();
                 steering.ended(&id);
                 // The queued create stays held until the successor has ended.
-                assert_eq!(steering.pop_ready(true).is_some(), id == "r2");
+                assert_eq!(steering.pop_ready(id == "r1").is_some(), id == "r2");
                 ended.push(id);
             }
         }

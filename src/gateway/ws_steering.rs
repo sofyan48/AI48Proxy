@@ -15,10 +15,10 @@ pub(super) const MAX_QUEUED: usize = 16;
 #[derive(Default)]
 pub(super) struct Steering {
     pub enabled: bool,
-    /// Parents of forwarded `response.steer` frames awaiting an upstream ack.
-    unacknowledged: Vec<String>,
-    /// Accepted steer id -> (parent, successor response id once created).
-    accepted: HashMap<String, (String, String)>,
+    /// (parent, client event_id) of forwarded `response.steer` frames awaiting an ack.
+    unacknowledged: Vec<(String, String)>,
+    /// Accepted steer id -> (parent, successor response id once created, client event_id).
+    accepted: HashMap<String, (String, String, String)>,
     /// Parent that upstream reported as waiting for client input (tool results).
     waiting_parent: String,
     /// Most recent `response.created` id; Go's fallback parent for id-less acks.
@@ -38,8 +38,40 @@ impl Steering {
         }
     }
 
-    pub fn submitted(&mut self, parent: &str) {
-        self.unacknowledged.push(parent.to_owned());
+    pub fn submitted(&mut self, parent: &str, event_id: &str) {
+        self.unacknowledged
+            .push((parent.to_owned(), event_id.to_owned()));
+    }
+
+    pub fn has_unacknowledged(&self) -> bool {
+        !self.unacknowledged.is_empty()
+    }
+
+    /// Nothing outstanding: no unacked or accepted steer and no queued create.
+    pub fn settled(&self) -> bool {
+        self.unacknowledged.is_empty() && self.accepted.is_empty() && self.queue.is_empty()
+    }
+
+    /// Go loss order: unacknowledged steers, accepted steers sorted by steer id,
+    /// then queued (never sent) creates. Operations without an event_id are omitted.
+    pub fn abandoned(&self) -> (Vec<String>, Vec<String>) {
+        let mut sent: Vec<String> = self
+            .unacknowledged
+            .iter()
+            .map(|(_, event)| event.clone())
+            .collect();
+        let mut ids: Vec<&String> = self.accepted.keys().collect();
+        ids.sort();
+        sent.extend(ids.into_iter().map(|id| self.accepted[id].2.clone()));
+        sent.retain(|event| !event.is_empty());
+        let queued = self
+            .queue
+            .iter()
+            .filter_map(|frame| frame.get("event_id").and_then(Value::as_str))
+            .filter(|event| !event.is_empty())
+            .map(str::to_owned)
+            .collect();
+        (sent, queued)
     }
 
     /// Track an upstream `response.steer.*` event. The event itself is opaque
@@ -52,8 +84,8 @@ impl Steering {
         }
         match text(event, "/type") {
             "response.steer.accepted" => {
-                self.consume(&parent);
-                self.accepted.insert(id, (parent, String::new()));
+                let event_id = self.consume(&parent);
+                self.accepted.insert(id, (parent, String::new(), event_id));
             }
             "response.steer.failed" => {
                 if self.accepted.remove(&id).is_none() {
@@ -65,14 +97,12 @@ impl Steering {
         }
     }
 
-    fn consume(&mut self, parent: &str) {
-        if let Some(index) = self
-            .unacknowledged
+    fn consume(&mut self, parent: &str) -> String {
+        self.unacknowledged
             .iter()
-            .position(|p| p == parent || p.is_empty())
-        {
-            self.unacknowledged.remove(index);
-        }
+            .position(|(p, _)| p == parent || p.is_empty())
+            .map(|index| self.unacknowledged.remove(index).1)
+            .unwrap_or_default()
     }
 
     /// Record `response.created`. Without an explicit create in flight the
@@ -86,7 +116,7 @@ impl Steering {
         }
         let parent = parent.to_owned();
         let mut owned = false;
-        for (steer_parent, successor) in self.accepted.values_mut() {
+        for (steer_parent, successor, _) in self.accepted.values_mut() {
             if *steer_parent == parent && successor.is_empty() {
                 *successor = id.to_owned();
                 owned = true;
@@ -104,18 +134,22 @@ impl Steering {
     /// A steer is complete once the response that consumed it has ended.
     pub fn ended(&mut self, id: &str) {
         if !id.is_empty() {
-            self.accepted.retain(|_, (_, successor)| successor != id);
+            self.accepted.retain(|_, (_, successor, _)| successor != id);
         }
     }
 
-    /// Go readyForCreate, restricted to an idle socket: AI48Proxy does not
-    /// pipeline creates behind an active response.
-    pub fn ready(&self, idle: bool) -> bool {
-        idle && self.unacknowledged.is_empty()
-            && self
-                .accepted
-                .values()
-                .all(|(parent, successor)| !successor.is_empty() || *parent == self.waiting_parent)
+    /// Go readyForCreate: creates pipeline behind a running explicit response,
+    /// but never behind an unacked steer or an automatic successor.
+    pub fn ready(&self, automatic_active: bool) -> bool {
+        !automatic_active
+            && self.unacknowledged.is_empty()
+            && self.accepted.values().all(|(parent, successor, _)| {
+                !successor.is_empty() || *parent == self.waiting_parent
+            })
+    }
+
+    pub fn queued_len(&self) -> usize {
+        self.queue.len()
     }
 
     /// Go wrongParent: while an accepted steer awaits input, only a create that
@@ -123,7 +157,7 @@ impl Steering {
     pub fn create_parent_ok(&self, previous: &str) -> bool {
         self.accepted
             .values()
-            .all(|(_, successor)| !successor.is_empty() || previous == self.waiting_parent)
+            .all(|(_, successor, _)| !successor.is_empty() || previous == self.waiting_parent)
     }
 
     pub fn enqueue(&mut self, frame: Value) -> Result<()> {
@@ -135,8 +169,8 @@ impl Steering {
         Ok(())
     }
 
-    pub fn pop_ready(&mut self, idle: bool) -> Option<Value> {
-        if self.enabled && self.ready(idle) {
+    pub fn pop_ready(&mut self, automatic_active: bool) -> Option<Value> {
+        if self.enabled && self.ready(automatic_active) {
             self.queue.pop_front()
         } else {
             None

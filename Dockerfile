@@ -15,6 +15,8 @@ RUN apt-get update \
     && useradd --uid 10001 --gid 10001 --no-create-home --home-dir /var/lib/ai48proxy --shell /usr/sbin/nologin ai48proxy \
     && install -d -m 0700 -o 10001 -g 10001 /var/lib/ai48proxy
 COPY --from=builder /build/target/release/ai48proxy /usr/local/bin/ai48proxy
+COPY LICENSE THIRD_PARTY_NOTICES.md /usr/share/licenses/ai48proxy/
+COPY licenses/ /usr/share/licenses/ai48proxy/licenses/
 USER 10001:10001
 WORKDIR /var/lib/ai48proxy
 # Actual bind address and port are supplied by Home; this is only the default.

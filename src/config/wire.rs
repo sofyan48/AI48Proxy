@@ -48,6 +48,14 @@ pub(super) fn duration(value: &Value, key: &str, default: &str, nanos: bool) -> 
     Ok(parsed)
 }
 
+/// Go duration; a leading '-' yields zero (callers treat it as non-positive).
+pub(super) fn parse_go_duration(input: &str) -> Result<Duration> {
+    match input.strip_prefix('-') {
+        Some(rest) => parse_duration(rest).map(|_| Duration::ZERO),
+        None => parse_duration(input),
+    }
+}
+
 // Go duration grammar, including compound and fractional units; bounded by int64 ns.
 fn parse_duration(input: &str) -> Result<Duration> {
     let mut s = input.strip_prefix('+').unwrap_or(input);

@@ -94,7 +94,7 @@ pub(super) fn apply(
     cloak(
         body,
         strict.eq_ignore_ascii_case("true"),
-        &chrono::Local::now().format("%Y-%m-%d").to_string(),
+        &current_date(auth),
     )?;
     if super::betas::uses_progress(body["model"].as_str().unwrap_or(""))
         && matches!(
@@ -107,6 +107,19 @@ pub(super) fn apply(
     }
     cache::normalize(body);
     Ok(())
+}
+
+/// Go claudeCodeTimezone: a valid credential timezone, else local time. The
+/// configured header-defaults timezone is projected into the attribute upstream.
+fn current_date(auth: &Value) -> String {
+    let now = chrono::Utc::now();
+    match setting(auth, "timezone").and_then(|tz| tz.parse::<chrono_tz::Tz>().ok()) {
+        Some(tz) => now.with_timezone(&tz).format("%Y-%m-%d").to_string(),
+        None => now
+            .with_timezone(&chrono::Local)
+            .format("%Y-%m-%d")
+            .to_string(),
+    }
 }
 
 fn setting(auth: &Value, key: &str) -> Option<String> {

@@ -15,6 +15,8 @@ mod execution_tests;
 pub mod keepalive;
 #[path = "config/multimedia.rs"]
 pub mod multimedia;
+#[path = "config/providers.rs"]
+pub mod providers;
 #[cfg(test)]
 #[path = "config/tests.rs"]
 mod tests;
@@ -73,6 +75,7 @@ pub struct Config {
     pub lifecycle: Lifecycle,
     pub observation: Observation,
     pub payload: PayloadRules,
+    pub providers: providers::ProviderSettings,
     pub raw: Value,
 }
 
@@ -237,6 +240,7 @@ impl Config {
             lifecycle,
             observation,
             payload,
+            providers: providers::ProviderSettings::parse(&raw)?,
             raw,
         })
     }

@@ -458,3 +458,32 @@ fn checked_out_go_contract_sources_match_the_regression_fixtures() {
     assert!(!sanitizer.contains("delete(out.Metadata, \"account_uuid\")"));
     assert!(!sanitizer.contains("delete(out.Metadata, \"claude_device_ids\")"));
 }
+
+#[test]
+fn operator_beta_strip_append_and_client_request_id_modes() {
+    use crate::config::providers::ClaudeHeaderDefaults;
+    let mut headers = HeaderMap::new();
+    headers.insert("anthropic-beta", "a,b,c".parse().unwrap());
+    headers.insert("x-client-request-id", "generated".parse().unwrap());
+    let defaults = ClaudeHeaderDefaults {
+        beta_strip: vec!["b".into()],
+        beta_append: vec!["c".into(), "d".into()],
+        client_request_id: "off".into(),
+        ..Default::default()
+    };
+    super::operator_overrides(&mut headers, &HeaderMap::new(), &defaults).unwrap();
+    assert_eq!(headers["anthropic-beta"], "a,c,d");
+    assert!(!headers.contains_key("x-client-request-id"));
+
+    let mut incoming = HeaderMap::new();
+    incoming.insert("x-client-request-id", "caller".parse().unwrap());
+    headers.insert("x-client-request-id", "generated".parse().unwrap());
+    let passthrough = ClaudeHeaderDefaults {
+        client_request_id: "passthrough".into(),
+        ..Default::default()
+    };
+    super::operator_overrides(&mut headers, &incoming, &passthrough).unwrap();
+    assert_eq!(headers["x-client-request-id"], "caller");
+    super::operator_overrides(&mut headers, &HeaderMap::new(), &passthrough).unwrap();
+    assert!(!headers.contains_key("x-client-request-id"));
+}

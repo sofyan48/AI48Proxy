@@ -93,13 +93,7 @@ pub(crate) fn request_headers(
 ) -> Result<()> {
     forward_headers(headers, incoming);
     let configured = if oauth {
-        config
-            .raw
-            .get("codex-header-defaults")
-            .and_then(|v| v.get("user-agent"))
-            .and_then(serde_yaml::Value::as_str)
-            .unwrap_or("")
-            .trim()
+        config.providers.codex_user_agent.as_str()
     } else {
         ""
     };

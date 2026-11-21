@@ -11,6 +11,9 @@ use futures_util::{Stream, StreamExt};
 use serde_json::Value;
 use tokio_util::sync::CancellationToken;
 
+#[path = "codex_multiagent.rs"]
+pub(super) mod multiagent;
+
 const MAX_RESPONSE: usize = 32 * 1024 * 1024;
 
 pub(super) struct Events {
@@ -269,9 +272,257 @@ pub(super) async fn buffered(
     }
 }
 
+/// Go codexBootstrapMaxBufferedFrames: counted in upstream lines, blank separators included.
+const BOOTSTRAP_MAX_LINES: usize = 48;
+/// Go codexBootstrapMaxBufferedBytes: bounds raw bytes held, including a partial line.
+const BOOTSTRAP_MAX_BYTES: usize = 1 << 20;
+
+pub(super) enum Bootstrap {
+    /// Held bytes are replayed ahead of the untouched remainder of the body.
+    Released(reqwest::Response),
+    /// A synthesized HTTP 503 carrying the normalized error body, so the caller
+    /// runs the same failure/rotation path as a genuine upstream 503.
+    Rejected(reqwest::Response),
+    Cancelled,
+}
+
+enum Line {
+    Hold,
+    Release,
+    Reject(Value),
+}
+
+/// Go stream-bootstrap-buffering (HTTP/SSE): hold pre-generation frames until the
+/// first generated event so an in-stream overload rejection can fail the attempt
+/// before downstream headers are committed. Payloads are never logged.
+pub(super) async fn bootstrap(
+    response: reqwest::Response,
+    timeout: Option<std::time::Duration>,
+    cancellation: &CancellationToken,
+) -> Bootstrap {
+    let deadline = timeout.map(|timeout| tokio::time::Instant::now() + timeout);
+    let status = response.status();
+    let version = response.version();
+    let headers = response.headers().clone();
+    let mut source = response.bytes_stream();
+    let mut held = Vec::new();
+    let mut scanned = 0usize;
+    let mut lines = 0usize;
+    let mut failure = None;
+    let reason = 'probe: loop {
+        while let Some(end) = held[scanned..].iter().position(|&b| b == b'\n') {
+            lines += 1;
+            if lines > BOOTSTRAP_MAX_LINES {
+                break 'probe "frame_budget";
+            }
+            match classify(&held[scanned..scanned + end]) {
+                Line::Hold => scanned += end + 1,
+                Line::Release => break 'probe "generation_started",
+                Line::Reject(body) => {
+                    tracing::info!(
+                        event = "codex_bootstrap_rejected",
+                        held_lines = lines,
+                        "Codex overload during stream bootstrap; failing attempt over"
+                    );
+                    let body = serde_json::to_vec(&body).unwrap_or_default();
+                    let mut builder = http::Response::builder()
+                        .status(StatusCode::SERVICE_UNAVAILABLE)
+                        .version(version)
+                        .header("content-type", "application/json");
+                    if let Some(value) = headers.get("retry-after") {
+                        builder = builder.header("retry-after", value);
+                    }
+                    return match builder.body(reqwest::Body::from(body)) {
+                        Ok(rejected) => Bootstrap::Rejected(rejected.into()),
+                        Err(_) => Bootstrap::Cancelled,
+                    };
+                }
+            }
+        }
+        if held.len() > BOOTSTRAP_MAX_BYTES {
+            break 'probe "byte_budget";
+        }
+        let expired = async {
+            match deadline {
+                Some(deadline) => tokio::time::sleep_until(deadline).await,
+                None => std::future::pending().await,
+            }
+        };
+        let next = tokio::select! {
+            biased;
+            _ = cancellation.cancelled() => return Bootstrap::Cancelled,
+            _ = expired => break 'probe "time_budget",
+            next = source.next() => next,
+        };
+        match next {
+            Some(Ok(bytes)) => held.extend_from_slice(&bytes),
+            Some(Err(err)) => {
+                failure = Some(Err(err));
+                break 'probe "transport_error";
+            }
+            // A clean end stays request-scoped: the stream consumer reports it incomplete.
+            None => break 'probe "ended",
+        }
+    };
+    tracing::debug!(
+        event = "codex_bootstrap_released",
+        reason,
+        held_lines = lines,
+        held_bytes = held.len(),
+        "Codex stream bootstrap released"
+    );
+    let prefix = (!held.is_empty()).then(|| Ok(bytes::Bytes::from(held)));
+    let body = futures_util::stream::iter(prefix.into_iter().chain(failure)).chain(source);
+    let mut builder = http::Response::builder().status(status).version(version);
+    if let Some(target) = builder.headers_mut() {
+        *target = headers;
+    }
+    match builder.body(reqwest::Body::wrap_stream(body)) {
+        Ok(released) => Bootstrap::Released(released.into()),
+        Err(_) => Bootstrap::Cancelled,
+    }
+}
+
+fn classify(line: &[u8]) -> Line {
+    let line = line.strip_suffix(b"\r").unwrap_or(line);
+    // event:, id:, comments and blank separators belong to the frame they frame.
+    let Some(data) = line.strip_prefix(b"data:") else {
+        return Line::Hold;
+    };
+    let data = data.trim_ascii();
+    if data.is_empty() {
+        return Line::Hold;
+    }
+    let Ok(event) = serde_json::from_slice::<Value>(data) else {
+        return Line::Release;
+    };
+    let kind = event.get("type").and_then(Value::as_str).unwrap_or("");
+    if matches!(kind, "error" | "response.failed") {
+        return match terminal_error(&event, kind) {
+            Some(body) if overload(&body) => Line::Reject(body),
+            _ => Line::Release,
+        };
+    }
+    if bufferable(kind, &event) {
+        Line::Hold
+    } else {
+        Line::Release
+    }
+}
+
+/// Go isCodexBootstrapBufferableEvent: a closed list, so unknown frames release.
+fn bufferable(kind: &str, event: &Value) -> bool {
+    match kind {
+        "response.created"
+        | "response.in_progress"
+        | "codex.rate_limits"
+        | "codex.response.metadata"
+        | "response.metadata"
+        | "keepalive" => true,
+        "response.output_item.added" => {
+            let item = &event["item"];
+            let text = |key: &str| item[key].as_str().unwrap_or("").is_empty();
+            match item["type"].as_str() {
+                Some("message") => empty_list(&item["content"]),
+                Some("reasoning") => {
+                    text("encrypted_content")
+                        && empty_list(&item["summary"])
+                        && empty_list(&item["content"])
+                }
+                Some("function_call") => text("arguments"),
+                Some("custom_tool_call") => text("input"),
+                _ => false,
+            }
+        }
+        "response.content_part.added" | "response.reasoning_summary_part.added" => {
+            empty_part(&event["part"])
+        }
+        _ => false,
+    }
+}
+
+fn empty_list(list: &Value) -> bool {
+    list.as_array()
+        .is_none_or(|entries| entries.iter().all(empty_part))
+}
+
+fn empty_part(part: &Value) -> bool {
+    let empty = |key: &str| part[key].as_str().unwrap_or("").is_empty();
+    match part["type"].as_str() {
+        Some("output_text" | "summary_text" | "text" | "reasoning_text") => empty("text"),
+        Some("refusal") => empty("refusal"),
+        _ => false,
+    }
+}
+
+/// Go codexTerminalFailureBody, normalized to `{"error":{...}}`.
+fn terminal_error(event: &Value, kind: &str) -> Option<Value> {
+    let paths: &[&str] = if kind == "response.failed" {
+        &["/response/error", "/error", "/body/error"]
+    } else {
+        &["/error", "/body/error", "/response/error"]
+    };
+    let error = paths
+        .iter()
+        .filter_map(|path| event.pointer(path))
+        .find(|value| !value.is_null())
+        .map(|value| match value {
+            Value::String(message) => serde_json::json!({"message": message}),
+            other => other.clone(),
+        })
+        .or_else(|| {
+            (kind == "error").then(|| {
+                let mut error = serde_json::Map::new();
+                for (from, to) in [
+                    ("message", "message"),
+                    ("code", "code"),
+                    ("error_type", "type"),
+                ] {
+                    if let Some(value) = event.get(from).filter(|v| v.is_string()) {
+                        error.insert(to.into(), value.clone());
+                    }
+                }
+                Value::Object(error)
+            })
+        })?;
+    Some(serde_json::json!({ "error": error }))
+}
+
+/// Go isCodexOverloadBootstrapFailure: only transient capacity, overload and
+/// rate-limit rejections fail over; everything else keeps in-stream delivery.
+fn overload(body: &Value) -> bool {
+    let field = |key: &str| {
+        body["error"][key]
+            .as_str()
+            .unwrap_or("")
+            .trim()
+            .to_ascii_lowercase()
+    };
+    let (kind, code, message) = (field("type"), field("code"), field("message"));
+    let capacity_code = matches!(
+        code.as_str(),
+        "" | "turn_rate_limit_exceeded" | "model_at_capacity" | "model_is_at_capacity"
+    );
+    let at_capacity = message.contains("model is at capacity")
+        || message.contains("model_at_capacity")
+        || message.contains("model_is_at_capacity")
+        || (message.contains("model") && message.contains("at capacity"));
+    (capacity_code && (at_capacity || code == "turn_rate_limit_exceeded"))
+        || kind == "service_unavailable_error"
+        || code == "server_is_overloaded"
+        || kind == "rate_limit_error"
+        || code == "rate_limit_exceeded"
+        || ((kind == "server_error" || code == "server_error")
+            && message.contains("you can retry your request"))
+}
+
 #[cfg(test)]
 #[path = "codex_tests.rs"]
 mod tests;
+
+#[cfg(test)]
+#[path = "codex_bootstrap_tests.rs"]
+mod bootstrap_tests;
 
 #[cfg(test)]
 mod terminal_alias_tests {

@@ -24,6 +24,8 @@ mod ws_http;
 mod ws_replay;
 #[path = "ws_state.rs"]
 mod ws_state;
+#[path = "ws_steering.rs"]
+mod ws_steering;
 #[cfg(test)]
 #[path = "ws_tests.rs"]
 mod ws_tests;
@@ -189,6 +191,10 @@ async fn session(
         .await;
     }
     history.native = true;
+    // Read once per socket, as Go binds steering at connect time. permessage-deflate
+    // (`codex.websocket-compression`) is never negotiated by tungstenite/axum, so
+    // both directions behave like Go's `websocket-compression: false`.
+    let mut steering = ws_steering::Steering::new(home.config().providers.codex_response_steering);
     let mut turn = Some(ws_home::Turn::new(home.clone(), &selection, &alias));
     // CPA bounds connection acquisition, never the established response stream.
     let (mut upstream, _) = tokio::time::timeout(
@@ -212,108 +218,208 @@ async fn session(
     let idle = tokio::time::sleep(std::time::Duration::from_secs(300));
     tokio::pin!(idle);
     loop {
-        tokio::select! {
-            biased;
-            _ = cancel.cancelled() => break,
-            _ = &mut idle => { replay.invalidate(); anyhow::bail!("Codex websocket idle deadline") },
-            message = upstream.next() => {
-                idle.as_mut().reset(tokio::time::Instant::now() + std::time::Duration::from_secs(300));
-                let Some(Ok(message)) = message else { anyhow::bail!("upstream disconnected"); };
-                let text = match message {
-                    UpMessage::Text(text) => text.to_string(),
-                    UpMessage::Binary(bytes) => String::from_utf8(bytes.to_vec())?,
-                    UpMessage::Ping(bytes) => { tokio::time::timeout(std::time::Duration::from_secs(10), upstream.send(UpMessage::Pong(bytes))).await??; continue; },
-                    UpMessage::Pong(_) => continue,
-                    UpMessage::Close(_) => anyhow::bail!("upstream closed"),
-                    _ => continue,
-                };
-                ensure!(text.len() <= limit, "upstream event exceeds limit");
-                let event: Value = serde_json::from_str(&text)?;
-                let kind = event.get("type").and_then(Value::as_str).unwrap_or("");
-                if let Some(turn) = turn.as_mut() { turn.event(&event); }
-                if kind == "response.created" {
-                    ensure!(turn.is_some() && active_id.is_none(), "unexpected upstream response");
-                    active_id = event.pointer("/response/id").and_then(Value::as_str).map(str::to_owned);
-                    ensure!(active_id.is_some(), "response id missing");
-                }
-                let terminal = matches!(kind, "error" | "response.completed" | "response.done" | "response.failed" | "response.incomplete" | "response.cancelled");
-                let owns_active = ws_state::terminal_owns_active(&event, active_id.as_deref());
-                if terminal && kind != "error" {
-                    ensure!(ws_state::terminal_response_id(&event, active_id.as_deref()).is_some(), "terminal response id missing");
-                }
-                if owns_active {
-                    ensure!(turn.is_some(), "terminal response without active turn");
-                    let successful = matches!(kind, "response.completed" | "response.done")
-                        && event.pointer("/response/status").and_then(Value::as_str).is_none_or(|s| s == "completed");
-                    let current = turn.as_mut().expect("checked turn");
-                    current.record.failed = !successful || current.usage.failed;
-                    current.record.status_code = if current.record.failed { 502 } else { 200 };
-                    if !current.record.failed {
-                        let request = pending.take().ok_or_else(|| anyhow::anyhow!("request missing"))?;
-                        history.commit(request.clone(), &event, limit)?;
-                        replay.commit(
-                            active_id.clone().ok_or_else(|| anyhow::anyhow!("response id missing"))?,
-                            request,
-                            event.clone(),
-                        );
-                    } else {
-                        history.invalidate();
-                        replay.invalidate();
-                        pending = None;
-                    }
-                    // Usage completes per response; the stream lease is deliberately retained.
-                    drop(turn.take());
-                    active_id = None;
-                }
-                writer.send(Message::Text(text.into())).await?;
-                if kind == "error" && owns_active { anyhow::bail!("upstream rejected request"); }
-            },
-            message = input.recv() => {
-                let Some(message) = message else { break; };
-                let frame = match decode(message) {
-                    Ok(frame) => frame,
-                    Err(_) => { send_error(writer, "invalid_json", "Expected a JSON object").await?; continue; },
-                };
-                if matches!(frame.get("type").and_then(Value::as_str), Some("response.interrupt" | "response.cancel")) {
-                    if !ws_state::control(&frame, active_id.as_deref()) {
-                        send_error(writer, "no_active_response", "Control frame does not own the active response").await?;
+        let queued = steering.pop_ready(turn.is_none() && active_id.is_none());
+        let frame = if let Some(frame) = queued {
+            frame
+        } else {
+            tokio::select! {
+                biased;
+                _ = cancel.cancelled() => break,
+                _ = &mut idle => { replay.invalidate(); anyhow::bail!("Codex websocket idle deadline") },
+                message = upstream.next() => {
+                    idle.as_mut().reset(tokio::time::Instant::now() + std::time::Duration::from_secs(300));
+                    let Some(Ok(message)) = message else { anyhow::bail!("upstream disconnected"); };
+                    let text = match message {
+                        UpMessage::Text(text) => text.to_string(),
+                        UpMessage::Binary(bytes) => String::from_utf8(bytes.to_vec())?,
+                        UpMessage::Ping(bytes) => { tokio::time::timeout(std::time::Duration::from_secs(10), upstream.send(UpMessage::Pong(bytes))).await??; continue; },
+                        UpMessage::Pong(_) => continue,
+                        UpMessage::Close(_) => anyhow::bail!("upstream closed"),
+                        _ => continue,
+                    };
+                    ensure!(text.len() <= limit, "upstream event exceeds limit");
+                    let event: Value = serde_json::from_str(&text)?;
+                    let kind = event.get("type").and_then(Value::as_str).unwrap_or("");
+                    if steering.enabled && kind.starts_with("response.steer.") {
+                        // Acks/pending/failures are opaque and never end or fail a response.
+                        steering.observe(&event);
+                        writer.send(Message::Text(text.into())).await?;
                         continue;
                     }
-                    ws_home::authorize(&home, headers, Some(principal), Some(&alias)).await?;
-                    // Native controls retain their original fields and never acquire/release a turn.
-                    upstream.send(UpMessage::Text(serde_json::to_string(&frame)?.into())).await?;
+                    if kind == "response.created" && steering.enabled {
+                        ensure!(active_id.is_none(), "unexpected upstream response");
+                        let explicit = turn.is_some();
+                        steering.created(&event, explicit)?;
+                        if !explicit {
+                            // Automatic successor: same selection and lease, new usage record.
+                            turn = Some(ws_home::Turn::new(home.clone(), &selection, &alias));
+                            pending = None;
+                        }
+                    }
+                    if let Some(turn) = turn.as_mut() { turn.event(&event); }
+                    if kind == "response.created" {
+                        ensure!(turn.is_some() && active_id.is_none(), "unexpected upstream response");
+                        active_id = event.pointer("/response/id").and_then(Value::as_str).map(str::to_owned);
+                        ensure!(active_id.is_some(), "response id missing");
+                    }
+                    let terminal = matches!(kind, "error" | "response.completed" | "response.done" | "response.failed" | "response.incomplete" | "response.cancelled");
+                    let owns_active = ws_state::terminal_owns_active(&event, active_id.as_deref());
+                    if terminal && kind != "error" {
+                        ensure!(ws_state::terminal_response_id(&event, active_id.as_deref()).is_some(), "terminal response id missing");
+                    }
+                    if terminal && let Some(id) = ws_state::terminal_response_id(&event, active_id.as_deref()) {
+                        steering.ended(id);
+                    }
+                    if owns_active {
+                        ensure!(turn.is_some(), "terminal response without active turn");
+                        let successful = matches!(kind, "response.completed" | "response.done")
+                            && event.pointer("/response/status").and_then(Value::as_str).is_none_or(|s| s == "completed");
+                        let current = turn.as_mut().expect("checked turn");
+                        current.record.failed = !successful || current.usage.failed;
+                        current.record.status_code = if current.record.failed { 502 } else { 200 };
+                        if !current.record.failed {
+                            if let Some(request) = pending.take() {
+                                history.commit(request.clone(), &event, limit)?;
+                                replay.commit(
+                                    active_id.clone().ok_or_else(|| anyhow::anyhow!("response id missing"))?,
+                                    request,
+                                    event.clone(),
+                                );
+                            } else {
+                                ensure!(steering.enabled, "request missing");
+                                // A steering successor continues the parent's chain.
+                                history.chain(&event, limit)?;
+                            }
+                        } else {
+                            history.invalidate();
+                            replay.invalidate();
+                            pending = None;
+                        }
+                        // Usage completes per response; the stream lease is deliberately retained.
+                        drop(turn.take());
+                        active_id = None;
+                    }
+                    writer.send(Message::Text(text.into())).await?;
+                    if kind == "error" && owns_active { anyhow::bail!("upstream rejected request"); }
                     continue;
-                }
-                if turn.is_some() {
-                    send_error(writer, "response_in_progress", "Wait for the active response terminal event").await?;
-                    continue;
-                }
-                if let Some(response_id) = frame.get("previous_response_id").and_then(Value::as_str) {
-                    let replay_known = replay.get(response_id).is_some();
-                    tracing::debug!(replay_known, "Codex websocket continuation replay state checked");
-                }
-                let mut body = match history.hydrate(frame, limit) {
-                    Ok(body) => body,
-                    Err(_) => { send_error(writer, "invalid_continuation", "Continuation requires known history or a full replacement transcript").await?; continue; },
-                };
-                if body.get("prompt_cache_key").and_then(Value::as_str).is_none_or(str::is_empty)
-                    && let Some(key) = crate::providers::codex::cache::provider_session(&execution, "")
-                { body["prompt_cache_key"] = key.into(); }
-                if body["model"].as_str() != Some(&alias) {
-                    send_error(writer, "model_changed", "Reconnect to change the model").await?;
-                    continue;
-                }
-                ws_home::authorize(&home, headers, Some(principal), Some(&alias)).await?;
-                let prepared = match ws_transport::prepare(&home.config(), &selection, headers, body.clone()) {
-                    Ok(prepared) => prepared,
-                    Err(_) => { send_error(writer, "unsupported_payload", "Request cannot be prepared for native WebSocket transport").await?; continue; },
-                };
-                turn = Some(ws_home::Turn::new(home.clone(), &selection, &alias));
-                pending = Some(body);
-                // Even a failed send may have been admitted: terminate, never reconnect/reselect.
-                upstream.send(UpMessage::Text(prepared.message.into())).await?;
-            },
+                },
+                message = input.recv() => {
+                    let Some(message) = message else { break; };
+                    let frame = match decode(message) {
+                        Ok(frame) => frame,
+                        Err(_) => { send_error(writer, "invalid_json", "Expected a JSON object").await?; continue; },
+                    };
+                    let kind = frame.get("type").and_then(Value::as_str);
+                    if matches!(kind, Some("response.interrupt" | "response.cancel")) {
+                        if !ws_state::control(&frame, active_id.as_deref()) {
+                            send_error(writer, "no_active_response", "Control frame does not own the active response").await?;
+                            continue;
+                        }
+                        ws_home::authorize(&home, headers, Some(principal), Some(&alias)).await?;
+                        // Native controls retain their original fields and never acquire/release a turn.
+                        upstream.send(UpMessage::Text(serde_json::to_string(&frame)?.into())).await?;
+                        continue;
+                    }
+                    if steering.enabled && kind == Some("response.steer") {
+                        if frame.get("model").and_then(Value::as_str).is_some_and(|m| m != alias) {
+                            send_error(writer, "model_changed", "Reconnect to change the model").await?;
+                            continue;
+                        }
+                        ws_home::authorize(&home, headers, Some(principal), Some(&alias)).await?;
+                        let (message, parent) = match ws_steering::prepare(&home.config(), &selection, headers, &alias, frame, limit) {
+                            Ok(prepared) => prepared,
+                            Err(_) => { send_error(writer, "invalid_steer", "Steering input cannot be prepared").await?; continue; },
+                        };
+                        // Only upstream acknowledges steering; it never acquires a turn or redispatches.
+                        steering.submitted(&parent);
+                        upstream.send(UpMessage::Text(message.into())).await?;
+                        continue;
+                    }
+                    if steering.enabled && matches!(kind, Some("response.create" | "response.append")) {
+                        // Go queues explicit creates until the active response and any
+                        // steering successor have settled on this same socket.
+                        steering.enqueue(frame)?;
+                        continue;
+                    }
+                    frame
+                },
+            }
+        };
+        if turn.is_some() {
+            send_error(
+                writer,
+                "response_in_progress",
+                "Wait for the active response terminal event",
+            )
+            .await?;
+            continue;
         }
+        if let Some(response_id) = frame.get("previous_response_id").and_then(Value::as_str) {
+            let replay_known = replay.get(response_id).is_some();
+            tracing::debug!(
+                replay_known,
+                "Codex websocket continuation replay state checked"
+            );
+        }
+        let mut body = match history.hydrate(frame, limit) {
+            Ok(body) => body,
+            Err(_) => {
+                send_error(
+                    writer,
+                    "invalid_continuation",
+                    "Continuation requires known history or a full replacement transcript",
+                )
+                .await?;
+                continue;
+            }
+        };
+        if body
+            .get("prompt_cache_key")
+            .and_then(Value::as_str)
+            .is_none_or(str::is_empty)
+            && let Some(key) = crate::providers::codex::cache::provider_session(&execution, "")
+        {
+            body["prompt_cache_key"] = key.into();
+        }
+        if body["model"].as_str() != Some(&alias) {
+            send_error(writer, "model_changed", "Reconnect to change the model").await?;
+            continue;
+        }
+        if steering.enabled
+            && !steering.create_parent_ok(
+                body.get("previous_response_id")
+                    .and_then(Value::as_str)
+                    .unwrap_or(""),
+            )
+        {
+            send_error(
+                writer,
+                "invalid_continuation",
+                "response.create must continue the response waiting for required input",
+            )
+            .await?;
+            continue;
+        }
+        ws_home::authorize(&home, headers, Some(principal), Some(&alias)).await?;
+        let prepared =
+            match ws_transport::prepare(&home.config(), &selection, headers, body.clone()) {
+                Ok(prepared) => prepared,
+                Err(_) => {
+                    send_error(
+                        writer,
+                        "unsupported_payload",
+                        "Request cannot be prepared for native WebSocket transport",
+                    )
+                    .await?;
+                    continue;
+                }
+            };
+        turn = Some(ws_home::Turn::new(home.clone(), &selection, &alias));
+        pending = Some(body);
+        // Even a failed send may have been admitted: terminate, never reconnect/reselect.
+        upstream
+            .send(UpMessage::Text(prepared.message.into()))
+            .await?;
     }
     // Drop upstream before the exactly-once execution guard on every return/cancellation.
     drop(upstream);

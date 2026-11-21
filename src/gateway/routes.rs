@@ -23,7 +23,7 @@ pub(super) async fn generate(
     home: Arc<HomeClient>,
     uri: Uri,
     headers: HeaderMap,
-    body: Value,
+    mut body: Value,
 ) -> Response {
     if !home.ready() || home.cancellation().is_cancelled() {
         return error(
@@ -39,6 +39,9 @@ pub(super) async fn generate(
             "Expected an object with boolean stream",
         );
     }
+    let config = home.config();
+    // Responses API boundary rewrites precede dispatch, like CPA's handler.
+    super::codex::multiagent::prepare_boundary(&config, uri.path(), &headers, &mut body);
     let Ok(format) = upstream::format(uri.path()) else {
         return error(
             StatusCode::NOT_IMPLEMENTED,
@@ -67,7 +70,6 @@ pub(super) async fn generate(
         body.get("stream").and_then(Value::as_bool).unwrap_or(false)
     };
     let request_id = diagnostics::request_id();
-    let config = home.config();
     let mut excluded: Vec<String> = Vec::new();
     // Home's selected limit includes credential overrides, including explicit zero.
     let mut round = 0;
@@ -154,6 +156,19 @@ pub(super) async fn generate(
             ),
             api_key: caller_api_key.clone(),
         };
+        // Executor-stage rewrites; provider payload rules still run last inside prepare.
+        let attempt_body = |selection: &crate::home::client::Selection| {
+            let mut attempt_body = body.clone();
+            let optimized = super::codex::multiagent::prepare_attempt(
+                &config,
+                selection,
+                uri.path(),
+                &headers,
+                &mut attempt_body,
+            );
+            (attempt_body, optimized)
+        };
+        let (prepared_body, mut optimized) = attempt_body(&selection);
         let mut prepared = match crate::providers::codex::cache::with_context(
             cache_context(),
             || {
@@ -162,7 +177,7 @@ pub(super) async fn generate(
                     &selection,
                     uri.path(),
                     &headers,
-                    body.clone(),
+                    prepared_body,
                     requested_stream,
                 )
             },
@@ -215,13 +230,24 @@ pub(super) async fn generate(
             } else {
                 prepared.stream
             };
-        let mut result = tokio::select! {
+        let result = tokio::select! {
             biased;
             _ = cancellation.cancelled() => {
                 attempt.record.local_failure(503);
                 return error(StatusCode::SERVICE_UNAVAILABLE, "not_ready", "Home membership ended");
             },
             response = prepared.request.send() => response,
+        };
+        let result = restore(result, optimized, prepared.response_mode);
+        let bootstrap = bootstrap_enabled(&config, prepared.response_mode, requested_stream);
+        let Some(mut result) = codex_bootstrap(result, bootstrap, &config, &cancellation).await
+        else {
+            attempt.record.local_failure(503);
+            return error(
+                StatusCode::SERVICE_UNAVAILABLE,
+                "not_ready",
+                "Home membership ended",
+            );
         };
         let rules =
             crate::config::execution::resolve_rules(&config, &selection.provider, &selection.auth);
@@ -267,6 +293,8 @@ pub(super) async fn generate(
                     );
                 }
                 attempt.refreshed(&selection);
+                let (prepared_body, refreshed_optimized) = attempt_body(&selection);
+                optimized = refreshed_optimized;
                 prepared =
                     match crate::providers::codex::cache::with_context(cache_context(), || {
                         upstream::prepare(
@@ -274,7 +302,7 @@ pub(super) async fn generate(
                             &selection,
                             uri.path(),
                             &headers,
-                            body.clone(),
+                            prepared_body,
                             requested_stream,
                         )
                     }) {
@@ -298,6 +326,17 @@ pub(super) async fn generate(
                     },
                     response = prepared.request.send() => response,
                 };
+                result = restore(result, optimized, prepared.response_mode);
+                let Some(probed) = codex_bootstrap(result, bootstrap, &config, &cancellation).await
+                else {
+                    attempt.record.local_failure(503);
+                    return error(
+                        StatusCode::SERVICE_UNAVAILABLE,
+                        "not_ready",
+                        "Home membership ended",
+                    );
+                };
+                result = probed;
                 let rules = crate::config::execution::resolve_rules(
                     &config,
                     &selection.provider,
@@ -567,6 +606,60 @@ fn rotation_allowed(
     retryable: bool,
 ) -> bool {
     action.map_or(retryable, |action| !action.stops())
+}
+
+/// Codex stream-bootstrap-buffering applies to downstream SSE over the HTTP path only.
+/// Restore the Codex collaboration namespace on successful upstream bodies before
+/// bootstrap probing, translation or usage observation (CPA restores per data line).
+fn restore(
+    result: Result<reqwest::Response, reqwest::Error>,
+    optimized: bool,
+    mode: crate::providers::ResponseMode,
+) -> Result<reqwest::Response, reqwest::Error> {
+    match result {
+        Ok(response) if optimized && response.status().is_success() => {
+            Ok(super::codex::multiagent::restore_response(
+                response,
+                mode == crate::providers::ResponseMode::Json,
+            ))
+        }
+        other => other,
+    }
+}
+
+fn bootstrap_enabled(
+    config: &crate::config::Config,
+    mode: crate::providers::ResponseMode,
+    requested_stream: bool,
+) -> bool {
+    config.providers.codex_stream_bootstrap_buffering
+        && requested_stream
+        && mode == crate::providers::ResponseMode::CodexSse
+}
+
+/// Runs before any attribution so a bootstrap overload is observed exactly like an
+/// upstream HTTP 503: one failure record, then the ordinary rotation decision.
+/// None means the execution was cancelled while holding.
+async fn codex_bootstrap(
+    result: Result<reqwest::Response, reqwest::Error>,
+    enabled: bool,
+    config: &crate::config::Config,
+    cancellation: &tokio_util::sync::CancellationToken,
+) -> Option<Result<reqwest::Response, reqwest::Error>> {
+    match result {
+        Ok(response) if enabled && response.status().is_success() => match super::codex::bootstrap(
+            response,
+            config.providers.codex_stream_bootstrap_timeout,
+            cancellation,
+        )
+        .await
+        {
+            super::codex::Bootstrap::Released(response)
+            | super::codex::Bootstrap::Rejected(response) => Some(Ok(response)),
+            super::codex::Bootstrap::Cancelled => None,
+        },
+        other => Some(other),
+    }
 }
 
 fn accepts_sse(mode: crate::providers::ResponseMode, content_type: &str) -> bool {

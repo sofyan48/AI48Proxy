@@ -414,16 +414,62 @@ pub fn prepare_context(
     }
     if is_antigravity {
         antigravity::normalize(&mut body, selection)?;
+        antigravity::obfuscate_sensitive(&mut body, &config.providers.antigravity_sensitive);
     } else if is_vertex {
         vertex::normalize(&mut body, &selection.model, vertex_openapi)?;
     }
     if format == ProviderFormat::Claude {
-        claude::prepare_body(
-            &mut body,
+        if creds.oauth {
+            // Operator fallbacks replace the built-in baseline; native caller
+            // headers are copied afterwards by prepare_body and still win.
+            for (name, value) in config.providers.claude_headers.pairs() {
+                if !value.is_empty() {
+                    insert(&mut creds.headers, name, value)?;
+                }
+            }
+        }
+        // Go resolveClaudeWirePolicy: the global switch only changes the default
+        // mode; an explicit credential cloak_mode still wins.
+        let mut auth = std::borrow::Cow::Borrowed(&selection.auth);
+        if config.providers.disable_claude_cloak_mode
+            && text(&selection.auth, "/attributes/cloak_mode")
+                .trim()
+                .is_empty()
+            && text(&selection.auth, "/metadata/cloak_mode")
+                .trim()
+                .is_empty()
+            && auth.is_object()
+        {
+            let owned = auth.to_mut();
+            if !owned.get("attributes").is_some_and(Value::is_object) {
+                owned["attributes"] = serde_json::json!({});
+            }
+            owned["attributes"]["cloak_mode"] = "never".into();
+        }
+        let timezone = &config.providers.claude_headers.timezone;
+        if !timezone.is_empty()
+            && timezone.parse::<chrono_tz::Tz>().is_ok()
+            && text(&auth, "/attributes/timezone")
+                .trim()
+                .parse::<chrono_tz::Tz>()
+                .is_err()
+            && text(&auth, "/metadata/timezone")
+                .trim()
+                .parse::<chrono_tz::Tz>()
+                .is_err()
+            && auth.is_object()
+        {
+            let owned = auth.to_mut();
+            if !owned.get("attributes").is_some_and(Value::is_object) {
+                owned["attributes"] = serde_json::json!({});
+            }
+            owned["attributes"]["timezone"] = timezone.as_str().into();
+        }
+        claude::prepare_body(&mut body, &mut creds.headers, &auth, incoming, creds.oauth)?;
+        claude::operator_overrides(
             &mut creds.headers,
-            &selection.auth,
             incoming,
-            creds.oauth,
+            &config.providers.claude_headers,
         )?;
     }
     let url = if is_antigravity {
@@ -556,12 +602,92 @@ pub fn prepare_context(
     if format == ProviderFormat::Claude && creds.oauth {
         bytes = claude_signing::sign(bytes)?;
     }
+    if is_codex && creds.oauth {
+        bytes = codex_compress(config, &url, bytes, &mut creds.headers)?;
+    }
+    let client = match (is_antigravity, config.providers.antigravity_pool) {
+        (true, Some(pool)) => pooled_client(
+            client,
+            pool,
+            format!(
+                "{}\u{0}{}",
+                selection
+                    .auth
+                    .get("id")
+                    .and_then(Value::as_str)
+                    .unwrap_or("anonymous"),
+                creds
+                    .proxy_url
+                    .as_deref()
+                    .or(config.proxy_url.as_deref())
+                    .unwrap_or("")
+            ),
+        )?,
+        _ => client.build()?,
+    };
     Ok(Prepared {
-        request: client.build()?.post(url).headers(creds.headers).body(bytes),
+        request: client.post(url).headers(creds.headers).body(bytes),
         stream,
         format,
         response_mode,
     })
+}
+
+/// Per-credential Antigravity pool (Go antigravity transport cache). Bounded so many
+/// credentials degrade to short-lived clients instead of growing without limit.
+fn pooled_client(
+    builder: reqwest::ClientBuilder,
+    pool: crate::config::providers::AntigravityPool,
+    scope: String,
+) -> Result<reqwest::Client> {
+    use std::{collections::HashMap, sync::Mutex};
+    type Key = (String, crate::config::providers::AntigravityPool);
+    static CACHE: std::sync::OnceLock<Mutex<HashMap<Key, reqwest::Client>>> =
+        std::sync::OnceLock::new();
+    const LIMIT: usize = 1024;
+    let cache = CACHE.get_or_init(Default::default);
+    let key = (scope, pool);
+    if let Some(client) = cache.lock().expect("pool cache").get(&key) {
+        return Ok(client.clone());
+    }
+    let client = builder
+        .pool_idle_timeout(pool.idle)
+        .pool_max_idle_per_host(pool.max_idle_per_host)
+        .http1_only()
+        .build()?;
+    let mut guard = cache.lock().expect("pool cache");
+    // Drop entries from older settings first (config hot reload).
+    guard.retain(|(_, settings), _| *settings == pool);
+    if guard.len() < LIMIT {
+        guard.insert(key, client.clone());
+    }
+    Ok(client)
+}
+
+/// Go codex_executor_request.go: zstd only for ChatGPT Codex OAuth and only when smaller.
+/// Pure transport framing after the final payload barrier.
+fn codex_compress(
+    config: &Config,
+    url: &Url,
+    bytes: Vec<u8>,
+    headers: &mut HeaderMap,
+) -> Result<Vec<u8>> {
+    let settings = &config.providers;
+    if !settings.codex_request_compression
+        || bytes.len() < settings.codex_request_compression_min_bytes
+        || !url
+            .host_str()
+            .is_some_and(|h| h.eq_ignore_ascii_case("chatgpt.com"))
+        || !url.path().starts_with("/backend-api/codex/")
+    {
+        return Ok(bytes);
+    }
+    let compressed = zstd::bulk::compress(&bytes, 3)?;
+    if compressed.len() >= bytes.len() {
+        return Ok(bytes);
+    }
+    insert(headers, "content-encoding", "zstd")?;
+    Ok(compressed)
 }
 
 pub(super) fn text<'a>(auth: &'a Value, pointer: &str) -> &'a str {

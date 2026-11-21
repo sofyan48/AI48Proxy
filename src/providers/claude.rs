@@ -233,6 +233,50 @@ fn request_betas(
     Ok(())
 }
 
+/// Go claude_executor_request.go: operator strip/append get the last word over
+/// derived and caller betas; client-request-id off/passthrough shapes the ID header.
+pub(super) fn operator_overrides(
+    headers: &mut HeaderMap,
+    incoming: &HeaderMap,
+    defaults: &crate::config::providers::ClaudeHeaderDefaults,
+) -> Result<()> {
+    if !defaults.beta_strip.is_empty() || !defaults.beta_append.is_empty() {
+        let mut betas = Vec::new();
+        if let Some(value) = headers.get("anthropic-beta") {
+            append_betas(
+                &mut betas,
+                value
+                    .to_str()
+                    .map_err(|_| anyhow::anyhow!("invalid Anthropic beta header"))?,
+            );
+        }
+        betas.retain(|beta| !defaults.beta_strip.iter().any(|s| s == beta));
+        for beta in &defaults.beta_append {
+            append_betas(&mut betas, beta);
+        }
+        if betas.is_empty() {
+            headers.remove("anthropic-beta");
+        } else {
+            insert(headers, "anthropic-beta", &betas.join(","))?;
+        }
+    }
+    match defaults.client_request_id.as_str() {
+        "off" => {
+            headers.remove("x-client-request-id");
+        }
+        "passthrough" => match incoming.get("x-client-request-id") {
+            Some(value) if !value.as_bytes().is_empty() => {
+                headers.insert("x-client-request-id", value.clone());
+            }
+            _ => {
+                headers.remove("x-client-request-id");
+            }
+        },
+        _ => {}
+    }
+    Ok(())
+}
+
 fn append_betas(betas: &mut Vec<String>, value: &str) {
     for beta in value.split(',').map(str::trim).filter(|v| !v.is_empty()) {
         if !betas.iter().any(|v| v == beta) {

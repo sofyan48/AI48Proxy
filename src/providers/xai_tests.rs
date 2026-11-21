@@ -119,6 +119,52 @@ fn oauth_base_identity_and_fail_closed() {
 }
 
 #[test]
+fn inject_x_search_follows_home_config() {
+    let selected = selection("xai", json!({"attributes":{"api_key":"fixture"}}));
+    let config = Config::parse(
+        b"credential-concurrency:\n  lifecycle-config-revision: 7\nxai:\n  inject-x-search: true\n",
+    )
+    .unwrap();
+    assert!(config.unsupported_features().is_empty());
+    let input = json!({"input":"hi","tools":[{"type":"function","name":"f","parameters":{"type":"object"}}],"tool_choice":"auto"});
+    let prepared = crate::providers::prepare(
+        &config,
+        &selected,
+        "/v1/responses",
+        &HeaderMap::new(),
+        input,
+        true,
+    )
+    .unwrap();
+    let sent = body(&prepared.request.build().unwrap());
+    assert_eq!(sent["tools"][1], json!({"type":"x_search"}));
+    let mut allowed = json!({"tool_choice":{"type":"allowed_tools","tools":[]}});
+    super::inject_x_search(&mut allowed);
+    assert_eq!(
+        allowed["tool_choice"]["tools"],
+        json!([{"type":"x_search"}])
+    );
+    // Idempotent and absent when disabled.
+    let mut again = sent.clone();
+    super::inject_x_search(&mut again);
+    assert_eq!(again, sent);
+    let prepared = crate::providers::prepare(
+        &self::config(),
+        &selected,
+        "/v1/responses",
+        &HeaderMap::new(),
+        json!({"input":"hi"}),
+        true,
+    )
+    .unwrap();
+    assert!(
+        body(&prepared.request.build().unwrap())
+            .get("tools")
+            .is_none()
+    );
+}
+
+#[test]
 fn payload_rules_are_last_and_cannot_enable_unported_tools() {
     let selected = selection("xai", json!({"attributes":{"api_key":"fixture"}}));
     let config = Config::parse(b"credential-concurrency:\n  lifecycle-config-revision: 7\npayload:\n  override:\n    - models:\n        - name: '*'\n          protocol: openai-response\n      params:\n        model: configured\n        instructions: configured\n").unwrap();

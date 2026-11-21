@@ -27,7 +27,9 @@ async fn bounded<T>(future: impl Future<Output = T>) -> T {
 
 async fn observed(mut predicate: impl FnMut() -> bool) {
     // Yield rather than advancing the paused clock while waiting for socket delivery.
-    for _ in 0..10_000 {
+    // Bound by wall-clock time, not yield count: real socket I/O can lag on loaded CI runners.
+    let deadline = std::time::Instant::now() + Duration::from_secs(5);
+    while std::time::Instant::now() < deadline {
         if predicate() {
             return;
         }

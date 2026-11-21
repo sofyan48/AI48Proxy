@@ -21,6 +21,9 @@ use tokio::{
 use tokio_rustls::{TlsAcceptor, server::TlsStream};
 use tower::ServiceExt;
 
+#[path = "codex_bootstrap_failover_tests.rs"]
+mod codex_bootstrap_failover_tests;
+
 type Peer = BufReader<TlsStream<TcpStream>>;
 const CONFIG: &str = "request-retry: 2\ncredential-concurrency:\n  lifecycle-config-revision: 7\n  cpa-heartbeat-timeout: 1h\n  release-flush-interval: 1h\n  release-max-backoff: 1h\n";
 pub(crate) const SECRET: &str = "matrix-upstream-key-not-a-real-credential";
@@ -113,12 +116,16 @@ impl Home {
     }
 
     async fn registration(&self) -> Peer {
+        self.registration_with(CONFIG).await
+    }
+
+    async fn registration_with(&self, config: &str) -> Peer {
         let mut bootstrap = self.accept().await;
         assert_eq!(
             command(&mut bootstrap).await,
             [b"GET".to_vec(), b"config".to_vec()]
         );
-        bulk(&mut bootstrap, CONFIG.as_bytes()).await;
+        bulk(&mut bootstrap, config.as_bytes()).await;
         drop(bootstrap);
         let mut subscription = self.accept().await;
         let args = command(&mut subscription).await;
@@ -138,7 +145,7 @@ impl Home {
             &[
                 b"message".to_vec(),
                 b"config".to_vec(),
-                CONFIG.as_bytes().to_vec(),
+                config.as_bytes().to_vec(),
             ],
         )
         .await

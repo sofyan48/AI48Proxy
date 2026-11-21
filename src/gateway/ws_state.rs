@@ -139,6 +139,17 @@ impl History {
         Ok(())
     }
 
+    /// Advance the native chain to an automatic steering successor. It has no
+    /// client request of its own; model/instructions stay inherited from the
+    /// last explicit request.
+    pub fn chain(&mut self, event: &Value, limit: usize) -> Result<()> {
+        let request = self
+            .request
+            .clone()
+            .ok_or_else(|| anyhow::anyhow!("successor without a prior request"))?;
+        self.commit(request, event, limit)
+    }
+
     pub fn invalidate(&mut self) {
         self.valid = false;
     }

@@ -98,6 +98,9 @@ pub(super) fn prepare(
         "xAI isolated composer conversations unsupported"
     );
     normalize_tools(&mut body)?;
+    if config.providers.xai_inject_x_search {
+        inject_x_search(&mut body);
+    }
     if !creds.headers.contains_key("x-xai-token-auth")
         && !has_custom_header(selection, "user-agent")
         && let Some(value) = incoming.get("user-agent")
@@ -239,6 +242,32 @@ fn complex_schema(value: &Value) -> bool {
     }
 }
 
+/// Go ensureXAINativeXSearchToolDoc. Hosted-only forced choices cannot reach here:
+/// validate_tools admits only function tools, so injection is always allowed.
+pub(super) fn inject_x_search(body: &mut Value) {
+    let entry = serde_json::json!({"type": "x_search"});
+    match body.get_mut("tools").and_then(Value::as_array_mut) {
+        Some(tools) => {
+            if !tools.iter().any(|t| text(t, "/type") == "x_search") {
+                tools.push(entry.clone());
+            }
+        }
+        None => body["tools"] = Value::Array(vec![entry.clone()]),
+    }
+    if let Some(choice) = body.get_mut("tool_choice")
+        && text(choice, "/type") == "allowed_tools"
+    {
+        match choice.get_mut("tools").and_then(Value::as_array_mut) {
+            Some(list) => {
+                if !list.iter().any(|t| text(t, "/type") == "x_search") {
+                    list.push(entry);
+                }
+            }
+            None => choice["tools"] = Value::Array(vec![entry]),
+        }
+    }
+}
+
 pub(super) fn validate_tools(body: &Value, meta: bool) -> Result<()> {
     ensure!(
         body.get("functions").is_none(),
@@ -254,6 +283,9 @@ pub(super) fn validate_tools(body: &Value, meta: bool) -> Result<()> {
         );
         for tool in tools {
             if meta && tool == &super::meta::muse_namespace() {
+                continue;
+            }
+            if !meta && text(tool, "/type") == "x_search" {
                 continue;
             }
             ensure!(

@@ -29,6 +29,8 @@ pub fn prepare(
 ) -> Result<reqwest::Request> {
     let mut builtins = config.clone();
     builtins.payload = Default::default();
+    // WS frames are JSON text; HTTP body compression must not apply here.
+    builtins.providers.codex_request_compression = false;
     let prepared = crate::providers::prepare(
         &builtins,
         selection,
@@ -87,6 +89,19 @@ pub fn prepare(
         if let Some(value) = incoming.get(name).filter(|v| !v.as_bytes().is_empty()) {
             headers.insert(name, value.clone());
         }
+    }
+    // Go codexHeaderDefaults: OAuth-only fallback, caller header wins.
+    let beta = config.providers.codex_beta_features.as_str();
+    if !beta.is_empty()
+        && !selection
+            .auth
+            .pointer("/attributes/api_key")
+            .is_some_and(|v| v.as_str().is_some_and(|s| !s.is_empty()))
+        && incoming
+            .get("x-codex-beta-features")
+            .is_none_or(|v| v.as_bytes().is_empty())
+    {
+        super::super::insert(headers, "x-codex-beta-features", beta)?;
     }
     super::super::custom_headers(headers, &selection.auth)?;
     Ok(request)

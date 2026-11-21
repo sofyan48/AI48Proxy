@@ -61,3 +61,27 @@ cargo fmt --all --check
 ```
 
 The ignored projection test requires the sibling `AI48Home` checkout and Go dependencies. It compares the real Home sanitizer output with `src/config/home_default_downstream.yaml`; update the fixture only after reviewing the diff and the Home change that caused it.
+
+## Provider settings now consumed (typed in `src/config/providers.rs`)
+
+| Home field | Rust consumer | Behavior |
+| --- | --- | --- |
+| `codex-header-defaults.user-agent` | `providers/codex.rs` | OAuth-only User-Agent fallback (HTTP and WS). |
+| `codex-header-defaults.beta-features` | `providers/codex_ws.rs` | OAuth-only `x-codex-beta-features` on WS when the caller omits it. |
+| `codex.upstream-request-compression(-min-bytes)` | `providers.rs::codex_compress` | zstd body for ChatGPT Codex OAuth `/backend-api/codex/*`, only when smaller; applied after payload rules. |
+| `xai.inject-x-search` | `providers/xai.rs::inject_x_search` | Adds `{"type":"x_search"}` to `tools` (and `allowed_tools` choice) before payload rules. |
+| `claude-header-defaults.{user-agent,package-version,runtime-version,os,arch,timeout}` | `providers.rs` | Replaces the built-in Claude OAuth header baseline; native caller headers still win. |
+
+| `claude-header-defaults.{anthropic-beta-strip,anthropic-beta-append,client-request-id,timezone}` | `providers/claude.rs::operator_overrides`, `claude_wire.rs` | Final beta set strip/append; request ID on/off/passthrough; cloak date uses credential timezone, then the configured timezone. |
+| `disable-claude-cloak-mode` | `providers.rs` | Default cloak mode becomes `never`; an explicit credential `cloak_mode` still wins. |
+| `antigravity.connection-pool.*` | `providers.rs::pooled_client` | Opt-in per-credential HTTP/1.1 pool (30s/2 defaults, 210s/100 caps, non-positive selects short mode). |
+| `antigravity.sensitive-words*`, `sensitive-patterns-replace` | `providers/antigravity_sensitive.rs` | System-instruction obfuscation and replacement, before payload rules. |
+| `codex.stream-bootstrap-buffering`, `stream-bootstrap-timeout` | `gateway/codex.rs::bootstrap` | Holds pre-generation SSE frames; overload during bootstrap fails over before headers commit. |
+| `client.codex.optimize-multi-agent-v2`, `codex.orphan-delegation-compatibility` | `gateway/codex_multiagent.rs` | HTTP Responses request rewrite and SSE/JSON restore. |
+| `codex.response-steering` | `gateway/ws_steering.rs` | Full-duplex `response.steer` on the bound upstream socket; successor responses report usage once each. |
+| `codex.websocket-compression` | — | The worker never negotiates permessage-deflate, so wire frames are always uncompressed. |
+| `codex.model-level-cooling`, `codex.signin-with-chatgpt-identifier`, `claude-header-defaults.inject-diagnostics` | — | Inert in Home mode: Home owns cooldowns (disable-cooling is forced), SIWC is rejected per request, diagnostics are never injected. |
+
+Still rejected when Home enables them: `plugins.enabled: true`, `antigravity-signature-cache-enabled: false` (bypass replay), `claude-header-defaults.stabilize-device-profile: true`.
+
+Known gaps: the `spawn_agent` model catalog is not rewritten. Multi-agent/orphan rewriting is not applied on the WS path. WS steering does not pipeline queued creates or build Go's detailed abandoned-event errors.

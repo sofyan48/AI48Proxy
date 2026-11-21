@@ -188,10 +188,10 @@ fn effective_unsupported_settings_still_fail_support_validation() {
 
 #[test]
 fn unsupported_inventory_is_precise_and_never_contains_values() {
-    let c = parse("metadata: {future: true}\nplugins: {enabled: true}\ncodex: {response-steering: true}\nrequests: {streaming: {keepalive-seconds: 5}, passthrough-headers: true}\n").unwrap();
+    let c = parse("metadata: {future: true}\nplugins: {enabled: true}\ncodex: {response-steering: true, future-control: 1}\nrequests: {streaming: {keepalive-seconds: 5}, passthrough-headers: true}\n").unwrap();
     assert_eq!(
         c.unsupported_features(),
-        vec!["codex.response-steering", "plugins.enabled"]
+        vec!["codex.future-control", "plugins.enabled"]
     );
     assert!(c.raw.get("metadata").is_some());
 }

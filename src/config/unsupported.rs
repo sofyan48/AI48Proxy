@@ -91,13 +91,10 @@ pub(super) fn features(raw: &Value) -> Vec<String> {
             }
         }
     }
-    for key in [
-        "antigravity-signature-cache-enabled",
-        "antigravity-signature-bypass-strict",
-    ] {
-        if let Some(value) = field(raw, key) {
-            leaves(value, key, &mut out);
-        }
+    // Cache-enabled (Go default) matches the worker's validating path; strict bypass
+    // is ignored by Go unless the cache is disabled, which needs bypass replay.
+    if field(raw, "antigravity-signature-cache-enabled") == Some(&Value::Bool(false)) {
+        out.push("antigravity-signature-cache-enabled".into());
     }
     // Additional canonical v8 execution controls not projected by normalization.
     if let Some(value) = field(raw, "access").and_then(|v| field(v, "api-keys")) {
@@ -134,6 +131,16 @@ fn inert(value: &Value, path: &str) -> bool {
         return true;
     }
     let key = path.rsplit('.').next().unwrap_or(path);
+    // Home forces disable-cooling, so worker-local cooldown scoping is inert; Home
+    // owns cooldowns. The SIWC identifier only shapes SIWC, which is rejected per request.
+    if matches!(
+        path,
+        "codex.model-level-cooling"
+            | "claude.model-level-cooling"
+            | "codex.signin-with-chatgpt-identifier"
+    ) {
+        return true;
+    }
     // Home injects this disabled default unconditionally, including the retained
     // OAuth scope. A positive window is NOT safe to ignore.
     if key == "tos-pause-window" {
@@ -178,6 +185,9 @@ fn inert(value: &Value, path: &str) -> bool {
                 | "antigravity-signature-bypass-strict"
                 | "upstream-request-compression"
                 | "websocket-compression"
+                // The worker never injects Claude diagnostics.
+                | "inject-diagnostics"
+                | "stabilize-device-profile"
         )
     {
         return true;
@@ -186,7 +196,17 @@ fn inert(value: &Value, path: &str) -> bool {
 }
 
 fn leaves(value: &Value, path: &str, out: &mut Vec<String>) {
-    if path.rsplit('.').next() == Some("video-result-auth-cache-ttl") || inert(value, path) {
+    if path.rsplit('.').next() == Some("video-result-auth-cache-ttl")
+        || super::providers::CONSUMED.contains(&path)
+        || super::providers::CONSUMED_LISTS.iter().any(|p| {
+            path.strip_prefix(p)
+                .is_some_and(|s| s.is_empty() || s.starts_with('['))
+        })
+        || super::providers::CONSUMED_PREFIXES
+            .iter()
+            .any(|p| path.starts_with(p))
+        || inert(value, path)
+    {
         return;
     }
     match value {
@@ -219,7 +239,7 @@ mod codex_tests {
         for yaml in [
             "xai-api-key: [{api-key: fixture}]",
             "meta-api-key: [{api-key: fixture}]",
-            "upstream: {xai: {inject-x-search: true}}",
+            "upstream: {xai: {unported-control: true}}",
             "kimi: {unported-control: true}",
         ] {
             let raw: Value = serde_yaml::from_str(yaml).unwrap();
@@ -231,20 +251,19 @@ mod codex_tests {
     }
 
     #[test]
-    fn unported_codex_controls_remain_rejected() {
-        for prefix in ["codex", "upstream.codex"] {
-            for key in [
-                "response-steering",
-                "optimize-multi-agent-v2",
-                "orphan-delegation-compatibility",
-                "websocket-compression",
-                "upstream-request-compression",
-            ] {
-                let path = format!("{prefix}.{key}");
-                let mut out = Vec::new();
-                leaves(&Value::Bool(true), &path, &mut out);
-                assert_eq!(out, vec![path]);
-            }
+    fn codex_controls_consumed_only_in_home_flat_layout() {
+        for key in [
+            "response-steering",
+            "orphan-delegation-compatibility",
+            "websocket-compression",
+        ] {
+            let mut out = Vec::new();
+            leaves(&Value::Bool(true), &format!("codex.{key}"), &mut out);
+            assert!(out.is_empty(), "{key}");
+            // Home normalizes to the flat layout; a non-normalized path is unknown.
+            let path = format!("upstream.codex.{key}");
+            leaves(&Value::Bool(true), &path, &mut out);
+            assert_eq!(out, vec![path]);
         }
     }
 }

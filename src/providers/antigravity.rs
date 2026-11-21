@@ -4,6 +4,8 @@ use sha2::{Digest, Sha256};
 
 #[path = "antigravity_diagnostic.rs"]
 mod diagnostic;
+#[path = "antigravity_sensitive.rs"]
+mod sensitive;
 #[path = "antigravity_signature.rs"]
 mod signature;
 #[path = "antigravity_tools.rs"]
@@ -59,6 +61,15 @@ fn request_user_agent(configured: &str) -> &str {
         return configured[..index].trim();
     }
     configured
+}
+
+/// Obfuscates configured sensitive words in the wrapped systemInstruction.
+/// Call after `normalize` and before user payload rules.
+pub(super) fn obfuscate_sensitive(
+    body: &mut Value,
+    rules: &crate::config::providers::AntigravitySensitive,
+) {
+    sensitive::obfuscate_system_instruction(body, rules);
 }
 
 pub(super) fn normalize(body: &mut Value, selection: &Selection) -> Result<()> {

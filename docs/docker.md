@@ -93,8 +93,10 @@ before workers start. Missing PostgreSQL variables fail Compose interpolation.
 
 Release tags matching `v*` publish `ghcr.io/sofyan48/ai48proxy:<tag>` and
 `:latest` for `linux/amd64` and `linux/arm64` through
-`.github/workflows/image.yml`. A manual workflow dispatch publishes the tag
-provided in the workflow input without changing `:latest`.
+`.github/workflows/image.yml`. Each architecture builds on a native runner, then
+both images are combined into a multi-architecture manifest. Architecture-specific
+image tags use the `-amd64` and `-arm64` suffixes. A manual workflow dispatch
+publishes the provided tag (default `edge`) without changing `:latest`.
 
 For a local release or emergency image publication, authenticate to GHCR first:
 
@@ -105,6 +107,24 @@ IMAGE=ghcr.io/sofyan48/ai48proxy ./scripts/publish-image.sh v0.1.0
 
 The script uses Buildx and pushes provenance/SBOM metadata. Do not put a PAT in
 the repository or in `.env`; use a short-lived login or CI `GITHUB_TOKEN`.
+
+## Binary releases and CI
+
+`.github/workflows/release.yaml` runs on tag pushes, or manually with an existing
+release tag. It checks out that tag, prepares release notes and a draft for new
+releases, then builds native binaries for Linux, macOS, and Windows on amd64 and
+arm64 runners. Only after all six builds succeed does it upload the archives and
+`checksums.txt` and publish the release. Manual reruns replace matching assets.
+
+Archives are named `AI48Proxy_<version>_<os>_<arch>.tar.gz` (`.zip` on Windows),
+with the leading `v` removed from the version. OS names are `linux`, `darwin`, and
+`windows`; architecture names are `amd64` and `aarch64`. Each archive contains
+`ai48proxy` (`ai48proxy.exe` on Windows), `README.md`, and `LICENSE`. Linux binaries
+use the hosted Ubuntu runner's glibc; they are not musl/static compatibility builds.
+
+`.github/workflows/worker.yml` runs checks only for pushes to branches other than
+`main` and pull requests targeting `main`. Pushes to `main`, tag pushes, pull
+requests targeting other branches, and manual runs do not trigger worker checks.
 
 ## Operate an initialized stack
 

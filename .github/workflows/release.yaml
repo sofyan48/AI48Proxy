@@ -1,0 +1,195 @@
+name: release
+
+on:
+  push:
+    tags:
+      - '*'
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: Existing tag to release (for example, v0.1.0)
+        required: true
+        type: string
+
+permissions:
+  contents: write
+
+concurrency:
+  group: release-${{ inputs.tag || github.ref_name }}
+  cancel-in-progress: false
+
+env:
+  GH_REPO: ${{ github.repository }}
+  RELEASE_TAG: ${{ inputs.tag || github.ref_name }}
+
+defaults:
+  run:
+    shell: bash
+
+jobs:
+  prepare-release:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: refs/tags/${{ env.RELEASE_TAG }}
+          fetch-depth: 0
+          fetch-tags: true
+      - name: Prepare release notes and draft
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          notes_dir="$(mktemp -d)"
+          trap 'rm -rf "$notes_dir"' EXIT
+
+          previous_tag=""
+          if previous_tag_value="$(git describe --tags --abbrev=0 HEAD^ 2>/dev/null)"; then
+            previous_tag="$previous_tag_value"
+            changelog_range="${previous_tag}..HEAD"
+          else
+            changelog_range="HEAD"
+          fi
+          git log --reverse --pretty=format:'- %s (%h)' "$changelog_range" > "$notes_dir/commits"
+          grep -Ev '^- (docs:|test:)' "$notes_dir/commits" > "$notes_dir/changelog" || [[ $? -eq 1 ]]
+
+          gh api "repos/${GH_REPO}/releases/generate-notes" \
+            -f tag_name="$RELEASE_TAG" \
+            --jq .body > "$notes_dir/generated"
+          if [[ ! -s "$notes_dir/generated" ]]; then
+            if [[ -n "$previous_tag" ]]; then
+              printf '**Full Changelog**: https://github.com/%s/compare/%s...%s\n' "$GH_REPO" "$previous_tag" "$RELEASE_TAG" > "$notes_dir/generated"
+            else
+              printf '**Full Changelog**: https://github.com/%s/commits/%s\n' "$GH_REPO" "$RELEASE_TAG" > "$notes_dir/generated"
+            fi
+          fi
+          {
+            if [[ -s "$notes_dir/changelog" ]]; then
+              printf '## Changelog\n\n'
+              cat "$notes_dir/changelog"
+              printf '\n\n'
+            fi
+            cat "$notes_dir/generated"
+          } > "$notes_dir/notes"
+
+          if gh release view "$RELEASE_TAG" >/dev/null 2>&1; then
+            gh release edit "$RELEASE_TAG" --title "$RELEASE_TAG" --notes-file "$notes_dir/notes"
+          else
+            gh release create "$RELEASE_TAG" --draft --verify-tag --title "$RELEASE_TAG" --notes-file "$notes_dir/notes"
+          fi
+
+  build:
+    name: build ${{ matrix.os }}-${{ matrix.arch }}
+    needs: prepare-release
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 45
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: ubuntu-latest
+            target: x86_64-unknown-linux-gnu
+            os: linux
+            arch: amd64
+          - runner: ubuntu-24.04-arm
+            target: aarch64-unknown-linux-gnu
+            os: linux
+            arch: aarch64
+          - runner: macos-15-intel
+            target: x86_64-apple-darwin
+            os: darwin
+            arch: amd64
+          - runner: macos-15
+            target: aarch64-apple-darwin
+            os: darwin
+            arch: aarch64
+          - runner: windows-latest
+            target: x86_64-pc-windows-msvc
+            os: windows
+            arch: amd64
+          - runner: windows-11-arm
+            target: aarch64-pc-windows-msvc
+            os: windows
+            arch: aarch64
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: refs/tags/${{ env.RELEASE_TAG }}
+      - name: Install stable Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+      - name: Build locked release binary
+        env:
+          TARGET: ${{ matrix.target }}
+        run: cargo build --locked --release --target "$TARGET"
+      - name: Package release archive
+        env:
+          TARGET: ${{ matrix.target }}
+          ASSET_OS: ${{ matrix.os }}
+          ASSET_ARCH: ${{ matrix.arch }}
+        run: |
+          set -euo pipefail
+          version="${RELEASE_TAG#v}"
+          if [[ ! "$version" =~ ^[A-Za-z0-9][A-Za-z0-9._+-]*$ ]]; then
+            printf 'Tag cannot be used as an archive version: %s\n' "$RELEASE_TAG" >&2
+            exit 1
+          fi
+          mkdir -p package dist
+          binary="ai48proxy"
+          if [[ "$ASSET_OS" == windows ]]; then
+            binary+=".exe"
+          fi
+          cp "target/$TARGET/release/$binary" README.md LICENSE package/
+          archive_base="AI48Proxy_${version}_${ASSET_OS}_${ASSET_ARCH}"
+          if [[ "$ASSET_OS" == windows ]]; then
+            export ARCHIVE_NAME="${archive_base}.zip"
+            pwsh -NoProfile -NonInteractive -Command 'Compress-Archive -LiteralPath "package/ai48proxy.exe", "package/README.md", "package/LICENSE" -DestinationPath ("dist/" + $env:ARCHIVE_NAME)'
+          else
+            tar -czf "dist/${archive_base}.tar.gz" -C package "$binary" README.md LICENSE
+          fi
+      - uses: actions/upload-artifact@v4
+        with:
+          name: release-${{ matrix.os }}-${{ matrix.arch }}
+          path: dist/AI48Proxy_*
+          if-no-files-found: error
+
+  publish-release:
+    needs:
+      - prepare-release
+      - build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: refs/tags/${{ env.RELEASE_TAG }}
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: release-*
+          path: dist
+          merge-multiple: true
+      - name: Verify archives, upload assets and publish release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          cd dist
+          shopt -s nullglob
+          archives=(AI48Proxy_*.tar.gz AI48Proxy_*.zip)
+          if [[ ${#archives[@]} -ne 6 ]]; then
+            printf 'Expected 6 release archives, found %s\n' "${#archives[@]}" >&2
+            exit 1
+          fi
+          version="${RELEASE_TAG#v}"
+          for os in linux darwin windows; do
+            extension="tar.gz"
+            if [[ "$os" == windows ]]; then
+              extension="zip"
+            fi
+            for arch in amd64 aarch64; do
+              test -s "AI48Proxy_${version}_${os}_${arch}.${extension}"
+            done
+          done
+          sha256sum "${archives[@]}" | sort -k2 > checksums.txt
+          gh release upload "$RELEASE_TAG" "${archives[@]}" checksums.txt --clobber
+          gh release edit "$RELEASE_TAG" --draft=false

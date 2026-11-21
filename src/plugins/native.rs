@@ -177,8 +177,8 @@ unsafe fn open_library(path: &Path) -> Result<*mut c_void> {
         .chain(std::iter::once(0))
         .collect();
     let handle = unsafe { windows_sys::Win32::System::LibraryLoader::LoadLibraryW(wide.as_ptr()) };
-    ensure!(handle != 0, "unable to load native plugin");
-    Ok(handle as *mut c_void)
+    ensure!(!handle.is_null(), "unable to load native plugin");
+    Ok(handle)
 }
 #[cfg(windows)]
 unsafe fn load_symbol<T: Copy>(handle: *mut c_void, name: &[u8]) -> Result<T> {
@@ -186,7 +186,7 @@ unsafe fn load_symbol<T: Copy>(handle: *mut c_void, name: &[u8]) -> Result<T> {
     let symbol = unsafe {
         windows_sys::Win32::System::LibraryLoader::GetProcAddress(handle as _, name.as_ptr().cast())
     };
-    ensure!(!symbol.is_null(), "native plugin init symbol is missing");
+    let symbol = symbol.context("native plugin init symbol is missing")?;
     Ok(unsafe { std::mem::transmute_copy(&symbol) })
 }
 #[cfg(windows)]

@@ -1,0 +1,7 @@
+# Local development stack. The stack definition lives in ../AI48Home/compose.yaml
+# so `docker compose up` works the same from either repository.
+# Production: ./install.sh (uses docker-compose.yml explicitly).
+name: ai48home
+
+include:
+  - ../AI48Home/compose.yaml

@@ -2,6 +2,10 @@ use super::*;
 
 impl HomeClient {
     pub(super) async fn subscription(self: Arc<Self>, sub: Connection) {
+        let mut catalog_updater = crate::config::providers::codex_catalog::Updater::start(
+            self.config().providers.codex_catalog.clone(),
+            &self.cancel,
+        );
         let (mut reader, mut writer) = sub.split();
         let (frames_tx, mut frames) = tokio::sync::mpsc::channel(64);
         let receive_cancel = self.cancel.child_token();
@@ -84,6 +88,9 @@ impl HomeClient {
                 }
                 next.host = old.host.clone();
                 next.port = old.port;
+                catalog_updater
+                    .replace(&mut next.providers.codex_catalog, &self.cancel)
+                    .await;
                 *self.config.write().unwrap_or_else(|e| e.into_inner()) = Arc::new(next);
                 tracing::info!(operation = "config_update", "Home configuration applied");
             } else if let Some(bytes) = message(&frame, "cluster") {
@@ -95,6 +102,7 @@ impl HomeClient {
                 self.cluster_control(Some(instruction));
             }
         };
+        catalog_updater.stop().await;
         receive_cancel.cancel();
         receiver.abort();
         let _ = receiver.await;

@@ -838,7 +838,23 @@ async fn codex_models_runtime_catalog_changes_spawn_agent_description() {
     cfg.providers.codex_catalog =
         crate::config::providers::codex_catalog::Catalog::parse(&raw).unwrap();
     let cancel = tokio_util::sync::CancellationToken::new();
-    let snapshot = cfg.providers.codex_catalog.snapshot(&cancel).await.unwrap();
+    let mut updater = crate::config::providers::codex_catalog::Updater::start(
+        cfg.providers.codex_catalog.clone(),
+        &cancel,
+    );
+    let expected = serde_json::to_string(&catalog).unwrap();
+    let snapshot = tokio::time::timeout(std::time::Duration::from_secs(5), async {
+        loop {
+            let snapshot = cfg.providers.codex_catalog.snapshot(&cancel).await.unwrap();
+            if &*snapshot == expected {
+                break snapshot;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .unwrap();
+    updater.stop().await;
     let templates = models::parse_templates(&snapshot).unwrap();
     let profiles =
         models::models_from_home_templates(&json!({"codex":[{"id":"gpt-5.5"}]}), &templates);

@@ -169,14 +169,32 @@ HTTP fallback now applies request rewrites before payload rules and restores JSO
 and SSE using attempt-owned flags, before downstream output, usage, and history
 commit. It does not inherit another socket response's restoration state.
 
-`models.codex-catalog` can select an HTTP(S) URL or absolute local file. Catalog
-refresh is demand-driven: three-hour successful refresh cadence, 60-second failure
-backoff, 8 MiB limit, and a 10-second fetch bound. Empty source uses the embedded
-catalog. Failure keeps the last valid snapshot; replacement configs own independent
-caches. Fetches use no Home/caller credentials, redirects, or inherited proxies.
-This is not Go's background updater or complete model registry: no default public
-remote fetch or management-triggered refresh is added. Old config fetches are
-bounded and cannot publish into a replacement config.
+Codex catalog source and automatic refresh policy follow the sibling Go
+`internal/registry/catalog_sources.go` and `codex_client_models_updater.go`:
+
+- An explicit `models.codex-catalog` HTTP(S) URL or absolute file is the only
+  candidate. Otherwise, try these public URLs in order (including after invalid JSON):
+  1. `https://raw.githubusercontent.com/router-for-me/models/refs/heads/main/codex_client_models.json`
+  2. `https://models.router-for.me/codex_client_models.json`
+- Home mode **does not disable the Codex updater**. Go disables only its general
+  and Devin catalogs in Home mode. `models.catalog` does not select Codex templates.
+- The Home subscription owner starts one background task immediately, then starts
+  a three-hour ticker after the initial attempt completes. Success and failure
+  use the same cadence; there is no 60-second retry. Requests read snapshots only.
+- Embedded data is available before the first refresh; failures retain the last
+  valid snapshot. Source changes cancel and join the old generation before starting
+  the replacement, retaining last-valid data. Unrelated reloads preserve the same
+  cache and ticker. Home cancellation stops in-flight reads and periodic work;
+  owner destruction aborts its task as a safety net.
+
+Resource/security bounds remain stricter than Go's `http.DefaultClient`: 8 MiB per
+candidate, a 10-second timeout per candidate, regular local files only, no URL
+credentials, redirects, inherited proxies, or Home/caller authentication. Failed
+explicit sources do not fall through to public URLs. This is a template updater,
+not a local credential/model registry or management-triggered refresh API. Rust
+has no Go `--local-model` switch; Go's switch selects embedded defaults while still
+allowing explicit sources. The production Rust default matches Go without that flag.
+Tests use local mock URLs, not the public network.
 
 Dependency notices and the yawc MPL-2.0 text are shipped in the release Docker
 image under `/usr/share/licenses/ai48proxy/`; see `THIRD_PARTY_NOTICES.md`.

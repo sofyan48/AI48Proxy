@@ -1,5 +1,4 @@
-//! Config-owned Codex catalog cache. No global source map or detached refresh tasks.
-//! Empty source deliberately stays offline; explicit models.codex-catalog wins.
+//! Codex templates with a runtime-owned, cancellable Go-parity catalog updater.
 use std::{collections::HashSet, path::Path, sync::Arc, time::Duration};
 
 use anyhow::{Context, Result, ensure};
@@ -10,22 +9,24 @@ use tokio_util::sync::CancellationToken;
 pub(crate) const EMBEDDED: &str = include_str!("codex_models_catalog.json");
 const MAX_BYTES: usize = 8 << 20;
 const REFRESH: Duration = Duration::from_secs(3 * 60 * 60);
-const RETRY: Duration = Duration::from_secs(60);
+// CLIProxyAPI/internal/registry/codex_client_models_updater.go, in order.
+const DEFAULT_URLS: [&str; 2] = [
+    "https://raw.githubusercontent.com/router-for-me/models/refs/heads/main/codex_client_models.json",
+    "https://models.router-for.me/codex_client_models.json",
+];
 const FETCH_TIMEOUT: Duration = Duration::from_secs(10);
 
 #[derive(Debug)]
 struct State {
     data: Arc<str>,
-    next_attempt: Option<Instant>,
 }
 
-/// One cache per parsed config; clones share it, replacement configs never do.
-/// Holding the async mutex coalesces readers. Dropping a refresh future releases
-/// it without marking the attempt complete, so cancellation cannot wedge refresh.
+/// Immutable source policy and a last-valid snapshot. Network I/O never locks readers.
 #[derive(Debug)]
 pub(crate) struct Catalog {
     source: String,
     state: Mutex<State>,
+    refresh_lock: Mutex<()>,
 }
 
 impl Default for Catalog {
@@ -46,8 +47,8 @@ impl Catalog {
             source,
             state: Mutex::new(State {
                 data: Arc::from(EMBEDDED),
-                next_attempt: None,
             }),
+            refresh_lock: Mutex::new(()),
         }
     }
 
@@ -67,36 +68,104 @@ impl Catalog {
     }
 
     pub(crate) async fn snapshot(&self, cancel: &CancellationToken) -> Option<Arc<str>> {
-        tokio::select! {
-            biased;
-            _ = cancel.cancelled() => None,
-            data = self.refresh(cancel) => data,
+        let state = self.state.lock().await;
+        (!cancel.is_cancelled()).then(|| state.data.clone())
+    }
+
+    fn sources<'a>(&'a self, defaults: &'a [String]) -> Vec<&'a str> {
+        if self.source.is_empty() {
+            defaults.iter().map(String::as_str).collect()
+        } else {
+            vec![&self.source]
         }
     }
 
-    async fn refresh(&self, cancel: &CancellationToken) -> Option<Arc<str>> {
-        let mut state = self.state.lock().await;
-        if self.source.is_empty() || state.next_attempt.is_some_and(|next| Instant::now() < next) {
-            return (!cancel.is_cancelled()).then(|| state.data.clone());
-        }
-        let result = tokio::time::timeout(FETCH_TIMEOUT, read_source(&self.source)).await;
-        // No await between the lifetime check and publication. The cache belongs
-        // only to this immutable config generation, never to a newer source.
-        if cancel.is_cancelled() {
-            return None;
-        }
-        match result {
-            Ok(Ok(data)) => {
-                state.data = Arc::from(data);
-                state.next_attempt = Some(Instant::now() + REFRESH);
-            }
-            _ => {
-                state.next_attempt = Some(Instant::now() + RETRY);
-                // Do not expose URLs (which may contain signed query parameters).
+    async fn refresh(&self, cancel: &CancellationToken, defaults: &[String]) {
+        tokio::select! {
+            biased;
+            _ = cancel.cancelled() => {},
+            _ = async {
+                let _singleflight = self.refresh_lock.lock().await;
+                for source in self.sources(defaults) {
+                    if let Ok(Ok(data)) = tokio::time::timeout(FETCH_TIMEOUT, read_source(source)).await {
+                        let mut state = self.state.lock().await;
+                        // No await between the generation lifetime check and publication.
+                        if !cancel.is_cancelled() {
+                            state.data = Arc::from(data);
+                        }
+                        return;
+                    }
+                }
+                // URLs may contain signed query parameters; never log them.
                 tracing::warn!("Codex catalog refresh failed; keeping last valid catalog");
-            }
+            } => {},
         }
-        Some(state.data.clone())
+    }
+}
+
+/// Exactly one owned task per Home lifetime. Reload joins the old generation before
+/// starting another; Drop is an abort safety net if its owner is itself aborted.
+#[derive(Debug)]
+pub(crate) struct Updater {
+    catalog: Arc<Catalog>,
+    cancel: CancellationToken,
+    task: tokio::task::JoinHandle<()>,
+}
+
+impl Updater {
+    pub(crate) fn start(catalog: Arc<Catalog>, parent: &CancellationToken) -> Self {
+        Self::start_with_defaults(catalog, parent, DEFAULT_URLS.map(str::to_owned).to_vec())
+    }
+
+    fn start_with_defaults(
+        catalog: Arc<Catalog>,
+        parent: &CancellationToken,
+        defaults: Vec<String>,
+    ) -> Self {
+        let cancel = parent.child_token();
+        let worker_cancel = cancel.clone();
+        let worker_catalog = catalog.clone();
+        let task = tokio::spawn(async move {
+            worker_catalog.refresh(&worker_cancel, &defaults).await;
+            // Go starts its three-hour ticker after the initial attempt completes.
+            let mut ticks = tokio::time::interval_at(Instant::now() + REFRESH, REFRESH);
+            ticks.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+            loop {
+                tokio::select! {
+                    biased;
+                    _ = worker_cancel.cancelled() => break,
+                    _ = ticks.tick() => worker_catalog.refresh(&worker_cancel, &defaults).await,
+                }
+            }
+        });
+        Self {
+            catalog,
+            cancel,
+            task,
+        }
+    }
+
+    pub(crate) async fn replace(&mut self, next: &mut Arc<Catalog>, parent: &CancellationToken) {
+        if self.catalog.source == next.source {
+            // Unrelated config updates preserve data, cadence, and the running owner.
+            *next = self.catalog.clone();
+            return;
+        }
+        self.stop().await;
+        next.state.lock().await.data = self.catalog.state.lock().await.data.clone();
+        *self = Self::start(next.clone(), parent);
+    }
+
+    pub(crate) async fn stop(&mut self) {
+        self.cancel.cancel();
+        let _ = (&mut self.task).await;
+    }
+}
+
+impl Drop for Updater {
+    fn drop(&mut self) {
+        self.cancel.cancel();
+        self.task.abort();
     }
 }
 

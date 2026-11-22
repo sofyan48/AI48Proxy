@@ -45,6 +45,38 @@ pulls the published worker image, starts Home, issues three distinct worker JWTs
 into `.env`, and starts the workers and nginx. No manually provisioned secret files are required.
 Do not start the entire stack before this bootstrap sequence completes.
 
+### Migrating from CLIProxyAPI
+
+AI48Proxy is not a drop-in binary replacement for CLIProxyAPI. Before moving
+production traffic:
+
+1. Back up the Home database, deployment secrets, and old worker identities.
+   Keep the old stack available for rollback; do not delete its volumes.
+2. Review [configuration compatibility](config-sync-matrix.md) and run the
+   [worker acceptance runbook](worker-acceptance.md) against the providers and
+   request formats actually used in production. A healthy worker alone does not
+   prove provider, streaming, tool-call, usage, or billing compatibility.
+3. Disable global `plugins.enabled` in Home. AI48Proxy has no native plugin
+   execution; Gemini CLI, AI Studio relay, and plugin-provided executors are not
+   substitutes for built-in supported providers. Do not route their traffic to
+   AI48Proxy. Disabling plugins also affects Home and any remaining CPA workers
+   sharing that Home; use a separate control plane if they still need plugins.
+4. Use a fresh installer directory for a new stack. Migrating an existing Home
+   database is an explicit operation, not `-import` over production state. Issue
+   distinct Home identities for the new workers; do not copy old worker state.
+5. Stop the old port-binding services before switching ingress. Verify real
+   requests, streaming, usage ingestion, and request logs before completing the
+   cutover. Roll back ingress to the old stack if acceptance fails.
+
+On every `deploy` and `start`, the installer reads `/v8/management/plugins`,
+PATCHes `/v8/management/config` with `{"plugins":{"enabled":false}}` when
+necessary, and reads the plugin state again before provisioning/starting workers.
+This is a database-backed configuration change, not just a YAML edit. Existing
+per-plugin configuration is preserved. API failures, invalid state, or a failed
+verification abort startup. Keep plugins disabled after deployment: re-enabling
+them produces an unsupported worker configuration and interrupts worker lifetimes.
+Direct `docker compose up` bypasses this installer guard.
+
 ### Installer environment and artifact contract
 
 | Variable in `.env` | Purpose |
@@ -70,7 +102,7 @@ container environment values.
 matching `.env`. New configuration advertises node address `ai48home:8327`, with
 listener port `8327`; the `home` alias remains available to existing deployments. `deploy/config.yaml` sets worker `host: ""` and `port: 8317`,
 `remote-management.secret-key` from `MANAGEMENT_KEY`, and `api-keys` from
-`GATEWAY_API_KEY`.
+`GATEWAY_API_KEY`, and explicitly sets `plugins.enabled: false`.
 
 Home mounts `deploy/cluster.yaml` read-only at `/AI48Home/cluster.yaml`. The
 initial import loads generated configuration into Home's database. For reference,

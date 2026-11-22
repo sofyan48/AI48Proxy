@@ -102,6 +102,14 @@ Keep `.env`, generated deployment YAML, enrollment tokens and identity volumes
 private. Do not run another stack on the same published ports. Existing databases
 and worker identities require an explicit migration, not reinitialization.
 
+AI48Proxy is **not a drop-in CLIProxyAPI replacement**. The installer explicitly
+sets `plugins.enabled: false` for new installations and disables/verifies plugins
+in Home's database on every `deploy` and `start` before starting workers. This
+also affects other workers sharing that Home. Do not re-enable plugins while
+AI48Proxy is connected, and do not route plugin-only providers to it. Complete the
+[migration checklist](docs/docker.md#migrating-from-cliproxyapi) and
+[worker acceptance runbook](docs/worker-acceptance.md) before production cutover.
+
 See the [Docker deployment guide](docs/docker.md) for configuration, persistence,
 service naming changes and operational precautions.
 

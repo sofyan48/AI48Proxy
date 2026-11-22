@@ -48,6 +48,10 @@ jobs:
         uses: dtolnay/rust-toolchain@stable
         with:
           components: rustfmt, clippy
+      - name: Check production installer plugin guard
+        run: |
+          bash -n install.sh scripts/test-install.sh
+          bash scripts/test-install.sh
       - name: Format, lint, test and locked release build
         run: sh scripts/verify-worker.sh
       - name: Build non-root runtime image

@@ -80,6 +80,8 @@ remote-management:
 auth-dir: "~/.ai48home"
 api-keys:
   - "$(value GATEWAY_API_KEY)"
+plugins:
+  enabled: false
 EOF
   fi
   chmod 600 deploy/cluster.yaml deploy/config.yaml
@@ -93,6 +95,29 @@ wait_home() {
     sleep 2
   done
   fail 'Home did not become ready. Inspect: docker compose logs ai48home'
+}
+ensure_plugins_disabled() {
+  local enabled
+  enabled="$(curl -fsS --connect-timeout 5 --max-time 30 \
+    -H "X-MANAGEMENT-KEY: $(value MANAGEMENT_KEY)" \
+    http://127.0.0.1:8327/v8/management/plugins | jq -er '.plugins_enabled | tostring')"
+  case "$enabled" in
+    false) return 0 ;;
+    true)
+      log 'Disabling Home plugins in the database: AI48Proxy does not support plugin execution.'
+      curl -fsS --connect-timeout 5 --max-time 30 -X PATCH \
+        -H "X-MANAGEMENT-KEY: $(value MANAGEMENT_KEY)" \
+        -H 'Content-Type: application/json' \
+        --data '{"plugins":{"enabled":false}}' \
+        http://127.0.0.1:8327/v8/management/config >/dev/null
+      ;;
+    *) fail 'Cannot verify Home plugin state; refusing to start AI48Proxy.' ;;
+  esac
+  curl -fsS --connect-timeout 5 --max-time 30 \
+    -H "X-MANAGEMENT-KEY: $(value MANAGEMENT_KEY)" \
+    http://127.0.0.1:8327/v8/management/plugins \
+    | jq -e '.plugins_enabled == false' >/dev/null \
+    || fail 'Home plugins must be disabled before starting AI48Proxy.'
 }
 provision_workers() {
   local i token existing seen='|'
@@ -134,6 +159,7 @@ case "$ACTION" in
     fi
     compose up -d ai48home
     wait_home
+    ensure_plugins_disabled
     provision_workers
     compose up -d --wait --wait-timeout 240 ai48proxy-1 ai48proxy-2 ai48proxy-3
     compose up -d nginx
@@ -142,11 +168,13 @@ case "$ACTION" in
     log 'Check worker readiness: docker compose ps; docker compose logs ai48proxy-1'
     ;;
   start)
+    for cmd in docker curl jq awk; do require "$cmd"; done
     [[ -f "$ENV_FILE" && -e deploy/.home-imported ]] || fail 'Run install.sh deploy first.'
     for i in 1 2 3; do [[ -n "$(value "HOME_JWT_$i")" ]] || fail 'Worker JWT missing: finish install.sh deploy first.'; done
     compose up -d --wait --wait-timeout 180 postgres
     compose up -d ai48home
     wait_home
+    ensure_plugins_disabled
     compose up -d --wait --wait-timeout 240 ai48proxy-1 ai48proxy-2 ai48proxy-3
     compose up -d nginx
     ;;

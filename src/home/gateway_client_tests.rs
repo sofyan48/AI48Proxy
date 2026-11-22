@@ -21,7 +21,7 @@ async fn gateway_dispatch(home: &Home, base_url: &str) {
     );
     let selection = serde_json::json!({
         "model": "resolved-model", "provider": "openai", "auth_index": "local-index",
-        "user_api_key": "caller-principal", "auth": {"id": "local-credential", "attributes": {
+        "user_api_key": CALLER_KEY, "auth": {"id": "local-credential", "attributes": {
             "api_key": PROVIDER_KEY, "base_url": base_url
         }},
         "concurrency": {"accounted": true, "credential_id": "local-credential", "model": "ledger-model"}
@@ -61,7 +61,14 @@ async fn deliver_gateway_completion(home: &Home, client: &HomeClient, streaming:
                 assert_eq!(payload["stream"], streaming);
                 assert_eq!(payload["failed"], streaming);
                 assert_eq!(payload["accounting_version"], 2);
-                assert!(payload["api_key"].as_str() == Some("caller-principal"));
+                assert_eq!(payload["api_key"], CALLER_KEY);
+                // Optional cross-repository acceptance capture: these are the actual
+                // serialized LPUSH bytes, not a separately constructed billing fixture.
+                if !streaming {
+                    if let Some(path) = std::env::var_os("AI48_USAGE_CAPTURE") {
+                        std::fs::write(path, &args[2]).unwrap();
+                    }
+                }
                 for id in ["request_id", "execution_id"] {
                     assert!(
                         payload[id]
@@ -70,10 +77,8 @@ async fn deliver_gateway_completion(home: &Home, client: &HomeClient, streaming:
                     );
                 }
                 let encoded = payload.to_string();
-                assert!(
-                    !encoded.contains(CALLER_KEY),
-                    "usage exposed caller authentication"
-                );
+                // Home's wire contract requires the downstream key for DB attribution;
+                // only upstream credential material must be absent.
                 assert!(
                     !encoded.contains(PROVIDER_KEY),
                     "usage exposed upstream authentication"

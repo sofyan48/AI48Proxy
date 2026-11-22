@@ -197,3 +197,40 @@ unsafe fn close_library(handle: *mut c_void) {
         }
     }
 }
+
+#[cfg(all(test, windows))]
+mod windows_tests {
+    use super::*;
+
+    #[test]
+    fn missing_library_returns_error() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("missing-plugin.dll");
+        let error = unsafe { open_library(&path) }.unwrap_err();
+        assert!(error.to_string().contains("unable to load native plugin"));
+    }
+
+    #[test]
+    fn resolves_windows_function_pointer() {
+        let handle = unsafe { open_library(Path::new("kernel32.dll")) }.unwrap();
+        let result = unsafe {
+            load_symbol::<unsafe extern "system" fn() -> u32>(handle, b"GetCurrentProcessId\0")
+        };
+        let process_id = result.map(|function| unsafe { function() });
+        unsafe { close_library(handle) };
+        assert_eq!(process_id.unwrap(), std::process::id());
+    }
+
+    #[test]
+    fn missing_symbol_returns_error() {
+        let handle = unsafe { open_library(Path::new("kernel32.dll")) }.unwrap();
+        let result = unsafe { load_symbol::<Init>(handle, b"cliproxy_plugin_init\0") };
+        unsafe { close_library(handle) };
+        let error = result.unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("native plugin init symbol is missing")
+        );
+    }
+}

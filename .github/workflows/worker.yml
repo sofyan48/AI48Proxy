@@ -12,6 +12,33 @@ permissions:
   contents: read
 
 jobs:
+  windows:
+    name: Windows ${{ matrix.target }}
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: windows-latest
+            target: x86_64-pc-windows-msvc
+          - runner: windows-11-arm
+            target: aarch64-pc-windows-msvc
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install current stable Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+      - name: Check Windows targets and test native loader
+        env:
+          TARGET: ${{ matrix.target }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          cargo check --locked --all-targets --target "$TARGET"
+          cargo test --locked --lib --target "$TARGET" plugins::native::windows_tests
+
   rust:
     runs-on: ubuntu-latest
     timeout-minutes: 30

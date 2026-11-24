@@ -46,9 +46,12 @@ pub(super) fn openai_call(call: &Value) -> Result<Value> {
 }
 pub(super) fn claude_call(block: &Value) -> Result<Value> {
     fields(block, &["type", "id", "name", "input"])?;
-    object(&block["input"])?;
+    // Parameterless Claude calls may omit input; explicit invalid values still fail closed.
+    let empty_input = json!({});
+    let input = block.get("input").unwrap_or(&empty_input);
+    object(input)?;
     Ok(
-        json!({"id":nonempty(&block["id"])?,"type":"function","function":{"name":nonempty(&block["name"])?,"arguments":serde_json::to_string(&block["input"]).map_err(|_| invalid("tool input serialization"))?}}),
+        json!({"id":nonempty(&block["id"])?,"type":"function","function":{"name":nonempty(&block["name"])?,"arguments":serde_json::to_string(input).map_err(|_| invalid("tool input serialization"))?}}),
     )
 }
 pub(super) fn openai_messages(v: &Value) -> Result<(Vec<Value>, String)> {

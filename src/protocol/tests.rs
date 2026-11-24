@@ -84,6 +84,30 @@ fn basic_tool_conversation_both_directions() {
     ));
 }
 #[test]
+fn parameterless_claude_calls_default_only_missing_input() {
+    let mut request = json!({"model":"m","max_tokens":100,"messages":[
+        {"role":"user","content":"time"},
+        {"role":"assistant","content":[{"type":"tool_use","id":"t","name":"time"}]},
+        {"role":"user","content":[{"type":"tool_result","tool_use_id":"t","content":"noon"}]}
+    ]});
+    let translated = req(C, &request).unwrap();
+    let arguments = &translated["messages"][1]["tool_calls"][0]["function"]["arguments"];
+    assert!(arguments.is_string());
+    assert_eq!(arguments, "{}");
+    assert_eq!(translated["messages"][2]["tool_call_id"], "t");
+    for invalid in [Value::Null, json!(""), json!([]), json!(false)] {
+        request["messages"][1]["content"][0]["input"] = invalid;
+        assert!(req(C, &request).is_err());
+    }
+    request["messages"][1]["content"][0]["input"] = json!({"city":"Paris"});
+    assert_eq!(
+        req(C, &request).unwrap()["messages"][1]["tool_calls"][0]["function"]["arguments"],
+        "{\"city\":\"Paris\"}"
+    );
+    request["messages"][2]["content"][0]["tool_use_id"] = json!("wrong");
+    assert!(req(C, &request).is_err());
+}
+#[test]
 fn nonstream_responses_and_tools() {
     let o = json!({"id":"r","object":"chat.completion","created":123,"model":"target","choices":[{"index":0,"message":{"role":"assistant","content":"hi"},"finish_reason":"stop"}],"usage":{"prompt_tokens":7,"completion_tokens":3,"total_tokens":10}});
     let c = resp(O, &o).unwrap();

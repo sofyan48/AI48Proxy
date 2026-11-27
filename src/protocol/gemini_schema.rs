@@ -75,13 +75,44 @@ fn clean_node(schema: &Value, antigravity: bool, placeholder: bool, depth: usize
             values.iter().all(|v| !v.is_object() && !v.is_array()),
             "unsupported compound enum"
         );
-        let strings: Vec<String> = values.iter().map(display).collect();
+        let saw_empty = values
+            .iter()
+            .any(|v| v.as_str().is_some_and(|s| s.trim().is_empty()));
+        let saw_null = values.iter().any(Value::is_null);
+        let strings: Vec<String> = values
+            .iter()
+            .filter(|v| !v.is_null() && !v.as_str().is_some_and(|s| s.trim().is_empty()))
+            .map(display)
+            .collect();
         if !strings.is_empty() && strings.len() <= 10 {
             hint(&mut out, format!("Allowed: {}", strings.join(", ")));
         }
-        if !antigravity {
+        if !antigravity && (!strings.is_empty() || values.is_empty()) {
             out.insert("enum".into(), json!(strings));
             out.insert("type".into(), json!("string"));
+        }
+        if saw_empty {
+            hint(
+                &mut out,
+                if strings.is_empty() {
+                    "Allowed: \"\""
+                } else {
+                    "Empty string \"\" allowed"
+                }
+                .into(),
+            );
+            if !antigravity || !out.contains_key("type") {
+                out.insert("type".into(), json!("string"));
+            }
+        }
+        if saw_null {
+            hint(&mut out, "nullable".into());
+            if antigravity {
+                out.insert("nullable".into(), json!(true));
+            }
+            if !out.contains_key("type") {
+                out.insert("type".into(), json!("null"));
+            }
         }
     }
     if let Some(types) = out.get("type").and_then(Value::as_array).cloned() {
@@ -257,4 +288,55 @@ fn clean_node(schema: &Value, antigravity: bool, placeholder: bool, depth: usize
         }
     }
     Ok(Value::Object(out))
+}
+
+#[cfg(test)]
+mod enum_regressions {
+    use super::*;
+
+    #[test]
+    fn blank_and_null_enum_members_preserve_advisory_semantics() {
+        for antigravity in [false, true] {
+            let schema = json!({"type":"integer","enum":["", "  ", null, 0, false, "ok"],"description":"Original"});
+            let result = clean(&schema, antigravity, false).unwrap();
+            if antigravity {
+                assert!(result.get("enum").is_none());
+                assert_eq!(result["type"], "integer");
+                assert_eq!(result["nullable"], true);
+            } else {
+                assert_eq!(result["enum"], json!(["0", "false", "ok"]));
+                assert_eq!(result["type"], "string");
+            }
+            let description = result["description"].as_str().unwrap();
+            assert!(description.contains("Original"));
+            assert!(description.contains("Empty string \"\" allowed"));
+            assert!(description.contains("nullable"));
+            assert_eq!(clean(&result, antigravity, false).unwrap(), result);
+        }
+    }
+
+    #[test]
+    fn entirely_stripped_enum_is_not_sent_as_empty_restriction() {
+        for antigravity in [false, true] {
+            for values in [json!(["", "\t"]), json!([null]), json!(["", null])] {
+                let result = clean(&json!({"enum":values}), antigravity, false).unwrap();
+                assert!(result.get("enum").is_none());
+                assert!(result.get("type").is_some());
+                assert!(result.get("description").is_some());
+            }
+        }
+    }
+
+    #[test]
+    fn nested_enum_cleaning_keeps_property_names_and_fails_closed() {
+        let result = clean(
+            &json!({"type":"object","properties":{"enum":{"type":"string","enum":["", "ok"]}}}),
+            false,
+            false,
+        )
+        .unwrap();
+        assert_eq!(result["properties"]["enum"]["enum"], json!(["ok"]));
+        assert!(clean(&json!({"enum":[{}]}), false, false).is_err());
+        assert!(clean(&json!({"$ref":"#/x"}), false, false).is_err());
+    }
 }
